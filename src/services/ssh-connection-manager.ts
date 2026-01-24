@@ -168,6 +168,24 @@ export class SSHConnectionManager {
   }
 
   /**
+   * Get server config without throwing (returns null if not found/enabled)
+   * Useful for tools that want to inspect config without failing
+   */
+  public getServerConfig(name?: string): SSHConfig | null {
+    const key = name || this.defaultName;
+    
+    if (!this.configs[key]) {
+      return null;
+    }
+    
+    if (!this.isServerEnabled(key)) {
+      return null;
+    }
+    
+    return this.configs[key];
+  }
+
+  /**
    * Batch connect all configured SSH connections
    */
   public async connectAll(): Promise<void> {
@@ -722,12 +740,21 @@ export class SSHConnectionManager {
 
           // Set timeout for command execution
           timeoutId = setTimeout(() => {
+            cleanup();
             try {
-              // Try to gracefully close the stream first
+              // Send SIGKILL to forcefully terminate the remote process
+              // signal() sends a signal to the remote process
+              stream.signal("KILL");
+            } catch (e) {
+              // Ignore errors when sending signal
+            }
+            try {
+              // Close the stream to release resources
               stream.close();
             } catch (e) {
               // Ignore errors when closing streams during timeout
             }
+            reject(new Error(`Command timeout: execution exceeded ${timeout}ms limit. Remote process killed.`));
           }, timeout);
         }
       );
@@ -997,11 +1024,19 @@ export class SSHConnectionManager {
 
           // Set timeout for command execution
           timeoutId = setTimeout(() => {
+            cleanup();
+            try {
+              // Send SIGKILL to forcefully terminate the remote process
+              stream.signal("KILL");
+            } catch (e) {
+              // Ignore errors when sending signal
+            }
             try {
               stream.close();
             } catch (e) {
               // Ignore errors when closing streams during timeout
             }
+            reject(new Error(`Command timeout: execution exceeded ${timeout}ms limit. Remote process killed.`));
           }, timeout);
         }
       );

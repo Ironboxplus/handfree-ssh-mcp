@@ -1,249 +1,218 @@
 # 🤖 handfree-ssh-mcp
 
-A hands-free SSH automation tool via MCP (Model Context Protocol). Fork of [ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) with enhanced features for autonomous AI agent operations.
+**Configure once. Let the LLM handle the rest.**
 
-## 📝 Project Overview
+> 🧪 99.9% AI-coded. No artisanal hand-crafted code here.
 
-handfree-ssh-mcp enables AI assistants to execute remote SSH commands through a standardized MCP interface. Perfect for autonomous workflows, DevOps automation, and hands-free server management.
+A hands-free SSH automation tool via MCP. Fork of [ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) designed for autonomous AI agent operations.
 
-## ✨ Key Features
+## 🎯 Philosophy
 
-- **🔒 Secure Connections**: Password authentication, private key authentication (with passphrase support)
-- **🛡️ Command Security Control**: Whitelist and blacklist mechanisms for command filtering
-- **🔄 Standardized MCP Interface**: Seamless integration with AI assistants (Cursor, Claude, etc.)
-- **📂 File Transfer**: Bidirectional file transfers (upload/download)
-- **🔑 Credential Isolation**: SSH credentials managed locally, never exposed to AI models
-- **⏱️ Streaming Support**: Real-time output for long-running commands
-- **🌐 SOCKS Proxy**: Built-in proxy support for network routing
+The original ssh-mcp-server requires passing credentials and options via CLI arguments every time. That's tedious.
 
-## 🛠️ Tools List
+**handfree-ssh-mcp** takes a different approach:
+
+1. **Configure your servers once** in a YAML file
+2. **Set your security whitelists** per server
+3. **Let the LLM call whatever it needs** - hands-free
+
+Less manual interventions. Just autonomous SSH execution with safegurad.
+
+## ✨ What's New
+
+| Feature | Original | handfree-ssh-mcp |
+|---------|----------|------------------|
+| Configuration | CLI args | **YAML config file only** |
+| Multi-server | Messy `--ssh` flags | **Clean YAML structure** |
+| Whitelists | Single comma-separated string | **Per-server arrays** |
+| Execute command | Two separate tools | **One tool with `stream` param** |
+
+## 🚀 Quick Start
+
+### 1. Create `servers.yaml`
+
+```yaml
+defaultServer: dev
+
+servers:
+  dev:
+    host: xxxxx
+    port: 22
+    username: myuser
+    password: mypassword
+    # Define what the LLM is allowed to do
+    whitelist:
+      - "^ls.*$"
+      - "^cat.*$"
+      - "^pwd$"
+      - "^docker.*$"
+      - "^git.*$"
+      # Add whatever commands you trust the LLM to run
+
+  prod:
+    host: XXXXX
+    port: 22
+    username: deploy
+    privateKey: ~/.ssh/id_rsa
+    whitelist:
+      - "^ls.*$"        # Read only
+      - "^cat.*$"
+      - "^tail.*$"
+    blacklist:
+      - "^rm.*$"        # Never allow delete
+      - "^shutdown.*$"
+      - "^reboot.*$"
+```
+
+### 2. Add to MCP Config
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "node",
+      "args": [
+        "/path/to/handfree-ssh-mcp/build/index.js",
+        "--config", "/path/to/servers.yaml",
+        "--enable-servers", "dev,prod"
+      ]
+    }
+  }
+}
+```
+
+### 3. Done. Let the LLM Work.
+
+The AI can now execute commands on your servers. All within your defined security boundaries.
+
+---
+
+## 🛠️ Available Tools
 
 | Tool | Description |
 |------|-------------|
-| execute-command | Execute SSH commands on remote servers and get results |
-| execute-command-stream | Execute commands with real-time streaming output |
-| upload | Upload local files to remote servers |
-| download | Download files from remote servers |
-| list-servers | List all available SSH server configurations |
+| `execute-command` | Run SSH command (with optional `stream` for real-time output) |
+| `show-whitelist` | Show allowed commands for a server (helps LLM understand permissions) |
+| `upload` | Upload file to server |
+| `download` | Download file from server |
+| `list-servers` | List configured servers |
 
-## 📚 Usage
+### show-whitelist
 
-### 🔧 MCP Configuration Examples
+**Use this first!** Let the LLM know what it's allowed to do:
 
-> **⚠️ Important**: Each command line argument and its value must be separate elements in the `args` array.
+```json
+{
+  "tool": "show-whitelist",
+  "params": {
+    "connectionName": "dev"
+  }
+}
+```
 
-#### ⚙️ Command Line Options
+Returns a formatted list of allowed command patterns with examples.
+
+### execute-command
+
+```json
+{
+  "tool": "execute-command",
+  "params": {
+    "cmdString": "docker ps",
+    "connectionName": "dev",
+    "timeout": 300000,
+    "stream": true
+  }
+}
+```
+
+| Param | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `cmdString` | ✅ | - | Command to execute |
+| `connectionName` | ❌ | `defaultServer` | Which server to run on |
+| `timeout` | ❌ | 300000ms (stream) / 30000ms (no stream) | Timeout in ms |
+| `stream` | ❌ | `true` | Real-time streaming output |
+
+**When to use `stream: false`:**
+- Simple, fast commands (ls, pwd, cat)
+- When you don't need real-time feedback
+
+## 📄 YAML Config Reference
+
+```yaml
+# Which server to use if connectionName not specified
+defaultServer: dev
+
+# Pre-connect on startup (optional)
+preConnect: false
+
+servers:
+  server_name:
+    host: 192.168.1.1          # Required
+    port: 22                    # Optional, default 22
+    username: root              # Required
+    
+    # Auth: use ONE of these
+    password: xxx
+    privateKey: ~/.ssh/id_rsa
+    passphrase: key_password    # If privateKey is encrypted
+    
+    # Network
+    socksProxy: socks5://host:port
+    
+    # Security (regex patterns)
+    whitelist:                  # Only allow matching commands
+      - "^ls.*$"
+      - "^cat.*$"
+    blacklist:                  # Block matching commands
+      - "^rm -rf.*$"
+```
+
+## ⚙️ CLI Options
 
 ```text
-Options:
-  -h, --host          SSH server host address
-  -p, --port          SSH server port
-  -u, --username      SSH username
-  -w, --password      SSH password
-  -k, --privateKey    SSH private key file path
-  -P, --passphrase    Private key passphrase (if any)
-  -W, --whitelist     Command whitelist, comma-separated regular expressions
-  -B, --blacklist     Command blacklist, comma-separated regular expressions
-  -s, --socksProxy    SOCKS proxy server address (e.g., socks://user:password@host:port)
+--config          Path to YAML config file (REQUIRED)
+--enable-servers  Comma-separated list of servers to enable (REQUIRED for execute-command)
 ```
 
-#### 🔑 Using Password
+> **Note**: `--enable-servers` controls which servers are available. The first server listed becomes the default when `connectionName` is not specified.
+
+Example with selective servers:
 
 ```json
 {
-  "mcpServers": {
-    "handfree-ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "handfree-ssh-mcp",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--password", "your-password"
-      ]
-    }
-  }
+  "args": [
+    "--config", "servers.yaml",
+    "--enable-servers", "dev,staging"
+  ]
 }
 ```
 
-#### 🔐 Using Private Key
+## 🛡️ Security
 
-```json
-{
-  "mcpServers": {
-    "handfree-ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "handfree-ssh-mcp",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--privateKey", "~/.ssh/id_rsa"
-      ]
-    }
-  }
-}
-```
+- **Whitelist everything**: Define exactly what commands are allowed
+- **Keep secrets safe**: Add `servers.yaml` to `.gitignore`
+- **Per-server control**: Prod can be locked down, dev can be permissive
 
-#### 🔏 Using Private Key with Passphrase
+## 📋 TODO & PLAN
 
-```json
-{
-  "mcpServers": {
-    "handfree-ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "handfree-ssh-mcp",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--privateKey", "~/.ssh/id_rsa",
-        "--passphrase", "your-passphrase"
-      ]
-    }
-  }
-}
-```
+### High Priority
+- [x] **Complete test coverage**: Add tests for `list-servers`, `upload`, `download`, `show-whitelist`, streaming mode, timeout/kill
+- [ ] **Session support**: Add tools to list/create/resume/close persistent SSH sessions (for multi-command workflows)
+- [ ] **LLM-based whitelist**: Allow LLM to propose commands, with human approval adding to dynamic whitelist
 
-#### 🌐 Using SOCKS Proxy
+### Nice to Have
+- [ ] **Command history**: Log executed commands per server for audit/debugging
+- [ ] **Output caching**: Cache recent command outputs to avoid re-running identical commands
+- [ ] **Directory context**: Add `cwd` parameter to execute commands in specific directories
+- [ ] **Environment variables**: Support setting env vars per command or per session
+- [ ] **Multi-command execution**: Execute multiple commands in sequence with `&&` or `;` safely
+- [ ] **Server health check**: Periodic ping to detect connection drops early
 
-```json
-{
-  "mcpServers": {
-    "handfree-ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "handfree-ssh-mcp",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--password", "your-password",
-        "--socksProxy", "socks://username:password@proxy-host:proxy-port"
-      ]
-    }
-  }
-}
-```
-
-#### 📝 Using Command Whitelist and Blacklist
-
-**Whitelist Example** (only allow specific commands):
-
-```json
-{
-  "mcpServers": {
-    "handfree-ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "handfree-ssh-mcp",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--password", "your-password",
-        "--whitelist", "^ls( .*)?,^cat .*,^df.*"
-      ]
-    }
-  }
-}
-```
-
-**Blacklist Example** (block dangerous commands):
-
-```json
-{
-  "mcpServers": {
-    "handfree-ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "handfree-ssh-mcp",
-        "--host", "192.168.1.1",
-        "--port", "22",
-        "--username", "root",
-        "--password", "your-password",
-        "--blacklist", "^rm .*,^shutdown.*,^reboot.*"
-      ]
-    }
-  }
-}
-```
-
-> Note: If both whitelist and blacklist are specified, the command must pass both checks to be executed.
-
-### 🧩 Multi-SSH Connection Example
-
-Specify multiple SSH connections with unique names:
-
-```bash
-npx handfree-ssh-mcp \
-  --ssh "name=dev,host=1.2.3.4,port=22,user=alice,password=xxx" \
-  --ssh "name=prod,host=5.6.7.8,port=22,user=bob,password=yyy"
-```
-
-Execute on a specific connection:
-
-```json
-{
-  "tool": "execute-command",
-  "params": {
-    "cmdString": "ls -al",
-    "connectionName": "prod"
-  }
-}
-```
-
-With timeout:
-
-```json
-{
-  "tool": "execute-command",
-  "params": {
-    "cmdString": "ping -c 10 127.0.0.1",
-    "connectionName": "prod",
-    "timeout": 5000
-  }
-}
-```
-
-### ⏱️ Command Execution Timeout
-
-- **timeout**: Command execution timeout in milliseconds (default: 30000ms)
-- **execute-command-stream**: Extended timeout (default: 300000ms / 5 minutes) for long-running tasks
-
-### 🗂️ List All SSH Servers
-
-```json
-{
-  "tool": "list-servers",
-  "params": {}
-}
-```
-
-Response:
-
-```json
-[
-  { "name": "dev", "host": "1.2.3.4", "port": 22, "username": "alice" },
-  { "name": "prod", "host": "5.6.7.8", "port": 22, "username": "bob" }
-]
-```
-
-## 🛡️ Security Considerations
-
-- **Command Whitelisting**: Strongly recommended to restrict executable commands
-- **Private Key Security**: Ensure the machine running this server is secure
-- **Rate Limiting**: Consider running behind a firewall with rate-limiting
-- **Path Traversal**: Built-in protection, but be mindful of upload/download paths
 
 ## 📄 License
 
-ISC License - Based on [ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) by Junki
+ISC License
 
-## 🙏 Credits
-
-This project is a fork of [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server). Thanks to the original author for the excellent foundation!
+- Original work: © 2025 junki.cn ([ssh-mcp-server](https://github.com/classfang/ssh-mcp-server))
+- Modifications: © 2026 woqucc (handfree-ssh-mcp)

@@ -1,7 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
-import { CommandLineParser } from "../cli/command-line-parser.js";
 import { Logger } from "../utils/logger.js";
 import { registerAllTools } from "../tools/index.js";
 import { SERVER_CONFIG } from "../config/server.js";
@@ -10,6 +9,8 @@ import { ParsedArgs } from "../models/types.js";
 
 /**
  * MCP Server class
+ * 
+ * handfree-ssh-mcp: Configure once via YAML, let the LLM handle the rest.
  */
 export class SshMcpServer {
   private server: McpServer;
@@ -17,7 +18,6 @@ export class SshMcpServer {
 
   constructor() {
     this.server = new McpServer(SERVER_CONFIG);
-
     this.sshManager = SSHConnectionManager.getInstance();
   }
 
@@ -29,37 +29,52 @@ export class SshMcpServer {
   }
 
   /**
-   * Load configuration from YAML file or CLI arguments
+   * Load configuration from YAML file
+   * 
+   * Required: --config <path-to-yaml>
+   * Required: --enable-servers <server1,server2,...>
    */
   private loadConfig(): ParsedArgs {
     const args = process.argv.slice(2);
     
-    // Check for --config argument first
+    // YAML config is required
     const configPath = getConfigPath(args);
     
-    if (configPath) {
-      Logger.log(`Using YAML config file: ${configPath}`, "info");
-      const parsedArgs = loadConfigFromYaml(configPath);
-      
-      // Check for --enable-servers to restrict access
-      const enabledServers = getEnabledServersArg(args);
-      if (enabledServers) {
-        // Validate that all enabled servers exist in config
-        for (const serverName of enabledServers) {
-          if (!parsedArgs.configs[serverName]) {
-            throw new Error(`Enabled server '${serverName}' not found in config`);
-          }
-        }
-        Logger.log(`Enabled servers (via --enable-servers): ${enabledServers.join(", ")}`, "info");
-        parsedArgs.enabledServers = enabledServers;
-      }
-      
-      return parsedArgs;
+    if (!configPath) {
+      throw new Error(
+        "Missing required --config argument.\n\n" +
+        "Usage: handfree-ssh-mcp --config <servers.yaml> --enable-servers <server1,server2>\n\n" +
+        "See README for YAML configuration format."
+      );
     }
     
-    // Fall back to CLI arguments for backward compatibility
-    Logger.log("Using CLI arguments for configuration", "info");
-    return CommandLineParser.parseArgs();
+    Logger.log(`Loading config from: ${configPath}`, "info");
+    const parsedArgs = loadConfigFromYaml(configPath);
+    
+    // --enable-servers is required
+    const enabledServers = getEnabledServersArg(args);
+    if (!enabledServers || enabledServers.length === 0) {
+      throw new Error(
+        "Missing required --enable-servers argument.\n\n" +
+        "Usage: handfree-ssh-mcp --config <servers.yaml> --enable-servers <server1,server2>\n\n" +
+        "Available servers in config: " + Object.keys(parsedArgs.configs).join(", ")
+      );
+    }
+    
+    // Validate that all enabled servers exist in config
+    for (const serverName of enabledServers) {
+      if (!parsedArgs.configs[serverName]) {
+        throw new Error(
+          `Server '${serverName}' not found in config.\n\n` +
+          "Available servers: " + Object.keys(parsedArgs.configs).join(", ")
+        );
+      }
+    }
+    
+    Logger.log(`Enabled servers: ${enabledServers.join(", ")}`, "info");
+    parsedArgs.enabledServers = enabledServers;
+    
+    return parsedArgs;
   }
 
   /**

@@ -1,6 +1,7 @@
 ISC License
 
-Copyright (c) 2025 junki.cn
+Copyright (c) 2025 junki.cn (original ssh-mcp-server)
+Copyright (c) 2026 woqucc (handfree-ssh-mcp modifications)
 
 Permission to use, copy, modify, and/or distribute this software for any
 purpose with or without fee is hereby granted, provided that the above

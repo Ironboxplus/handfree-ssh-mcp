@@ -9,14 +9,19 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YOUR_USERNAME/handfree-ssh-mcp.git"
+    "url": "git+https://github.com/woqucc/handfree-ssh-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/YOUR_USERNAME/handfree-ssh-mcp/issues"
+    "url": "https://github.com/woqucc/handfree-ssh-mcp/issues"
   },
-  "homepage": "https://github.com/YOUR_USERNAME/handfree-ssh-mcp#readme",
+  "homepage": "https://github.com/woqucc/handfree-ssh-mcp#readme",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run build && node --test build/tests/config.test.js build/tests/command-validation.test.js build/tests/tools.test.js",
+    "test:config": "npm run build && node --test build/tests/config.test.js",
+    "test:cmd": "npm run build && node --test build/tests/command-validation.test.js",
+    "test:tools": "npm run build && node --test build/tests/tools.test.js",
+    "test:integration": "npm run build && node build/tests/integration.test.js",
+    "test:all": "npm run test && npm run test:integration",
     "build": "node scripts/build.js",
     "prepublishOnly": "npm run build"
   },
