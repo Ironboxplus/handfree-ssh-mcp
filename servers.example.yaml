@@ -1,0 +1,52 @@
+# SSH MCP Server Configuration Example
+# Copy this file to servers.yaml and update with your server details
+# 
+# IMPORTANT: This file contains secrets (passwords/passphrases)
+# Do NOT commit the actual servers.yaml to git!
+
+# Default server to use when connectionName is not specified
+defaultServer: dev
+
+# Whether to pre-connect to all servers on startup
+preConnect: false
+
+# Server configurations
+servers:
+  # Development server example
+  dev:
+    host: 192.168.1.100
+    port: 22
+    username: devuser
+    # Authentication: use either password OR privateKey (not both)
+    # password: your_password_here
+    privateKey: ~/.ssh/id_rsa
+    passphrase: ""  # Leave empty if key is not encrypted
+    # Optional: SOCKS proxy for connection
+    # socksProxy: socks5://proxy-host:1085
+    # Command security: whitelist of allowed command patterns (regex)
+    whitelist:
+      - "^ls( .*)?$"
+      - "^cat .*$"
+      - "^head .*$"
+      - "^tail .*$"
+      - "^pwd$"
+      - "^echo .*$"
+      - "^ping -c \\d+ .*$"
+      - "^git .*$"
+      - "^docker ps.*$"
+      - "^docker logs.*$"
+
+  # Production server example (commented out)
+  # prod:
+  #   host: 192.168.1.100
+  #   port: 22
+  #   username: deploy
+  #   password: your_production_password
+  #   socksProxy: socks5://192.168.1.100:1085
+  #   whitelist:
+  #     - "^ls( .*)?$"
+  #     - "^cat .*$"
+  #   blacklist:
+  #     - "^rm .*$"
+  #     - "^shutdown.*$"
+  #     - "^reboot.*$"

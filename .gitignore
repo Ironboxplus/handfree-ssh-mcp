@@ -1,0 +1,28 @@
+# 依赖目录
+node_modules/
+package-lock.json
+
+# 构建输出
+build/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 编辑器和IDE文件
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.classpath
+.settings/
+memo.md
+
+# SSH config files (contain secrets)
+servers.yaml
+servers.yml
+*.servers.yaml
+*.servers.yml
+ssh-config.yaml
+ssh-config.yml

@@ -1,0 +1,47 @@
+{
+  "name": "handfree-ssh-mcp",
+  "version": "1.0.0",
+  "description": "Handfree SSH MCP Server - A hands-free SSH automation tool via MCP protocol",
+  "main": "build/index.js",
+  "type": "module",
+  "bin": {
+    "handfree-ssh-mcp": "build/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR_USERNAME/handfree-ssh-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YOUR_USERNAME/handfree-ssh-mcp/issues"
+  },
+  "homepage": "https://github.com/YOUR_USERNAME/handfree-ssh-mcp#readme",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "node scripts/build.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ssh",
+    "mcp",
+    "server",
+    "cli"
+  ],
+  "author": "Junki",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.17.5",
+    "js-yaml": "^4.1.0",
+    "socks": "^2.8.6",
+    "ssh2": "^1.16.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.13.10",
+    "@types/ssh2": "^1.15.5",
+    "typescript": "^5.8.2"
+  },
+  "files": [
+    "build/**/*"
+  ]
+}
