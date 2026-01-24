@@ -2,7 +2,7 @@
 
 **Configure once. Let the LLM handle the rest.**
 
-> 🧪 99.9% AI-coded. No artisanal hand-crafted code here.
+> 🧪 99.9% AI-coded [Include this Readme]. No artisanal hand-crafted code here.
 
 A hands-free SSH automation tool via MCP. Fork of [ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) designed for autonomous AI agent operations.
 
@@ -16,7 +16,7 @@ The original ssh-mcp-server requires passing credentials and options via CLI arg
 2. **Set your security whitelists** per server
 3. **Let the LLM call whatever it needs** - hands-free
 
-Less manual interventions. Just autonomous SSH execution with safegurad.
+Less manual interventions. Just autonomous SSH execution with safeguards.
 
 ## ✨ What's New
 
@@ -25,17 +25,16 @@ Less manual interventions. Just autonomous SSH execution with safegurad.
 | Configuration | CLI args | **YAML config file only** |
 | Multi-server | Messy `--ssh` flags | **Clean YAML structure** |
 | Whitelists | Single comma-separated string | **Per-server arrays** |
-| Execute command | Two separate tools | **One tool with `stream` param** |
+| Streaming | Not supported | **Real-time output with `stream` param** |
+| Discoverability | None | **`show-whitelist` tool for LLM** |
 
 ## 🚀 Quick Start
 
 ### 1. Create `servers.yaml`
 
 ```yaml
-defaultServer: dev
-
 servers:
-  dev:
+  dev:  # Server name - use this in --enable-servers
     host: xxxxx
     port: 22
     username: myuser
@@ -129,7 +128,7 @@ Returns a formatted list of allowed command patterns with examples.
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `cmdString` | ✅ | - | Command to execute |
-| `connectionName` | ❌ | `defaultServer` | Which server to run on |
+| `connectionName` | ❌ | First in `--enable-servers` | Which server to run on |
 | `timeout` | ❌ | 300000ms (stream) / 30000ms (no stream) | Timeout in ms |
 | `stream` | ❌ | `true` | Real-time streaming output |
 
@@ -140,9 +139,6 @@ Returns a formatted list of allowed command patterns with examples.
 ## 📄 YAML Config Reference
 
 ```yaml
-# Which server to use if connectionName not specified
-defaultServer: dev
-
 # Pre-connect on startup (optional)
 preConnect: false
 
@@ -166,6 +162,9 @@ servers:
       - "^cat.*$"
     blacklist:                  # Block matching commands
       - "^rm -rf.*$"
+    
+    # Safe directory for destructive commands (rm, etc.)
+    safeDirectory: /home/user   # rm allowed only within this path
 ```
 
 ## ⚙️ CLI Options

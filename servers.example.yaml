@@ -4,9 +4,6 @@
 # IMPORTANT: This file contains secrets (passwords/passphrases)
 # Do NOT commit the actual servers.yaml to git!
 
-# Default server to use when connectionName is not specified
-defaultServer: dev
-
 # Whether to pre-connect to all servers on startup
 preConnect: false
 
@@ -23,6 +20,8 @@ servers:
     passphrase: ""  # Leave empty if key is not encrypted
     # Optional: SOCKS proxy for connection
     # socksProxy: socks5://proxy-host:1085
+    # Safe directory for rm commands (optional)
+    # safeDirectory: /home/root
     # Command security: whitelist of allowed command patterns (regex)
     whitelist:
       - "^ls( .*)?$"
@@ -43,6 +42,7 @@ servers:
   #   username: deploy
   #   password: your_production_password
   #   socksProxy: socks5://192.168.1.100:1085
+  #   safeDirectory: /home/deploy  # rm only allowed here
   #   whitelist:
   #     - "^ls( .*)?$"
   #     - "^cat .*$"
