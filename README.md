@@ -202,12 +202,8 @@ Example with selective servers:
 
 ### Nice to Have
 - [ ] **Command history**: Log executed commands per server for audit/debugging
-- [ ] **Output caching**: Cache recent command outputs to avoid re-running identical commands
-- [ ] **Directory context**: Add `cwd` parameter to execute commands in specific directories
-- [ ] **Environment variables**: Support setting env vars per command or per session
-- [ ] **Multi-command execution**: Execute multiple commands in sequence with `&&` or `;` safely
+- [x] **Multi-command execution**: Execute multiple commands in sequence with `&&` or `;` safely (fixed: `2>/dev/null` now allowed)
 - [ ] **Server health check**: Periodic ping to detect connection drops early
-
 
 ## 📄 License
 

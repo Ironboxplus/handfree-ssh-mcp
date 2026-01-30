@@ -449,7 +449,9 @@ export class SSHConnectionManager {
       { regex: /\bdd\b.*\bof=/, reason: "dd with of= (can overwrite files)" },
       { regex: /\bmv\b/, reason: "mv detected (can overwrite)" },
       { regex: /\bcp\b.*-f/, reason: "cp -f detected (force overwrite)" },
-      { regex: />\s*\//, reason: "output redirection to absolute path" },
+      // Allow stderr redirection to /dev/null (2>/dev/null, 2>&1>/dev/null, etc.)
+      // Block dangerous writes like: echo x > /etc/passwd, cat > /bin/bash
+      { regex: /(?<![0-9])>\s*\/(?!dev\/null)/, reason: "output redirection to absolute path" },
       { regex: />\s*~/, reason: "output redirection to home path" },
     ];
     

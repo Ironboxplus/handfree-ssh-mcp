@@ -317,4 +317,110 @@ describe("Special Characters in Commands", () => {
   });
 });
 
+/**
+ * Test the destructive pattern matching logic
+ * (extracted from ssh-connection-manager.ts for testing)
+ */
+function getDestructiveMatch(command: string): string | null {
+  const destructivePatterns: Array<{ regex: RegExp; reason: string }> = [
+    { regex: /\brm\b/, reason: "rm in command chain" },
+    { regex: /\brmdir\b/, reason: "rmdir in command chain" },
+    { regex: /\bunlink\b/, reason: "unlink in command chain" },
+    { regex: /\bshred\b/, reason: "shred in command chain" },
+    { regex: /\btruncate\b/, reason: "truncate in command chain" },
+    { regex: /-delete\b/, reason: "find -delete detected" },
+    { regex: /-exec\s+rm\b/, reason: "find -exec rm detected" },
+    { regex: /\bdd\b.*\bof=/, reason: "dd with of= (can overwrite files)" },
+    { regex: /\bmv\b/, reason: "mv detected (can overwrite)" },
+    { regex: /\bcp\b.*-f/, reason: "cp -f detected (force overwrite)" },
+    // Allow stderr redirection to /dev/null (2>/dev/null, 2>&1>/dev/null, etc.)
+    // Block dangerous writes like: echo x > /etc/passwd, cat > /bin/bash
+    { regex: /(?<![0-9])>\s*\/(?!dev\/null)/, reason: "output redirection to absolute path" },
+    { regex: />\s*~/, reason: "output redirection to home path" },
+  ];
+  
+  for (const { regex, reason } of destructivePatterns) {
+    if (regex.test(command)) {
+      return reason;
+    }
+  }
+  return null;
+}
+
+describe("Destructive Pattern Detection", () => {
+  it("should ALLOW 'find ... 2>/dev/null | head -5' (stderr to /dev/null is safe)", () => {
+    const cmd = 'find /var/mobile/Library/Logs -name "*log*" 2>/dev/null | head -5';
+    const result = getDestructiveMatch(cmd);
+    assert.strictEqual(result, null, `Should allow stderr to /dev/null but got: ${result}`);
+  });
+
+  it("should ALLOW 'apt search vnc 2>/dev/null || true'", () => {
+    const cmd = "dpkg -l | grep -i vnc; apt search vnc 2>/dev/null || true";
+    const result = getDestructiveMatch(cmd);
+    assert.strictEqual(result, null, `Should allow stderr to /dev/null but got: ${result}`);
+  });
+
+  it("should ALLOW 'cat file 2>/dev/null || echo fallback'", () => {
+    const cmd = 'cat /var/mobile/Library/Preferences/file.plist 2>/dev/null || echo "not found"';
+    const result = getDestructiveMatch(cmd);
+    assert.strictEqual(result, null, `Should allow stderr to /dev/null but got: ${result}`);
+  });
+
+  it("should ALLOW '2>&1 > /dev/null' pattern", () => {
+    const cmd = "some_command 2>&1 >/dev/null";
+    const result = getDestructiveMatch(cmd);
+    assert.strictEqual(result, null, `Should allow redirect to /dev/null but got: ${result}`);
+  });
+
+  it("should BLOCK 'echo x > /etc/passwd' (dangerous write)", () => {
+    const cmd = 'echo "hacked" > /etc/passwd';
+    const result = getDestructiveMatch(cmd);
+    assert.strictEqual(result, "output redirection to absolute path", `Should block dangerous redirect`);
+  });
+
+  it("should BLOCK 'cat malware > /bin/bash' (dangerous write)", () => {
+    const cmd = "cat malware > /bin/bash";
+    const result = getDestructiveMatch(cmd);
+    assert.strictEqual(result, "output redirection to absolute path", `Should block dangerous redirect`);
+  });
+
+  it("should BLOCK '> /tmp/file' (stdout redirect to absolute path)", () => {
+    const cmd = "echo test > /tmp/file";
+    const result = getDestructiveMatch(cmd);
+    assert.strictEqual(result, "output redirection to absolute path", `Should block stdout redirect`);
+  });
+
+  it("should BLOCK 'rm -rf /' command", () => {
+    const result = getDestructiveMatch("rm -rf /");
+    assert.strictEqual(result, "rm in command chain");
+  });
+
+  it("should BLOCK 'echo test && rm file' (hidden rm)", () => {
+    const result = getDestructiveMatch("echo test && rm file");
+    assert.strictEqual(result, "rm in command chain");
+  });
+
+  it("should BLOCK 'find -delete' pattern", () => {
+    const result = getDestructiveMatch("find /tmp -name '*.log' -delete");
+    assert.strictEqual(result, "find -delete detected");
+  });
+
+  it("should BLOCK 'find -exec rm' pattern", () => {
+    const result = getDestructiveMatch("find /tmp -type f -exec rm {} \\;");
+    // Note: rm word boundary pattern matches first, which is also correct
+    assert.ok(result !== null, "Should block find -exec rm");
+    assert.ok(result.includes("rm"), `Should be blocked due to rm, got: ${result}`);
+  });
+
+  it("should BLOCK 'dd of=' pattern", () => {
+    const result = getDestructiveMatch("dd if=/dev/zero of=/dev/sda bs=4M");
+    assert.strictEqual(result, "dd with of= (can overwrite files)");
+  });
+
+  it("should BLOCK '> ~/' (home path redirect)", () => {
+    const result = getDestructiveMatch("echo test > ~/file");
+    assert.strictEqual(result, "output redirection to home path");
+  });
+});
+
 console.log("\n🧪 Running command validation tests...\n");
