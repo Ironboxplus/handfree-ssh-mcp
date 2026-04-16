@@ -3,6 +3,7 @@ import { SocksClient } from "socks";
 import { SSHConfig, SshConnectionConfigMap, ServerStatus } from "../models/types.js";
 import { Logger } from "../utils/logger.js";
 import { collectSystemStatus } from "../utils/status-collector.js";
+import { ToolError } from "../utils/tool-error.js";
 import fs from "fs";
 import path from "path";
 import { SFTPWrapper } from "ssh2";
@@ -138,6 +139,48 @@ export class SSHConnectionManager {
   }
 
   /**
+   * Hot-reload mutable policy fields from a fresh config map.
+   * Only updates whitelist, blacklist, and safeDirectory for servers that
+   * already exist. Does NOT touch SSH connections or credentials.
+   */
+  public updatePolicies(freshConfigs: SshConnectionConfigMap): void {
+    let changed = 0;
+
+    for (const [name, existing] of Object.entries(this.configs)) {
+      const fresh = freshConfigs[name];
+      if (!fresh) continue;
+
+      const wlChanged =
+        JSON.stringify(existing.commandWhitelist) !==
+        JSON.stringify(fresh.commandWhitelist);
+      const blChanged =
+        JSON.stringify(existing.commandBlacklist) !==
+        JSON.stringify(fresh.commandBlacklist);
+      const sdChanged = existing.safeDirectory !== fresh.safeDirectory;
+
+      if (wlChanged || blChanged || sdChanged) {
+        existing.commandWhitelist = fresh.commandWhitelist;
+        existing.commandBlacklist = fresh.commandBlacklist;
+        existing.safeDirectory = fresh.safeDirectory;
+        changed++;
+
+        const parts: string[] = [];
+        if (wlChanged) parts.push(`whitelist(${(fresh.commandWhitelist ?? []).length})`);
+        if (blChanged) parts.push(`blacklist(${(fresh.commandBlacklist ?? []).length})`);
+        if (sdChanged) parts.push(`safeDirectory(${fresh.safeDirectory ?? "none"})`);
+        Logger.log(
+          `Hot-reloaded policies for [${name}]: ${parts.join(", ")}`,
+          "info",
+        );
+      }
+    }
+
+    if (changed === 0) {
+      Logger.log("Config file changed but no policy updates detected", "info");
+    }
+  }
+
+  /**
    * Check if a server is enabled for use
    */
   private isServerEnabled(name: string): boolean {
@@ -145,6 +188,33 @@ export class SSHConnectionManager {
       return true; // All servers enabled
     }
     return this.enabledServers.includes(name);
+  }
+
+  /**
+   * Returns true when more than one server is enabled,
+   * meaning callers MUST specify connectionName explicitly.
+   */
+  public isMultiServer(): boolean {
+    const count = this.enabledServers
+      ? this.enabledServers.length
+      : Object.keys(this.configs).length;
+    return count > 1;
+  }
+
+  /**
+   * Resolve the target server name.
+   * When multiple servers are enabled, connectionName is mandatory.
+   */
+  public resolveServer(connectionName?: string): string {
+    if (this.isMultiServer() && !connectionName) {
+      const names = this.enabledServers ?? Object.keys(this.configs);
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `Multiple servers are enabled (${names.join(", ")}). You must specify connectionName explicitly. Call list-servers to see available names.`,
+        false,
+      );
+    }
+    return connectionName || this.defaultName;
   }
 
   /**
@@ -156,12 +226,16 @@ export class SSHConnectionManager {
     
     // Check if server exists
     if (!this.configs[key]) {
-      throw new Error(`SSH configuration for '${key}' not set`);
+      throw new ToolError("INVALID_CONFIGURATION", `SSH configuration for '${key}' not set`, false);
     }
     
     // Check if server is enabled
     if (!this.isServerEnabled(key)) {
-      throw new Error(`SSH server '${key}' is not enabled. Enabled servers: ${this.enabledServers?.join(", ") || "none"}`);
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `SSH server '${key}' is not enabled. Enabled servers: ${this.enabledServers?.join(", ") || "none"}`,
+        false,
+      );
     }
     
     return this.configs[key];
@@ -189,9 +263,15 @@ export class SSHConnectionManager {
    * Batch connect all configured SSH connections
    */
   public async connectAll(): Promise<void> {
-    const names = Object.keys(this.configs);
-    for (const name of names) {
-      await this.connect(name);
+    const names = this.enabledServers ?? Object.keys(this.configs);
+    const results = await Promise.allSettled(
+      names.map((name) => this.connect(name)),
+    );
+    const failures = results
+      .map((r, i) => (r.status === "rejected" ? `${names[i]}: ${(r.reason as Error).message}` : null))
+      .filter(Boolean);
+    if (failures.length > 0) {
+      Logger.log(`Pre-connect failures: ${failures.join("; ")}`, "error");
     }
   }
 
@@ -242,7 +322,7 @@ export class SSHConnectionManager {
       });
       client.on("error", (err: Error) => {
         this.connected.set(key, false);
-        reject(new Error(`SSH connection [${key}] failed: ${err.message}`));
+        reject(new ToolError("SSH_CONNECTION_FAILED", `SSH connection [${key}] failed: ${err.message}`, true));
       });
       client.on("close", () => {
         this.connected.set(key, false);
@@ -291,10 +371,12 @@ export class SSHConnectionManager {
           );
         } catch (err) {
           return reject(
-            new Error(
+            new ToolError(
+              "SSH_CONNECTION_FAILED",
               `Failed to create SOCKS proxy connection for [${key}]: ${
                 (err as Error).message
-              }`
+              }`,
+              true,
             )
           );
         }
@@ -311,10 +393,12 @@ export class SSHConnectionManager {
           );
         } catch (err) {
           return reject(
-            new Error(
+            new ToolError(
+              "LOCAL_FILE_READ_FAILED",
               `Failed to read private key file for [${key}]: ${
                 (err as Error).message
-              }`
+              }`,
+              false,
             )
           );
         }
@@ -323,8 +407,10 @@ export class SSHConnectionManager {
         Logger.log(`Using password authentication for [${key}]`, "info");
       } else {
         return reject(
-          new Error(
-            `No valid authentication method provided for [${key}] (password or private key)`
+          new ToolError(
+            "SSH_AUTHENTICATION_MISSING",
+            `No valid authentication method provided for [${key}] (password or private key)`,
+            false,
           )
         );
       }
@@ -340,7 +426,7 @@ export class SSHConnectionManager {
     const key = name || this.defaultName;
     const client = this.clients.get(key);
     if (!client) {
-      throw new Error(`SSH client for '${key}' not connected`);
+      throw new ToolError("SSH_CONNECTION_FAILED", `SSH client for '${key}' not connected`, true);
     }
     return client;
   }
@@ -356,7 +442,7 @@ export class SSHConnectionManager {
     }
     const client = this.clients.get(key);
     if (!client) {
-      throw new Error(`SSH client for '${key}' not initialized`);
+      throw new ToolError("SSH_CONNECTION_FAILED", `SSH client for '${key}' not initialized`, true);
     }
     return client;
   }
@@ -366,12 +452,15 @@ export class SSHConnectionManager {
    * @private
    */
   private isConnectionError(error: Error): boolean {
+    if (error instanceof ToolError) {
+      return error.code === "SSH_CONNECTION_FAILED";
+    }
+
     const msg = error.message.toLowerCase();
     return (
       msg.includes("not connected") ||
       msg.includes("connection") ||
       msg.includes("socket") ||
-      msg.includes("timeout") ||
       msg.includes("econnreset") ||
       msg.includes("econnrefused") ||
       msg.includes("epipe") ||
@@ -575,8 +664,8 @@ export class SSHConnectionManager {
     if (destructiveReason) {
       // Command contains rm/rmdir - check if it's a simple rm command or hidden in a chain
       const trimmed = command.trim();
-      
-      // If it starts with rm, validate it properly
+
+      // If it starts with rm, validate it properly but continue through whitelist/blacklist policy checks
       if (trimmed.startsWith('rm ') || trimmed === 'rm') {
         const rmValidation = this.validateRmCommand(trimmed, safeDir);
         if (!rmValidation.valid) {
@@ -586,15 +675,13 @@ export class SSHConnectionManager {
             reason: rmValidation.reason,
           };
         }
-        // rm is valid and within safe directory - allow it
-        Logger.log(`SECURITY: rm command allowed within safe directory (${safeDir}): ${command}`, "info");
-        return { isAllowed: true };
+        Logger.log(`SECURITY: rm command passed safe directory validation (${safeDir}): ${command}`, "info");
       } else {
         // Destructive pattern detected somewhere in the command (chained, subshell, redirection, etc.)
         Logger.log(`SECURITY: Destructive pattern detected (${destructiveReason}): ${command}`, "error");
         return {
           isAllowed: false,
-          reason: `Blocked destructive pattern: ${destructiveReason}. Command: "${command}"` ,
+          reason: `Blocked destructive pattern: ${destructiveReason}. Command: "${command}"`,
         };
       }
     }
@@ -682,7 +769,7 @@ export class SSHConnectionManager {
           // Handle immediate execution errors
           if (err) {
             cleanup();
-            reject(new Error(`Command execution error: ${err.message}`));
+            reject(new ToolError("COMMAND_EXECUTION_ERROR", `Command execution error: ${err.message}`, false));
             return;
           }
 
@@ -737,7 +824,7 @@ export class SSHConnectionManager {
           // Handle stream errors during execution
           stream.on("error", (err: Error) => {
             cleanup();
-            reject(new Error(`Stream error: ${err.message}`));
+            reject(new ToolError("COMMAND_EXECUTION_ERROR", `Stream error: ${err.message}`, false));
           });
 
           // Set timeout for command execution
@@ -756,7 +843,7 @@ export class SSHConnectionManager {
             } catch (e) {
               // Ignore errors when closing streams during timeout
             }
-            reject(new Error(`Command timeout: execution exceeded ${timeout}ms limit. Remote process killed.`));
+            reject(new ToolError("COMMAND_TIMEOUT", `Command timeout: execution exceeded ${timeout}ms limit. Remote process killed.`, false));
           }, timeout);
         }
       );
@@ -780,7 +867,11 @@ export class SSHConnectionManager {
     // Validate command input and security
     const validationResult = this.validateCommand(cmdString, name);
     if (!validationResult.isAllowed) {
-      throw new Error(`Command validation failed: ${validationResult.reason}`);
+      throw new ToolError(
+        "COMMAND_VALIDATION_FAILED",
+        `Command validation failed: ${validationResult.reason}`,
+        false,
+      );
     }
 
     const timeout = options.timeout || 30000; // Default 30 seconds timeout
@@ -865,7 +956,11 @@ export class SSHConnectionManager {
     // Validate command input and security
     const validationResult = this.validateCommand(cmdString, name);
     if (!validationResult.isAllowed) {
-      throw new Error(`Command validation failed: ${validationResult.reason}`);
+      throw new ToolError(
+        "COMMAND_VALIDATION_FAILED",
+        `Command validation failed: ${validationResult.reason}`,
+        false,
+      );
     }
 
     const timeout = options.timeout || 300000; // Default 5 minutes for streaming
@@ -953,7 +1048,7 @@ export class SSHConnectionManager {
         (err: Error | undefined, stream: ClientChannel) => {
           if (err) {
             cleanup();
-            reject(new Error(`Command execution error: ${err.message}`));
+            reject(new ToolError("COMMAND_EXECUTION_ERROR", `Command execution error: ${err.message}`, false));
             return;
           }
 
@@ -1021,7 +1116,7 @@ export class SSHConnectionManager {
           // Handle stream errors during execution
           stream.on("error", (err: Error) => {
             cleanup();
-            reject(new Error(`Stream error: ${err.message}`));
+            reject(new ToolError("COMMAND_EXECUTION_ERROR", `Stream error: ${err.message}`, false));
           });
 
           // Set timeout for command execution
@@ -1038,7 +1133,7 @@ export class SSHConnectionManager {
             } catch (e) {
               // Ignore errors when closing streams during timeout
             }
-            reject(new Error(`Command timeout: execution exceeded ${timeout}ms limit. Remote process killed.`));
+            reject(new ToolError("COMMAND_TIMEOUT", `Command timeout: execution exceeded ${timeout}ms limit. Remote process killed.`, false));
           }, timeout);
         }
       );
@@ -1052,8 +1147,10 @@ export class SSHConnectionManager {
     const resolvedPath = path.resolve(localPath);
     const workingDir = process.cwd();
     if (!resolvedPath.startsWith(workingDir)) {
-      throw new Error(
-        `Path traversal detected. Local path must be within the working directory.`
+      throw new ToolError(
+        "LOCAL_PATH_NOT_ALLOWED",
+        `Path traversal detected. Local path must be within the working directory.`,
+        false,
       );
     }
     return resolvedPath;
@@ -1073,7 +1170,7 @@ export class SSHConnectionManager {
     return new Promise<string>((resolve, reject) => {
       client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
         if (err) {
-          return reject(new Error(`SFTP connection failed: ${err.message}`));
+          return reject(new ToolError("SFTP_ERROR", `SFTP connection failed: ${err.message}`, true));
         }
 
         const readStream = fs.createReadStream(validatedLocalPath);
@@ -1090,12 +1187,12 @@ export class SSHConnectionManager {
 
         writeStream.on("error", (err: Error) => {
           cleanup();
-          reject(new Error(`File upload failed: ${err.message}`));
+          reject(new ToolError("SFTP_ERROR", `File upload failed: ${err.message}`, false));
         });
 
         readStream.on("error", (err: Error) => {
           cleanup();
-          reject(new Error(`Failed to read local file: ${err.message}`));
+          reject(new ToolError("LOCAL_FILE_READ_FAILED", `Failed to read local file: ${err.message}`, false));
         });
 
         readStream.pipe(writeStream);
@@ -1117,7 +1214,7 @@ export class SSHConnectionManager {
     return new Promise<string>((resolve, reject) => {
       client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
         if (err) {
-          return reject(new Error(`SFTP connection failed: ${err.message}`));
+          return reject(new ToolError("SFTP_ERROR", `SFTP connection failed: ${err.message}`, true));
         }
 
         const readStream = sftp.createReadStream(remotePath);
@@ -1134,12 +1231,12 @@ export class SSHConnectionManager {
 
         writeStream.on("error", (err: Error) => {
           cleanup();
-          reject(new Error(`Failed to save file: ${err.message}`));
+          reject(new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to save file: ${err.message}`, false));
         });
 
         readStream.on("error", (err: Error) => {
           cleanup();
-          reject(new Error(`File download failed: ${err.message}`));
+          reject(new ToolError("SFTP_ERROR", `File download failed: ${err.message}`, false));
         });
 
         readStream.pipe(writeStream);
@@ -1183,6 +1280,330 @@ export class SSHConnectionManager {
         enabled: this.isServerEnabled(key),
         status: status,
       };
+    });
+  }
+
+  /**
+   * Refresh system status for a server (or all enabled servers)
+   */
+  public async refreshStatus(name?: string): Promise<Record<string, ServerStatus>> {
+    const results: Record<string, ServerStatus> = {};
+    const names = name
+      ? [name]
+      : (this.enabledServers ?? Object.keys(this.configs));
+
+    await Promise.allSettled(
+      names.map(async (key) => {
+        try {
+          const client = await this.ensureConnected(key);
+          const status = await collectSystemStatus(client, key);
+          this.statusCache.set(key, status);
+          results[key] = status;
+        } catch (error) {
+          const fallback: ServerStatus = {
+            reachable: false,
+            lastUpdated: new Date().toISOString(),
+          };
+          this.statusCache.set(key, fallback);
+          results[key] = fallback;
+          Logger.log(
+            `Status refresh failed for [${key}]: ${(error as Error).message}`,
+            "error",
+          );
+        }
+      }),
+    );
+
+    return results;
+  }
+
+  /**
+   * Transfer a file between two remote servers by piping SFTP streams
+   * directly through the MCP host memory. No temp file, no SCP, no
+   * authorized-key exchange between the two servers required -- each
+   * side uses its own existing SSH session.
+   * After the transfer, file sizes are compared via SFTP stat.
+   * If both servers have md5sum, a hash verification is also performed.
+   */
+  public async transferBetweenServers(
+    sourceName: string,
+    sourceRemotePath: string,
+    destName: string,
+    destRemotePath: string,
+  ): Promise<string> {
+    const srcClient = await this.ensureConnected(sourceName);
+    const dstClient = await this.ensureConnected(destName);
+
+    const srcSftp = await this.openSftp(srcClient, "source");
+    const dstSftp = await this.openSftp(dstClient, "dest");
+
+    try {
+      // Get source file size before transfer
+      const srcStat = await this.sftpStat(srcSftp, sourceRemotePath, "source");
+
+      const readStream = srcSftp.createReadStream(sourceRemotePath);
+      const writeStream = dstSftp.createWriteStream(destRemotePath);
+
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const settle = (err?: Error) => {
+          if (settled) return;
+          settled = true;
+          err ? reject(err) : resolve();
+        };
+
+        writeStream.on("close", () => settle());
+        writeStream.on("error", (err: Error) =>
+          settle(new ToolError("SFTP_ERROR", `Dest write error: ${err.message}`, false)),
+        );
+        readStream.on("error", (err: Error) =>
+          settle(new ToolError("SFTP_ERROR", `Source read error: ${err.message}`, false)),
+        );
+
+        readStream.pipe(writeStream);
+      });
+
+      // --- Verification ---
+      const dstStat = await this.sftpStat(dstSftp, destRemotePath, "dest");
+      const verification: string[] = [];
+
+      // Size check
+      if (srcStat.size !== dstStat.size) {
+        throw new ToolError(
+          "SFTP_ERROR",
+          `Transfer verification failed: size mismatch (source=${srcStat.size} bytes, dest=${dstStat.size} bytes)`,
+          true,
+        );
+      }
+      verification.push(`size=${srcStat.size} bytes ✓`);
+
+      // MD5 check (best-effort: if md5sum is available on both servers)
+      const [srcMd5, dstMd5] = await Promise.all([
+        this.remoteMd5(srcClient, sourceRemotePath).catch(() => null),
+        this.remoteMd5(dstClient, destRemotePath).catch(() => null),
+      ]);
+
+      if (srcMd5 && dstMd5) {
+        if (srcMd5 !== dstMd5) {
+          throw new ToolError(
+            "SFTP_ERROR",
+            `Transfer verification failed: MD5 mismatch (source=${srcMd5}, dest=${dstMd5})`,
+            true,
+          );
+        }
+        verification.push(`md5=${srcMd5} ✓`);
+      }
+
+      const srcConfig = this.getConfig(sourceName);
+      const dstConfig = this.getConfig(destName);
+      return (
+        `Transfer complete (streamed via SFTP, verified: ${verification.join(", ")}): ` +
+        `${srcConfig.username}@${srcConfig.host}:${sourceRemotePath}` +
+        ` → ${dstConfig.username}@${dstConfig.host}:${destRemotePath}`
+      );
+    } finally {
+      srcSftp.end();
+      dstSftp.end();
+    }
+  }
+
+  /**
+   * SFTP stat a remote file.
+   */
+  private sftpStat(
+    sftp: SFTPWrapper,
+    remotePath: string,
+    label: string,
+  ): Promise<{ size: number }> {
+    return new Promise((resolve, reject) => {
+      sftp.stat(remotePath, (err, stats) => {
+        if (err) {
+          return reject(
+            new ToolError("SFTP_ERROR", `Failed to stat ${label} file: ${err.message}`, false),
+          );
+        }
+        resolve({ size: stats.size });
+      });
+    });
+  }
+
+  /**
+   * Compute MD5 of a remote file via ssh exec. Returns null if md5sum is unavailable.
+   */
+  private remoteMd5(client: Client, remotePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      client.exec(`md5sum ${this.shellQuote(remotePath)}`, (err, stream) => {
+        if (err) return reject(err);
+
+        let data = "";
+        stream.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+        stream.stderr.on("data", () => { /* ignore stderr */ });
+        stream.on("close", (code: number) => {
+          if (code !== 0) return reject(new Error("md5sum failed"));
+          const hash = data.trim().split(/\s+/)[0];
+          if (!hash || hash.length !== 32) return reject(new Error("unexpected md5sum output"));
+          resolve(hash);
+        });
+      });
+    });
+  }
+
+  /**
+   * Minimal POSIX shell quoting for a file path.
+   */
+  private shellQuote(s: string): string {
+    return "'" + s.replace(/'/g, "'\\''") + "'";
+  }
+
+  /**
+   * Open an SFTP session from an existing SSH client.
+   */
+  private openSftp(client: Client, label: string): Promise<SFTPWrapper> {
+    return new Promise((resolve, reject) => {
+      client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
+        if (err) {
+          return reject(
+            new ToolError("SFTP_ERROR", `SFTP connection failed (${label}): ${err.message}`, true),
+          );
+        }
+        resolve(sftp);
+      });
+    });
+  }
+
+  /**
+   * List remote files/directories via SFTP readdir
+   */
+  public async listRemoteDir(
+    remotePath: string,
+    name?: string,
+  ): Promise<Array<{ filename: string; isDirectory: boolean; size: number }>> {
+    const client = await this.ensureConnected(name);
+
+    return new Promise((resolve, reject) => {
+      client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
+        if (err) {
+          return reject(new ToolError("SFTP_ERROR", `SFTP connection failed: ${err.message}`, true));
+        }
+
+        sftp.readdir(remotePath, (err, list) => {
+          sftp.end();
+          if (err) {
+            return reject(new ToolError("SFTP_ERROR", `Failed to list remote directory: ${err.message}`, false));
+          }
+          const entries = list.map((entry) => ({
+            filename: entry.filename,
+            isDirectory: (entry.attrs.mode & 0o40000) !== 0,
+            size: entry.attrs.size,
+          }));
+          resolve(entries);
+        });
+      });
+    });
+  }
+
+  /**
+   * Upload a local directory recursively to a remote server
+   */
+  public async uploadDirectory(
+    localDir: string,
+    remoteDir: string,
+    name?: string,
+  ): Promise<string[]> {
+    const resolvedLocal = this.validateLocalPath(localDir);
+    if (!fs.statSync(resolvedLocal).isDirectory()) {
+      throw new ToolError("LOCAL_FILE_READ_FAILED", `Not a directory: ${localDir}`, false);
+    }
+
+    const results: string[] = [];
+
+    const client = await this.ensureConnected(name);
+    await this.sftpMkdirRecursive(client, remoteDir);
+
+    const entries = fs.readdirSync(resolvedLocal, { withFileTypes: true });
+    for (const entry of entries) {
+      const localPath = path.join(localDir, entry.name);
+      const remoteSub = `${remoteDir}/${entry.name}`;
+
+      if (entry.isDirectory()) {
+        const subResults = await this.uploadDirectory(localPath, remoteSub, name);
+        results.push(...subResults);
+      } else {
+        await this.upload(localPath, remoteSub, name);
+        results.push(remoteSub);
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Download a remote directory recursively to a local path
+   */
+  public async downloadDirectory(
+    remoteDir: string,
+    localDir: string,
+    name?: string,
+  ): Promise<string[]> {
+    const resolvedLocal = path.resolve(localDir);
+    const workingDir = process.cwd();
+    if (!resolvedLocal.startsWith(workingDir)) {
+      throw new ToolError("LOCAL_PATH_NOT_ALLOWED", "Path traversal detected.", false);
+    }
+
+    if (!fs.existsSync(resolvedLocal)) {
+      fs.mkdirSync(resolvedLocal, { recursive: true });
+    }
+
+    const results: string[] = [];
+    const entries = await this.listRemoteDir(remoteDir, name);
+
+    for (const entry of entries) {
+      if (entry.filename === "." || entry.filename === "..") continue;
+
+      const remotePath = `${remoteDir}/${entry.filename}`;
+      const localPath = path.join(localDir, entry.filename);
+
+      if (entry.isDirectory) {
+        const subResults = await this.downloadDirectory(remotePath, localPath, name);
+        results.push(...subResults);
+      } else {
+        await this.download(remotePath, localPath, name);
+        results.push(localPath);
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Create remote directory recursively via SFTP
+   */
+  private async sftpMkdirRecursive(client: Client, remotePath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
+        if (err) {
+          return reject(new ToolError("SFTP_ERROR", `SFTP connection failed: ${err.message}`, true));
+        }
+
+        const parts = remotePath.split("/").filter(Boolean);
+        let current = "";
+
+        const mkdirNext = (index: number) => {
+          if (index >= parts.length) {
+            sftp.end();
+            return resolve();
+          }
+
+          current += "/" + parts[index];
+          sftp.mkdir(current, (err) => {
+            // EEXIST is fine
+            mkdirNext(index + 1);
+          });
+        };
+
+        mkdirNext(0);
+      });
     });
   }
 }

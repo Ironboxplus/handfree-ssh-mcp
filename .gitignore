@@ -10,6 +10,7 @@ build/
 Thumbs.db
 
 # 编辑器和IDE文件
+.cursor/
 .idea/
 .vscode/
 *.swp

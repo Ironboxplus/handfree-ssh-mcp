@@ -1,9 +1,11 @@
+import fs from "fs";
+import path from "path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { registerAllTools } from "../tools/index.js";
-import { SERVER_CONFIG } from "../config/server.js";
+import { SERVER_CONFIG, SERVER_INSTRUCTIONS } from "../config/server.js";
 import { getConfigPath, getEnabledServersArg, loadConfigFromYaml } from "../config/config-loader.js";
 import { ParsedArgs } from "../models/types.js";
 
@@ -17,7 +19,9 @@ export class SshMcpServer {
   private sshManager: SSHConnectionManager;
 
   constructor() {
-    this.server = new McpServer(SERVER_CONFIG);
+    this.server = new McpServer(SERVER_CONFIG, {
+      instructions: SERVER_INSTRUCTIONS,
+    });
     this.sshManager = SSHConnectionManager.getInstance();
   }
 
@@ -34,7 +38,7 @@ export class SshMcpServer {
    * Required: --config <path-to-yaml>
    * Required: --enable-servers <server1,server2,...>
    */
-  private loadConfig(): ParsedArgs {
+  private loadConfig(): ParsedArgs & { resolvedConfigPath: string } {
     const args = process.argv.slice(2);
     
     // YAML config is required
@@ -73,8 +77,48 @@ export class SshMcpServer {
     
     Logger.log(`Enabled servers: ${enabledServers.join(", ")}`, "info");
     parsedArgs.enabledServers = enabledServers;
+
+    const resolvedConfigPath = path.isAbsolute(configPath)
+      ? configPath
+      : path.resolve(process.cwd(), configPath);
     
-    return parsedArgs;
+    return { ...parsedArgs, resolvedConfigPath };
+  }
+
+  /**
+   * Watch the YAML config file for changes and hot-reload policies
+   * (whitelist, blacklist, safeDirectory) without restarting.
+   */
+  private watchConfig(configPath: string): void {
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    try {
+      fs.watch(configPath, (eventType) => {
+        if (eventType !== "change") return;
+
+        // Debounce: editors often fire multiple events per save
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          try {
+            Logger.log("Config file changed, hot-reloading policies...", "info");
+            const fresh = loadConfigFromYaml(configPath);
+            this.sshManager.updatePolicies(fresh.configs);
+          } catch (error) {
+            Logger.log(
+              `Failed to hot-reload config: ${(error as Error).message}`,
+              "error",
+            );
+          }
+        }, 500);
+      });
+
+      Logger.log(`Watching config file for live policy updates: ${configPath}`, "info");
+    } catch (error) {
+      Logger.log(
+        `Could not watch config file (hot-reload disabled): ${(error as Error).message}`,
+        "error",
+      );
+    }
   }
 
   /**
@@ -82,7 +126,7 @@ export class SshMcpServer {
    */
   public async run(): Promise<void> {
     // Initialize SSH configuration
-    const parsedArgs = this.loadConfig();
+    const { resolvedConfigPath, ...parsedArgs } = this.loadConfig();
     this.sshManager.setConfig(parsedArgs.configs, parsedArgs.enabledServers);
 
     // Security warning
@@ -98,12 +142,12 @@ export class SshMcpServer {
       );
     }
 
-    // Pre-connect to all servers if flag is set
+    // Pre-connect to enabled servers if flag is set
     if (parsedArgs.preConnect) {
-      Logger.log("Pre-connecting to all configured SSH servers...", "info");
+      Logger.log("Pre-connecting to enabled SSH servers...", "info");
       try {
         await this.sshManager.connectAll();
-        Logger.log("Successfully pre-connected to all SSH servers", "info");
+        Logger.log("Successfully pre-connected to enabled SSH servers", "info");
       } catch (error) {
         Logger.log(
           `Warning: Some SSH connections failed during pre-connect: ${(error as Error).message}`,
@@ -111,6 +155,9 @@ export class SshMcpServer {
         );
       }
     }
+
+    // Watch config file for live policy hot-reload
+    this.watchConfig(resolvedConfigPath);
 
     // Register tools
     this.registerTools();

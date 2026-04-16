@@ -4,6 +4,8 @@ import { registerUploadTool } from "./upload.js";
 import { registerDownloadTool } from "./download.js";
 import { registerListServersTool } from "./list-servers.js";
 import { registerShowWhitelistTool } from "./show-whitelist.js";
+import { registerTransferTool } from "./transfer.js";
+import { registerHelpTool } from "./help.js";
 
 /**
  * Register all tools
@@ -15,4 +17,6 @@ export function registerAllTools(server: McpServer): void {
   registerDownloadTool(server);
   registerListServersTool(server);
   registerShowWhitelistTool(server);
+  registerTransferTool(server);
+  registerHelpTool(server);
 }

@@ -1,0 +1,163 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+const TOOL_HELP: Record<string, string> = {
+  "list-servers": `list-servers — Discover available SSH servers.
+
+Parameters:
+  refresh  (boolean, optional)  When true, re-collects live system status
+           (hostname, CPU, memory, disk, GPUs) from all enabled servers.
+           Without this, cached status from connection time is returned.
+
+Returns: JSON array of server objects with name, host, port, username,
+         connected, enabled, and optional status.
+
+Example:
+  list-servers                   → cached info
+  list-servers { refresh: true } → fresh system status`,
+
+  "execute-command": `execute-command — Run a shell command on a remote server.
+
+Parameters:
+  cmdString       (string, required)   The shell command to execute.
+  connectionName  (string, see below)  Target server name from list-servers.
+  stream          (boolean, optional)  Default true. Set false for short
+                  commands when you only need the final output.
+  timeout         (number, optional)   Max runtime in ms.
+                  Defaults: 300000 (stream) / 30000 (non-stream).
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Examples:
+  execute-command { cmdString: "pwd" }
+  execute-command { cmdString: "docker ps -a", connectionName: "prod", stream: false }
+  execute-command { cmdString: "tail -f /var/log/syslog", stream: true, timeout: 600000 }`,
+
+  "show-whitelist": `show-whitelist — Show allowed/blocked command patterns for a server.
+
+Parameters:
+  connectionName  (string, see below)  Target server name from list-servers.
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Returns: Whitelist patterns, blacklist patterns, and example commands.`,
+
+  "upload": `upload — Upload a single local file to a remote server over SFTP.
+
+Parameters:
+  localPath       (string, required)   File path on the MCP host.
+                  Must be inside the MCP working directory.
+  remotePath      (string, required)   Destination path on the remote server.
+  connectionName  (string, see below)  Target server name from list-servers.
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Example:
+  upload { localPath: "data.csv", remotePath: "/tmp/data.csv" }`,
+
+  "download": `download — Download a single file from a remote server over SFTP.
+
+Parameters:
+  remotePath      (string, required)   File path on the remote server.
+  localPath       (string, required)   Destination on the MCP host.
+                  Must be inside the MCP working directory.
+  connectionName  (string, see below)  Target server name from list-servers.
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Example:
+  download { remotePath: "/var/log/app.log", localPath: "app.log" }`,
+
+  "transfer": `transfer — Move files between hosts (single/recursive/cross-server).
+
+Modes:
+  upload    Push local → remote (single file or recursive directory).
+  download  Pull remote → local (single file or recursive directory).
+  relay     Stream a file from remote-A → remote-B via SFTP piping.
+            No temp file on the MCP host, no SCP, no authorized-key
+            exchange between the two servers. Each side uses its own
+            existing SSH session.
+
+Parameters for upload / download:
+  mode            (string, required)   "upload" or "download"
+  localPath       (string, required)   Path on the MCP host.
+  remotePath      (string, required)   Path on the remote server.
+  connectionName  (string, see below)  Target server name.
+  recursive       (boolean, optional)  True to transfer a whole directory tree.
+
+Parameters for relay:
+  mode              (string, required)   "relay"
+  sourceServer      (string, required)   Server name to read from.
+  sourceRemotePath  (string, required)   File path on source server.
+  destServer        (string, required)   Server name to write to.
+  destRemotePath    (string, required)   File path on dest server.
+
+connectionName rule (upload/download):
+  • If only one server is enabled → optional.
+  • If multiple servers are enabled → REQUIRED.
+
+Examples:
+  transfer { mode: "upload", localPath: "dist/", remotePath: "/opt/app/dist", recursive: true }
+  transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/var/log/app.log",
+             destServer: "backup", destRemotePath: "/backup/app.log" }`,
+
+  "help": `help — Show detailed usage for one or all tools.
+
+Parameters:
+  tool  (string, optional)  Tool name to get help for.
+        If omitted, shows a summary of all available tools.
+
+Example:
+  help                           → overview of all tools
+  help { tool: "execute-command" } → detailed usage for execute-command`,
+};
+
+const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details):
+
+  list-servers      Discover available SSH servers and their status.
+  execute-command   Run a shell command on a remote server.
+  show-whitelist    Show allowed/blocked command patterns.
+  upload            Upload a single file to a remote server.
+  download          Download a single file from a remote server.
+  transfer          Move files: single, recursive, or cross-server relay.
+  help              Show this help or detailed per-tool usage.
+
+Quick start:
+  1. list-servers → discover server names
+  2. show-whitelist { connectionName: "<name>" } → see what's allowed
+  3. execute-command { cmdString: "pwd", connectionName: "<name>" }`;
+
+/**
+ * Register help tool
+ */
+export function registerHelpTool(server: McpServer): void {
+  server.tool(
+    "help",
+    "Show detailed usage instructions for one or all tools. Call with no arguments for an overview, or specify a tool name for full parameter docs and examples.",
+    {
+      tool: z.string().optional().describe("Tool name to get detailed help for. Omit to see an overview of all tools."),
+    },
+    async ({ tool }) => {
+      if (tool) {
+        const text = TOOL_HELP[tool];
+        if (!text) {
+          return {
+            content: [{ type: "text", text: `Unknown tool: "${tool}". ${TOOL_OVERVIEW}` }],
+            isError: true,
+          };
+        }
+        return { content: [{ type: "text", text }] };
+      }
+
+      return { content: [{ type: "text", text: TOOL_OVERVIEW }] };
+    },
+  );
+}

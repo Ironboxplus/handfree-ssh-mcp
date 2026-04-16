@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
+import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
 
 /**
  * Register execute command tool
@@ -15,41 +16,38 @@ export function registerExecuteCommandTool(server: McpServer): void {
 
   server.tool(
     "execute-command",
-    "Execute command on connected server. Uses streaming mode by default for real-time output. Set stream=false for simple commands.",
+    "Execute a shell command on a remote server over SSH. Use this for command-line actions on the selected host. Streaming mode is enabled by default so long-running commands can emit progress; set stream=false for short commands where you only want the final output.",
     {
-      cmdString: z.string().describe("Command to execute"),
+      cmdString: z.string().describe("Exact remote shell command to run. Prefer a single command per call, for example 'pwd', 'ls -la', 'cat /etc/hostname', or 'git status'. Compound commands may be blocked by whitelist rules even if each subcommand is safe."),
       connectionName: z
         .string()
         .optional()
-        .describe("SSH connection name (optional, uses defaultServer from config)"),
+        .describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
       timeout: z
         .number()
         .optional()
         .describe(
-          "Command execution timeout in milliseconds (default: 300000ms for stream=true, 30000ms for stream=false)"
+          "Maximum runtime in milliseconds. Defaults to 300000 when stream=true and 30000 when stream=false. Increase this for long-running commands; reduce it for fast probes."
         ),
       stream: z
         .boolean()
         .optional()
         .describe(
-          "Enable real-time streaming output (default: true)"
+          "Whether to stream progress output. Default is true. Use false for short commands like pwd, ls, cat, head, tail, or git status when you only need the final result."
         ),
     },
     async ({ cmdString, connectionName, timeout, stream }, extra) => {
       try {
-        // Default to streaming mode (stream=true unless explicitly set to false)
+        const resolvedName = sshManager.resolveServer(connectionName);
         const useStream = stream !== false;
 
         if (useStream) {
-          // Streaming mode (default)
           const progressToken = extra._meta?.progressToken;
           let progressCounter = 0;
 
-          // Create progress callback if client provided a progress token
           const onProgress = progressToken
             ? (chunk: string) => {
                 progressCounter++;
-                // Send progress notification with the output chunk
                 extra.sendNotification({
                   method: "notifications/progress",
                   params: {
@@ -61,12 +59,11 @@ export function registerExecuteCommandTool(server: McpServer): void {
               }
             : undefined;
 
-          // Execute command with streaming support
           const result = await sshManager.executeCommandWithProgress(
             cmdString,
-            connectionName,
+            resolvedName,
             {
-              timeout: timeout || 300000, // 5 minutes default for streaming
+              timeout: timeout || 300000,
               onProgress,
             }
           );
@@ -76,10 +73,9 @@ export function registerExecuteCommandTool(server: McpServer): void {
           };
         }
 
-        // Non-streaming mode (only when stream=false)
         const result = await sshManager.executeCommand(
           cmdString,
-          connectionName,
+          resolvedName,
           {
             timeout: timeout || 30000,
           }
@@ -88,12 +84,10 @@ export function registerExecuteCommandTool(server: McpServer): void {
           content: [{ type: "text", text: result }],
         };
       } catch (error: unknown) {
-        const errorMessage = Logger.handleError(
-          error,
-          "Failed to execute command"
-        );
+        const toolError = toToolError(error, "COMMAND_EXECUTION_ERROR");
+        Logger.handleError(toolError, "Failed to execute command");
         return {
-          content: [{ type: "text", text: errorMessage }],
+          content: [{ type: "text", text: formatToolErrorResponse(toolError) }],
           isError: true,
         };
       }

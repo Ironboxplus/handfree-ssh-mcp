@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
+import { ToolError, formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
 
 /**
  * Register show-whitelist tool
@@ -13,22 +14,28 @@ export function registerShowWhitelistTool(server: McpServer): void {
 
   server.tool(
     "show-whitelist",
-    "Show allowed command patterns (whitelist) for a server. Use this to understand what commands you can execute.",
+    "Show the configured whitelist and blacklist for a server. Use this before execute-command when you need to understand which commands are allowed, why a command may be rejected, or what command patterns are safe to try next.",
     {
       connectionName: z
         .string()
         .optional()
-        .describe("SSH connection name (optional, uses defaultServer from config)"),
+        .describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
     },
     async ({ connectionName }) => {
       try {
-        const config = sshManager.getServerConfig(connectionName);
+        const resolvedName = sshManager.resolveServer(connectionName);
+        const config = sshManager.getServerConfig(resolvedName);
         
         if (!config) {
+          const toolError = new ToolError(
+            "INVALID_CONFIGURATION",
+            `Server '${resolvedName}' not found or not enabled.`,
+            false,
+          );
           return {
             content: [{
               type: "text",
-              text: `Server '${connectionName || "default"}' not found or not enabled.`
+              text: formatToolErrorResponse(toolError)
             }],
             isError: true,
           };
@@ -47,7 +54,6 @@ export function registerShowWhitelistTool(server: McpServer): void {
         } else {
           output += `${whitelist.length} patterns:\n\n`;
           for (const pattern of whitelist) {
-            // Try to make the regex more human-readable
             const readable = patternToReadable(pattern);
             output += `- \`${pattern}\``;
             if (readable !== pattern) {
@@ -85,12 +91,10 @@ export function registerShowWhitelistTool(server: McpServer): void {
           content: [{ type: "text", text: output }],
         };
       } catch (error: unknown) {
-        const errorMessage = Logger.handleError(
-          error,
-          "Failed to show whitelist"
-        );
+        const toolError = toToolError(error, "INVALID_CONFIGURATION");
+        Logger.handleError(toolError, "Failed to show whitelist");
         return {
-          content: [{ type: "text", text: errorMessage }],
+          content: [{ type: "text", text: formatToolErrorResponse(toolError) }],
           isError: true,
         };
       }
@@ -102,13 +106,10 @@ export function registerShowWhitelistTool(server: McpServer): void {
  * Convert regex pattern to human-readable description
  */
 function patternToReadable(pattern: string): string {
-  // Common transformations
   let readable = pattern;
   
-  // Remove anchors for display
   readable = readable.replace(/^\^/, "").replace(/\$$/, "");
   
-  // Common patterns
   if (readable === "ls( .*)?") return "ls, ls -la, ls /path, etc.";
   if (readable === "cat .*") return "cat <file>";
   if (readable === "pwd") return "pwd (current directory)";
@@ -131,7 +132,6 @@ function generateExamples(whitelist: string[]): string[] {
   const examples: string[] = [];
   
   for (const pattern of whitelist) {
-    // Try to generate a concrete example from the pattern
     if (pattern.includes("^ls")) examples.push("ls -la");
     if (pattern.includes("^cat")) examples.push("cat /etc/hostname");
     if (pattern.includes("^pwd")) examples.push("pwd");
@@ -155,6 +155,5 @@ function generateExamples(whitelist: string[]): string[] {
     if (pattern.includes("systemctl status")) examples.push("systemctl status <service>");
   }
   
-  // Remove duplicates
   return [...new Set(examples)];
 }

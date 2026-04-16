@@ -1,7 +1,26 @@
-/**
- * MCP Server configuration
- */
 export const SERVER_CONFIG = {
   name: "ssh-mcp-server",
-  version: "1.2.45",
+  version: "1.4.0",
 };
+
+export const SERVER_INSTRUCTIONS = `This server provides SSH access to the specific servers enabled at startup via --enable-servers.
+
+Recommended workflow:
+1. Call list-servers first to discover which server names are available, enabled, and currently connected.
+2. Use show-whitelist before execute-command when you are unsure whether a command is allowed.
+3. Use execute-command for remote shell commands. Prefer a single command per call. Compound commands such as "cmd1 && cmd2" may be rejected by whitelist rules even if each subcommand is individually safe.
+4. Use stream=false for short commands that should finish quickly, such as pwd, ls, cat, head, tail, git status, or docker ps.
+5. Use stream=true for commands that may take longer or where incremental output is useful.
+6. Use upload and download for single-file SFTP transfers. Use transfer for recursive directory transfers or cross-server relay.
+7. Call help or help { tool: "<name>" } for detailed per-tool parameter docs and examples.
+
+Server targeting:
+- When only one server is enabled, connectionName can be omitted and the server is auto-selected.
+- When multiple servers are enabled, connectionName is REQUIRED on execute-command, upload, download, show-whitelist, and transfer (upload/download mode). Omitting it returns an error listing the available names.
+
+Behavior notes:
+- A tool may automatically establish the SSH connection on first use.
+- Command execution is restricted by the configured whitelist and blacklist. If a command is rejected, inspect the whitelist rather than retrying the same command repeatedly.
+- Some commands return no output on success; this is normal.
+- File transfer tools use SFTP and can fail if the remote path is missing or permissions are insufficient.
+- Whitelist, blacklist, and safeDirectory changes in the YAML config are hot-reloaded without restarting the server.`;
