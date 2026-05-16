@@ -14,7 +14,7 @@ export function registerShowWhitelistTool(server: McpServer): void {
 
   server.tool(
     "show-whitelist",
-    "Show the configured whitelist and blacklist for a server. Use this before execute-command when you need to understand which commands are allowed, why a command may be rejected, or what command patterns are safe to try next.",
+    "Show the configured whitelist, blacklist, and SFTP path policy (allowedRemoteDirectories / allowedLocalDirectories) for a server. Use this before execute-command when you need to understand which commands are allowed, why a command may be rejected, or what command patterns are safe to try next. Also use it before upload / download / transfer to see which paths SFTP is permitted to touch.",
     {
       connectionName: z
         .string()
@@ -78,7 +78,60 @@ export function registerShowWhitelistTool(server: McpServer): void {
           }
           output += `\n`;
         }
-        
+
+        // SFTP path policy (upload / download / transfer tools only)
+        const allowedRemoteDirs = config.allowedRemoteDirectories ?? [];
+        const allowedLocalDirs = config.allowedLocalDirectories ?? [];
+        const mcpCwd = process.cwd();
+
+        output += `## 📂 SFTP Path Policy (upload / download / transfer)\n\n`;
+
+        // ----- Remote directories -----
+        output += `### Allowed remote directories\n\n`;
+        if (allowedRemoteDirs.length === 0) {
+          output += `⚠️ **\`allowedRemoteDirectories\` is NOT configured.** ` +
+            `SFTP upload/download/transfer is **disabled** for this server — every call will be rejected with \`REMOTE_PATH_NOT_ALLOWED\`. ` +
+            `To enable file transfer, add absolute POSIX directories under \`allowedRemoteDirectories\` in the server's YAML config.\n\n`;
+        } else {
+          output += `${allowedRemoteDirs.length} entr${allowedRemoteDirs.length === 1 ? "y" : "ies"}:\n\n`;
+          for (const dir of allowedRemoteDirs) {
+            output += `- \`${dir}\`\n`;
+          }
+          output += `\n`;
+        }
+
+        // ----- Local directories -----
+        output += `### Allowed local directories\n\n`;
+        output += `Always implicitly allowed: \`${mcpCwd}\` _(the MCP working directory)_\n\n`;
+        if (allowedLocalDirs.length === 0) {
+          output += `⚠️ **\`allowedLocalDirectories\` is NOT configured.** ` +
+            `Only paths inside the MCP working directory above can be used as the local side of upload/download — any other path will be rejected with \`LOCAL_PATH_NOT_ALLOWED\`. ` +
+            `To allow more locations, add absolute host paths under \`allowedLocalDirectories\` in the server's YAML config.\n\n`;
+        } else {
+          output += `Additional entries (${allowedLocalDirs.length}):\n\n`;
+          for (const dir of allowedLocalDirs) {
+            output += `- \`${dir}\`\n`;
+          }
+          output += `\n`;
+        }
+
+        // ----- Matching rules -----
+        output += `### Matching rules\n\n`;
+        output += `- A path is allowed iff it equals an entry above, or starts with \`<entry> + separator\`.\n`;
+        output += `- Remote paths must be absolute POSIX (\`/...\`); \`..\` segments and null bytes are rejected up-front.\n`;
+        output += `- Local paths are resolved on the MCP host first, then matched.\n`;
+        output += `- These path lists do **not** affect \`execute-command\`. They only restrict SFTP file transfers.\n\n`;
+
+        // ----- Output log policy (execute-command full-output persistence) -----
+        const outputLogRoot = sshManager.getOutputLogRoot();
+        const serverLogDir = `${outputLogRoot}/${config.name}/${config.username}`.replace(/\\/g, "/");
+        output += `## 📝 \`execute-command\` Output Logs\n\n`;
+        output += `Every \`execute-command\` call returns at most \`maxOutputBytes\` (default 65536) bytes per stream, tail-only. The FULL stdout/stderr is always persisted to disk:\n\n`;
+        output += `- Root: \`${outputLogRoot}\` _(override via the top-level \`outputLogDir:\` field in \`servers.yaml\`)_\n`;
+        output += `- This server's logs land under: \`${serverLogDir}/\`\n`;
+        output += `- File name: \`<timestamp>-<pid>-<rand>.log\` with \`=== META / STDOUT / STDERR / END ===\` markers.\n`;
+        output += `- When output is truncated, the response includes an \`[OUTPUT TRUNCATED]\` header with the on-disk log path.\n\n`;
+
         // Quick examples
         output += `## 💡 Example Commands\n\n`;
         output += `Based on the whitelist, here are some commands you can likely use:\n\n`;

@@ -27,3 +27,18 @@ servers.yml
 *.servers.yml
 ssh-config.yaml
 ssh-config.yml
+
+# SSH keys and other credentials — never commit these
+*.pem
+*.key
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.pub
+.env
+.env.*
+
+# execute-command persistent output logs.
+# These can contain remote file contents, hostnames, and command output.
+.handfree-output/

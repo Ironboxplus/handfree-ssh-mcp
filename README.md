@@ -165,6 +165,50 @@ servers:
     
     # Safe directory for destructive commands (rm, etc.)
     safeDirectory: /home/user   # rm allowed only within this path
+
+    # SFTP path policy — applies ONLY to upload / download / transfer.
+    # execute-command is NOT affected by these lists.
+    # If `allowedRemoteDirectories` is unset or empty, SFTP is DISABLED for the server.
+    allowedRemoteDirectories:
+      - /home/user
+      - /tmp
+    # Extra local dirs allowed as SFTP source/target.
+    # The MCP working directory is always permitted implicitly.
+    allowedLocalDirectories:
+      - /path/to/extra/local/dir
+```
+
+### SFTP path policy
+
+| Field | Scope | Default behavior |
+|---|---|---|
+| `allowedRemoteDirectories` | `upload` / `download` / `transfer` only | **Unset = SFTP disabled.** Must list absolute POSIX directories. |
+| `allowedLocalDirectories` | `upload` / `download` only | Unset = only the MCP working directory is allowed. |
+
+Path matching is exact-equal or `dir + separator` prefix. `..` segments and null bytes are rejected. Use `show-whitelist` to inspect a server's current SFTP policy.
+
+### Upload behaviors
+
+- **CRLF auto-fix for shell scripts.** When uploading a `.sh`, `.bash`, or `.zsh` file, any `\r\n` line endings are automatically converted to `\n` before the bytes are sent. The response notes when this happens and how many line endings were rewritten. The local file on disk is left untouched.
+- **Skip-if-identical (default on).** Before transferring, `upload` checks whether the remote file already matches the local payload. Files ≤ 256 MiB are compared byte-for-byte; larger files are compared via MD5 (using `md5sum` on the remote host). **Shell scripts (`.sh` / `.bash` / `.zsh`) are compared in a line-ending-agnostic way — both sides are LF-normalized before the comparison, so a CRLF-only diff is treated as identical and the upload is still skipped.** If they match, the upload is skipped and the response says so. Pass `skipIfIdentical: false` to force a re-upload. Recursive `transfer` (`mode: upload`, `recursive: true`) applies the same check per file.
+
+### `execute-command` output capping & full logs
+
+`execute-command` always persists the FULL stdout and stderr of every invocation to a local plain-text log file, then returns only a tail-truncated view to the caller. This keeps the LLM-visible payload small without losing any data.
+
+- **Default cap:** 65536 bytes (64 KiB) per stream, tail-only. Set `maxOutputBytes` on the tool call to raise/lower the cap.
+- **Streaming is unaffected.** When `stream: true`, every chunk still reaches the progress channel live; only the final aggregated return value is capped.
+- **Log path:** `<outputLogDir>/<server-name>/<username>/<timestamp>-<pid>-<rand>.log`. Default `outputLogDir` is `<cwd>/.handfree-output`. Override with a top-level `outputLogDir:` entry in `servers.yaml` (supports `~` and relative paths).
+- **Log format:** plain UTF-8 text with `=== META ===` / `=== STDOUT ===` / `=== STDERR ===` / `=== END ===` separators. Tail with `tail -f` while a command is running? Not yet — the file is finalized on close.
+- **Truncation marker:** when output is trimmed, the returned text starts with an `[OUTPUT TRUNCATED]` header that lists total bytes, bytes dropped, and the on-disk log path. When output fits within the cap, no header is added and no log path is reported (the file is still written).
+- **Retention:** none. Manage cleanup yourself (e.g. `find .handfree-output -mtime +7 -delete`).
+- **Failures are non-fatal.** If the log file cannot be written, the command still completes and the failure is logged as an MCP-side warning.
+
+```yaml
+# servers.yaml
+outputLogDir: ~/handfree-logs  # optional; defaults to <cwd>/.handfree-output
+servers:
+  dev: { ... }
 ```
 
 ## ⚙️ CLI Options

@@ -34,10 +34,10 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         "'upload' pushes local → remote. 'download' pulls remote → local. 'relay' copies remote-A → remote-B through the MCP host.",
       ),
       localPath: z.string().optional().describe(
-        "(upload/download only) Path on the MCP host. Must be inside the working directory.",
+        "(upload/download only) Path on the MCP host. Must be inside the MCP working directory or one of the server's allowedLocalDirectories.",
       ),
       remotePath: z.string().optional().describe(
-        "(upload/download only) Path on the remote server.",
+        "(upload/download only) Absolute POSIX path on the remote server. Must live inside one of the server's allowedRemoteDirectories — call show-whitelist to discover the allowed paths.",
       ),
       connectionName: z.string().optional().describe(
         "(upload/download only) Target server name from list-servers. Required when multiple servers are enabled.",
@@ -46,16 +46,19 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         "(relay only) Server name to download the file from.",
       ),
       sourceRemotePath: z.string().optional().describe(
-        "(relay only) File path on the source server.",
+        "(relay only) Absolute POSIX file path on the source server. Must live inside the source server's allowedRemoteDirectories.",
       ),
       destServer: z.string().optional().describe(
         "(relay only) Server name to upload the file to.",
       ),
       destRemotePath: z.string().optional().describe(
-        "(relay only) Destination file path on the target server.",
+        "(relay only) Absolute POSIX destination path on the target server. Must live inside the destination server's allowedRemoteDirectories.",
       ),
       recursive: z.boolean().optional().describe(
         "(upload/download only) When true, transfers an entire directory tree recursively. Default false.",
+      ),
+      skipIfIdentical: z.boolean().optional().describe(
+        "(upload only) When true (default), skip the upload if the remote file already matches the local file byte-for-byte (small files) or by MD5 hash (files larger than 256 MiB). Shell scripts (.sh / .bash / .zsh) are compared in a line-ending-agnostic way so CRLF\u2194LF differences alone do not trigger a re-upload. Set to false to force re-upload.",
       ),
     },
     async (params) => {
@@ -77,7 +80,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         }
 
         // upload or download
-        const { localPath, remotePath, connectionName, recursive } = params;
+        const { localPath, remotePath, connectionName, recursive, skipIfIdentical } = params;
         if (!localPath || !remotePath) {
           return {
             content: [{ type: "text", text: `${mode} mode requires: localPath, remotePath` }],
@@ -86,11 +89,12 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         }
 
         const resolvedName = sshManager.resolveServer(connectionName);
+        const uploadOptions = { skipIfIdentical: skipIfIdentical !== false };
 
         if (recursive) {
           let files: string[];
           if (mode === "upload") {
-            files = await sshManager.uploadDirectory(localPath, remotePath, resolvedName);
+            files = await sshManager.uploadDirectory(localPath, remotePath, resolvedName, uploadOptions);
           } else {
             files = await sshManager.downloadDirectory(remotePath, localPath, resolvedName);
           }
@@ -102,7 +106,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
 
         // Single file
         if (mode === "upload") {
-          const result = await sshManager.upload(localPath, remotePath, resolvedName);
+          const result = await sshManager.upload(localPath, remotePath, resolvedName, uploadOptions);
           return { content: [{ type: "text", text: result }] };
         } else {
           const result = await sshManager.download(remotePath, localPath, resolvedName);

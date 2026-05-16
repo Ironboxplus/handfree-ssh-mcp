@@ -12,16 +12,21 @@ export function registerUploadTool(server: McpServer): void {
 
   server.tool(
     "upload",
-    "Upload a local file from the MCP host to the remote server over SFTP. Use this when the file already exists locally and must be copied to the selected SSH server.",
+    "Upload a local file from the MCP host to the remote server over SFTP. Use this when the file already exists locally and must be copied to the selected SSH server. The remote destination must live inside one of the server's allowedRemoteDirectories; call show-whitelist to discover the allowed paths. " +
+      "Shell scripts (.sh / .bash / .zsh) with CRLF line endings are auto-converted to LF before upload (the response notes when this happens). " +
+      "By default the upload is skipped if the remote file is already identical to the local one (byte-compare for files \u2264 256 MiB, MD5 otherwise; shell scripts are compared in a line-ending-agnostic way so CRLF\u2194LF differences alone do not trigger a re-upload) \u2014 pass skipIfIdentical=false to force a re-upload.",
     {
-      localPath: z.string().describe("Path to a local file on the MCP host. This path must stay inside the MCP server working directory or it will be rejected."),
-      remotePath: z.string().describe("Destination path on the remote server, such as /tmp/file.txt or ./file.txt."),
+      localPath: z.string().describe("Path to a local file on the MCP host. Must be inside the MCP working directory or one of the server's allowedLocalDirectories."),
+      remotePath: z.string().describe("Destination path on the remote server. Must be an absolute POSIX path inside one of the server's allowedRemoteDirectories (e.g. /home/user/uploads/file.txt)."),
       connectionName: z.string().optional().describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
+      skipIfIdentical: z.boolean().optional().describe("When true (default), skip the upload if the remote file is already identical (byte-compare for files \u2264 256 MiB, MD5 otherwise; shell scripts ignore CRLF\u2194LF differences). Set to false to force re-upload."),
     },
-    async ({ localPath, remotePath, connectionName }) => {
+    async ({ localPath, remotePath, connectionName, skipIfIdentical }) => {
       try {
         const resolvedName = sshManager.resolveServer(connectionName);
-        const result = await sshManager.upload(localPath, remotePath, resolvedName);
+        const result = await sshManager.upload(localPath, remotePath, resolvedName, {
+          skipIfIdentical: skipIfIdentical !== false,
+        });
         return {
           content: [{ type: "text", text: result }],
         };

@@ -103,6 +103,7 @@ export class SshMcpServer {
             Logger.log("Config file changed, hot-reloading policies...", "info");
             const fresh = loadConfigFromYaml(configPath);
             this.sshManager.updatePolicies(fresh.configs);
+            this.sshManager.setOutputLogRoot(fresh.outputLogDir);
           } catch (error) {
             Logger.log(
               `Failed to hot-reload config: ${(error as Error).message}`,
@@ -128,6 +129,7 @@ export class SshMcpServer {
     // Initialize SSH configuration
     const { resolvedConfigPath, ...parsedArgs } = this.loadConfig();
     this.sshManager.setConfig(parsedArgs.configs, parsedArgs.enabledServers);
+    this.sshManager.setOutputLogRoot(parsedArgs.outputLogDir);
 
     // Security warning
     const allConfigs = Object.values(parsedArgs.configs);

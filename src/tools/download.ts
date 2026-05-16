@@ -12,10 +12,10 @@ export function registerDownloadTool(server: McpServer): void {
 
   server.tool(
     "download",
-    "Download a file from the remote server to the MCP host over SFTP. Use this when you need to inspect or save a remote file locally.",
+    "Download a file from the remote server to the MCP host over SFTP. Use this when you need to inspect or save a remote file locally. The remote source must live inside one of the server's allowedRemoteDirectories; call show-whitelist to discover the allowed paths.",
     {
-      remotePath: z.string().describe("Path to the file on the remote server, such as /var/log/app.log or ./output.txt."),
-      localPath: z.string().describe("Destination path on the MCP host. This path must stay inside the MCP server working directory or it will be rejected."),
+      remotePath: z.string().describe("Path to the file on the remote server. Must be an absolute POSIX path inside one of the server's allowedRemoteDirectories (e.g. /var/log/app.log)."),
+      localPath: z.string().describe("Destination path on the MCP host. Must be inside the MCP working directory or one of the server's allowedLocalDirectories."),
       connectionName: z.string().optional().describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
     },
     async ({ remotePath, localPath, connectionName }) => {

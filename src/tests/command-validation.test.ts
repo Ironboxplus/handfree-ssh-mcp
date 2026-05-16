@@ -7,6 +7,9 @@
 
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert";
+import os from "node:os";
+import path from "node:path";
+import fsForTest from "node:fs";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { ToolError } from "../utils/tool-error.js";
 
@@ -499,13 +502,15 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalEnsureConnected = manager.ensureConnected;
-    const originalExecuteCommandInternal = manager.executeCommandInternal;
+    const originalRunCommandStream = manager.runCommandStream;
     const originalReconnect = manager.reconnect;
+    const originalCreateLogWriter = manager.createLogWriter;
     let executeCalls = 0;
     let reconnectCalls = 0;
 
     manager.ensureConnected = async () => ({}) as any;
-    manager.executeCommandInternal = async () => {
+    manager.createLogWriter = () => null; // skip disk writes in this test
+    manager.runCommandStream = async () => {
       executeCalls += 1;
       throw new ToolError("COMMAND_TIMEOUT", "timed out", false);
     };
@@ -522,8 +527,9 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(reconnectCalls, 0);
     } finally {
       manager.ensureConnected = originalEnsureConnected;
-      manager.executeCommandInternal = originalExecuteCommandInternal;
+      manager.runCommandStream = originalRunCommandStream;
       manager.reconnect = originalReconnect;
+      manager.createLogWriter = originalCreateLogWriter;
     }
   });
 
@@ -538,18 +544,26 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalEnsureConnected = manager.ensureConnected;
-    const originalExecuteCommandInternal = manager.executeCommandInternal;
+    const originalRunCommandStream = manager.runCommandStream;
     const originalReconnect = manager.reconnect;
+    const originalCreateLogWriter = manager.createLogWriter;
     let executeCalls = 0;
     let reconnectCalls = 0;
 
     manager.ensureConnected = async () => ({}) as any;
-    manager.executeCommandInternal = async () => {
+    manager.createLogWriter = () => null;
+    manager.runCommandStream = async (
+      _cmd: string,
+      _client: unknown,
+      _timeout: number,
+      sinks: { stdoutCollector?: { push(c: string): void } },
+    ) => {
       executeCalls += 1;
       if (executeCalls === 1) {
         throw new ToolError("SSH_CONNECTION_FAILED", "socket closed", true);
       }
-      return "ok";
+      sinks.stdoutCollector?.push("ok");
+      return 0;
     };
     manager.reconnect = async () => {
       reconnectCalls += 1;
@@ -562,8 +576,9 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(reconnectCalls, 1);
     } finally {
       manager.ensureConnected = originalEnsureConnected;
-      manager.executeCommandInternal = originalExecuteCommandInternal;
+      manager.runCommandStream = originalRunCommandStream;
       manager.reconnect = originalReconnect;
+      manager.createLogWriter = originalCreateLogWriter;
     }
   });
 
@@ -641,6 +656,536 @@ describe("SSHConnectionManager regressions", () => {
       () => manager.connect("dev"),
       (error: unknown) => error instanceof ToolError && error.code === "SSH_AUTHENTICATION_MISSING",
     );
+  });
+});
+
+describe("SFTP path validators", () => {
+  const manager = SSHConnectionManager.getInstance() as any;
+
+  const baseConfig = (overrides: Record<string, unknown> = {}) => ({
+    name: "dev",
+    host: "127.0.0.1",
+    port: 22,
+    username: "root",
+    password: "test-password",
+    ...overrides,
+  });
+
+  afterEach(() => {
+    manager.disconnect();
+    manager.setConfig({}, undefined);
+  });
+
+  // -------- validateRemotePath --------
+
+  it("should reject SFTP when allowedRemoteDirectories is unset", () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+    assert.throws(
+      () => manager.validateRemotePath("/home/test/file.txt", "dev"),
+      (e: unknown) =>
+        e instanceof ToolError &&
+        e.code === "REMOTE_PATH_NOT_ALLOWED" &&
+        /no 'allowedRemoteDirectories' configured/.test(e.message),
+    );
+  });
+
+  it("should reject SFTP when allowedRemoteDirectories is empty", () => {
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: [] }) },
+      ["dev"],
+    );
+    assert.throws(
+      () => manager.validateRemotePath("/home/test/file.txt", "dev"),
+      (e: unknown) => e instanceof ToolError && e.code === "REMOTE_PATH_NOT_ALLOWED",
+    );
+  });
+
+  it("should accept a remote path inside an allowed directory", () => {
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: ["/home/test", "/tmp"] }) },
+      ["dev"],
+    );
+    assert.strictEqual(
+      manager.validateRemotePath("/home/test/sub/file.txt", "dev"),
+      "/home/test/sub/file.txt",
+    );
+    assert.strictEqual(
+      manager.validateRemotePath("/tmp/file.txt", "dev"),
+      "/tmp/file.txt",
+    );
+  });
+
+  it("should accept an exact-match remote directory path", () => {
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: ["/home/test"] }) },
+      ["dev"],
+    );
+    assert.strictEqual(
+      manager.validateRemotePath("/home/test", "dev"),
+      "/home/test",
+    );
+  });
+
+  it("should reject a remote path outside the allowed directories", () => {
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: ["/home/test"] }) },
+      ["dev"],
+    );
+    assert.throws(
+      () => manager.validateRemotePath("/etc/passwd", "dev"),
+      (e: unknown) =>
+        e instanceof ToolError &&
+        e.code === "REMOTE_PATH_NOT_ALLOWED" &&
+        /not inside any allowedRemoteDirectories/.test(e.message),
+    );
+  });
+
+  it("should reject a prefix-match-but-different-directory remote path", () => {
+    // "/home/testing/x" must NOT match allowed root "/home/test"
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: ["/home/test"] }) },
+      ["dev"],
+    );
+    assert.throws(
+      () => manager.validateRemotePath("/home/testing/x", "dev"),
+      (e: unknown) => e instanceof ToolError && e.code === "REMOTE_PATH_NOT_ALLOWED",
+    );
+  });
+
+  it("should reject relative remote paths", () => {
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: ["/home/test"] }) },
+      ["dev"],
+    );
+    assert.throws(
+      () => manager.validateRemotePath("home/test/file.txt", "dev"),
+      (e: unknown) =>
+        e instanceof ToolError &&
+        e.code === "REMOTE_PATH_NOT_ALLOWED" &&
+        /absolute POSIX path/.test(e.message),
+    );
+  });
+
+  it("should reject '..' segments in remote paths", () => {
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: ["/home/test"] }) },
+      ["dev"],
+    );
+    assert.throws(
+      () => manager.validateRemotePath("/home/test/../etc/passwd", "dev"),
+      (e: unknown) => e instanceof ToolError && e.code === "REMOTE_PATH_NOT_ALLOWED",
+    );
+  });
+
+  it("should reject null bytes in remote paths", () => {
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: ["/home/test"] }) },
+      ["dev"],
+    );
+    assert.throws(
+      () => manager.validateRemotePath("/home/test/file\0.txt", "dev"),
+      (e: unknown) => e instanceof ToolError && e.code === "REMOTE_PATH_NOT_ALLOWED",
+    );
+  });
+
+  it("should allow any path under root '/' when '/' is in allowedRemoteDirectories", () => {
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: ["/"] }) },
+      ["dev"],
+    );
+    assert.strictEqual(
+      manager.validateRemotePath("/etc/hosts", "dev"),
+      "/etc/hosts",
+    );
+  });
+
+  // -------- validateLocalPath --------
+
+  it("should accept a local path inside process.cwd() by default", () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+    const cwdFile = process.cwd() + (process.platform === "win32" ? "\\test.txt" : "/test.txt");
+    assert.strictEqual(
+      manager.validateLocalPath(cwdFile, "dev"),
+      cwdFile,
+    );
+  });
+
+  it("should accept a local path inside an allowedLocalDirectories entry", () => {
+    // Use the temp dir of the OS as an allowed directory
+    const tmp = path.resolve(os.tmpdir());
+
+    manager.setConfig(
+      { dev: baseConfig({ allowedLocalDirectories: [tmp] }) },
+      ["dev"],
+    );
+
+    const file = path.join(tmp, "handfree-test-file.txt");
+    assert.strictEqual(manager.validateLocalPath(file, "dev"), file);
+  });
+
+  it("should reject a local path outside cwd and outside allowedLocalDirectories", () => {
+    const tmp = path.resolve(os.tmpdir());
+
+    manager.setConfig({ dev: baseConfig() }, ["dev"]); // no allowedLocalDirectories
+    const file = path.join(tmp, "handfree-test-rejected.txt");
+
+    // Skip the case where tmpdir is somehow inside cwd (rare on Windows)
+    if (!file.startsWith(process.cwd() + path.sep) && file !== process.cwd()) {
+      assert.throws(
+        () => manager.validateLocalPath(file, "dev"),
+        (e: unknown) =>
+          e instanceof ToolError &&
+          e.code === "LOCAL_PATH_NOT_ALLOWED" &&
+          /not inside any allowed directory/.test(e.message),
+      );
+    }
+  });
+});
+
+describe("Upload CRLF auto-fix", () => {
+  // Access the private static helper via 'any' for testing.
+  const helper = (SSHConnectionManager as any).maybeFixShellScriptLineEndings as (
+    localPath: string,
+    buffer: Buffer,
+  ) => { buffer: Buffer; fixed: boolean; replacedCount: number };
+
+  it("should convert CRLF to LF for .sh files", () => {
+    const input = Buffer.from("#!/bin/sh\r\necho hi\r\n", "utf8");
+    const result = helper("/x/script.sh", input);
+    assert.strictEqual(result.fixed, true);
+    assert.strictEqual(result.replacedCount, 2);
+    assert.strictEqual(result.buffer.toString("utf8"), "#!/bin/sh\necho hi\n");
+  });
+
+  it("should convert CRLF to LF for .bash files", () => {
+    const input = Buffer.from("a\r\nb\r\nc", "utf8");
+    const result = helper("/x/run.bash", input);
+    assert.strictEqual(result.fixed, true);
+    assert.strictEqual(result.replacedCount, 2);
+    assert.strictEqual(result.buffer.toString("utf8"), "a\nb\nc");
+  });
+
+  it("should convert CRLF to LF for .zsh files (case-insensitive)", () => {
+    const input = Buffer.from("a\r\nb", "utf8");
+    const result = helper("/x/run.ZSH", input);
+    assert.strictEqual(result.fixed, true);
+    assert.strictEqual(result.replacedCount, 1);
+  });
+
+  it("should NOT touch .sh files that already have LF only", () => {
+    const input = Buffer.from("#!/bin/sh\necho hi\n", "utf8");
+    const result = helper("/x/script.sh", input);
+    assert.strictEqual(result.fixed, false);
+    assert.strictEqual(result.replacedCount, 0);
+    assert.strictEqual(result.buffer, input); // same buffer instance
+  });
+
+  it("should NOT touch non-shell-script extensions even with CRLF", () => {
+    const input = Buffer.from("a\r\nb\r\n", "utf8");
+    const result = helper("/x/data.txt", input);
+    assert.strictEqual(result.fixed, false);
+    assert.strictEqual(result.replacedCount, 0);
+  });
+
+  it("should NOT touch files with no extension", () => {
+    const input = Buffer.from("a\r\nb\r\n", "utf8");
+    const result = helper("/x/Makefile", input);
+    assert.strictEqual(result.fixed, false);
+  });
+
+  it("should preserve lone CR (not part of CRLF)", () => {
+    const input = Buffer.from("a\rb\r\nc", "utf8");
+    const result = helper("/x/run.sh", input);
+    assert.strictEqual(result.fixed, true);
+    assert.strictEqual(result.replacedCount, 1);
+    assert.strictEqual(result.buffer.toString("utf8"), "a\rb\nc");
+  });
+
+  it("should preserve binary bytes outside of CRLF sequences", () => {
+    const input = Buffer.from([0xff, 0x0d, 0x0a, 0x80, 0x0d, 0x0a]);
+    const result = helper("/x/blob.sh", input);
+    assert.strictEqual(result.fixed, true);
+    assert.strictEqual(result.replacedCount, 2);
+    assert.deepStrictEqual(
+      Array.from(result.buffer),
+      [0xff, 0x0a, 0x80, 0x0a],
+    );
+  });
+});
+
+describe("Upload skip-if-identical", () => {
+  const manager = SSHConnectionManager.getInstance() as any;
+
+  const baseConfig = (overrides: Record<string, unknown> = {}) => ({
+    name: "dev",
+    host: "127.0.0.1",
+    port: 22,
+    username: "root",
+    password: "test-password",
+    allowedRemoteDirectories: ["/tmp"],
+    ...overrides,
+  });
+
+  let tempFile: string;
+
+  afterEach(() => {
+    manager.disconnect();
+    manager.setConfig({}, undefined);
+    if (tempFile && fsForTest.existsSync(tempFile)) {
+      fsForTest.unlinkSync(tempFile);
+    }
+  });
+
+  function writeLocal(content: Buffer | string, ext = ".txt"): string {
+    const name = `handfree-upload-test-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`;
+    // Place inside cwd so it passes validateLocalPath without extra config
+    tempFile = path.resolve(process.cwd(), name);
+    fsForTest.writeFileSync(tempFile, content);
+    return tempFile;
+  }
+
+  it("should skip upload when remote content matches (small file)", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("hello world", "utf8"));
+
+    // Stub: ensureConnected returns a sentinel client; sftp ops return identical bytes
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => ({ size: Buffer.byteLength("hello world") });
+    manager.sftpReadBuffer = async () => Buffer.from("hello world", "utf8");
+
+    let writeCalled = false;
+    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+
+    const result = await manager.upload(local, "/tmp/file.txt", "dev");
+    assert.match(result, /Upload skipped/);
+    assert.match(result, /identical-content/);
+    assert.strictEqual(writeCalled, false);
+  });
+
+  it("should re-upload when skipIfIdentical=false even if remote matches", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("hello world", "utf8"));
+
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => ({ size: Buffer.byteLength("hello world") });
+    manager.sftpReadBuffer = async () => Buffer.from("hello world", "utf8");
+
+    let writeCalled = false;
+    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+
+    const result = await manager.upload(local, "/tmp/file.txt", "dev", { skipIfIdentical: false });
+    assert.match(result, /File uploaded successfully/);
+    assert.strictEqual(writeCalled, true);
+  });
+
+  it("should upload when remote is missing", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("payload", "utf8"));
+
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => { throw new ToolError("SFTP_ERROR", "no such file", false); };
+
+    let writeCalled = false;
+    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+
+    const result = await manager.upload(local, "/tmp/file.txt", "dev");
+    assert.match(result, /File uploaded successfully/);
+    assert.strictEqual(writeCalled, true);
+  });
+
+  it("should upload when sizes differ", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("hello", "utf8"));
+
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => ({ size: 999 });
+
+    let writeCalled = false;
+    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+
+    const result = await manager.upload(local, "/tmp/file.txt", "dev");
+    assert.match(result, /File uploaded successfully/);
+    assert.strictEqual(writeCalled, true);
+  });
+
+  it("should upload when content differs at same size", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("hello", "utf8"));
+
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => ({ size: 5 });
+    manager.sftpReadBuffer = async () => Buffer.from("world", "utf8");
+
+    let writeCalled = false;
+    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+
+    const result = await manager.upload(local, "/tmp/file.txt", "dev");
+    assert.match(result, /File uploaded successfully/);
+    assert.strictEqual(writeCalled, true);
+  });
+
+  it("should report CRLF auto-fix in the response for .sh uploads", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("#!/bin/sh\r\necho hi\r\n", "utf8"), ".sh");
+
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => { throw new ToolError("SFTP_ERROR", "missing", false); };
+
+    let written: Buffer | null = null;
+    manager.sftpWriteBuffer = async (_c: unknown, _p: string, payload: Buffer) => { written = payload; };
+
+    const result = await manager.upload(local, "/tmp/file.sh", "dev");
+    assert.match(result, /CRLF.{0,3}LF auto-fix/);
+    assert.match(result, /converted 2 line endings/);
+    assert.ok(written, "payload should have been written");
+    assert.strictEqual((written as Buffer).toString("utf8"), "#!/bin/sh\necho hi\n");
+  });
+
+  it("should reject upload of a directory path", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    // Use cwd itself (a directory) as the local path
+    const dirPath = process.cwd();
+
+    manager.ensureConnected = async () => ({}) as any;
+
+    await assert.rejects(
+      () => manager.upload(dirPath, "/tmp/whatever", "dev"),
+      (e: unknown) =>
+        e instanceof ToolError &&
+        e.code === "LOCAL_FILE_READ_FAILED" &&
+        /not a regular file/i.test(e.message),
+    );
+  });
+});
+
+describe("Upload shell-script line-ending-agnostic compare", () => {
+  // Integration through the real upload() method. The underlying byte-level
+  // CRLF→LF normalization is already exercised by "Upload CRLF auto-fix" above,
+  // so we only assert the end-to-end skip / re-upload behavior here.
+  const manager = SSHConnectionManager.getInstance() as any;
+
+  const baseConfig = (overrides: Record<string, unknown> = {}) => ({
+    name: "dev",
+    host: "127.0.0.1",
+    port: 22,
+    username: "root",
+    password: "test-password",
+    allowedRemoteDirectories: ["/tmp"],
+    ...overrides,
+  });
+
+  let tempFile: string;
+
+  afterEach(() => {
+    manager.disconnect();
+    manager.setConfig({}, undefined);
+    if (tempFile && fsForTest.existsSync(tempFile)) {
+      fsForTest.unlinkSync(tempFile);
+    }
+  });
+
+  function writeLocal(content: Buffer | string, ext: string): string {
+    const name = `handfree-shellcmp-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`;
+    tempFile = path.resolve(process.cwd(), name);
+    fsForTest.writeFileSync(tempFile, content);
+    return tempFile;
+  }
+
+  it("should skip .sh upload when remote has the same content but with CRLF endings", async () => {
+    // Local script has LF (or is fixed to LF before compare).
+    // Remote currently stores the same logical content but with CRLF.
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("#!/bin/sh\necho hi\n", "utf8"), ".sh");
+    const remoteRaw = Buffer.from("#!/bin/sh\r\necho hi\r\n", "utf8");
+
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => ({ size: remoteRaw.length });
+    manager.sftpReadBuffer = async () => remoteRaw;
+
+    let writeCalled = false;
+    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+
+    const result = await manager.upload(local, "/tmp/run.sh", "dev");
+    assert.match(result, /Upload skipped/);
+    assert.match(result, /ignoring-line-endings/);
+    assert.strictEqual(writeCalled, false, "should not upload when only line endings differ");
+  });
+
+  it("should skip .sh upload when local has CRLF and remote already has LF", async () => {
+    // Local is CRLF, will be auto-fixed to LF then compared against an LF remote.
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("#!/bin/sh\r\necho hi\r\n", "utf8"), ".sh");
+    const remoteRaw = Buffer.from("#!/bin/sh\necho hi\n", "utf8");
+
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => ({ size: remoteRaw.length });
+    manager.sftpReadBuffer = async () => remoteRaw;
+
+    let writeCalled = false;
+    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+
+    const result = await manager.upload(local, "/tmp/run.sh", "dev");
+    assert.match(result, /Upload skipped/);
+    // CRLF auto-fix should still be noted even though the upload itself was skipped
+    assert.match(result, /CRLF.{0,3}LF auto-fix/);
+    assert.strictEqual(writeCalled, false);
+  });
+
+  it("should re-upload .sh when remote content actually differs (not just line endings)", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("#!/bin/sh\necho hi\n", "utf8"), ".sh");
+    const remoteRaw = Buffer.from("#!/bin/sh\r\necho BYE\r\n", "utf8"); // different content
+
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => ({ size: remoteRaw.length });
+    manager.sftpReadBuffer = async () => remoteRaw;
+
+    let writeCalled = false;
+    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+
+    const result = await manager.upload(local, "/tmp/run.sh", "dev");
+    assert.match(result, /File uploaded successfully/);
+    assert.strictEqual(writeCalled, true);
+  });
+
+  it("should NOT use line-ending-agnostic compare for non-shell files (txt with CRLF differs from LF)", async () => {
+    // A .txt that differs only in line endings is NOT skipped — only shell scripts get the agnostic compare.
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const local = writeLocal(Buffer.from("a\nb\n", "utf8"), ".txt");
+    const remoteRaw = Buffer.from("a\r\nb\r\n", "utf8");
+
+    manager.ensureConnected = async () => ({}) as any;
+    manager.openSftp = async () => ({ end: () => {} }) as any;
+    manager.sftpStat = async () => ({ size: remoteRaw.length });
+    manager.sftpReadBuffer = async () => remoteRaw;
+
+    let writeCalled = false;
+    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+
+    const result = await manager.upload(local, "/tmp/file.txt", "dev");
+    // Sizes differ (4 vs 6), so we should re-upload
+    assert.match(result, /File uploaded successfully/);
+    assert.strictEqual(writeCalled, true);
   });
 });
 

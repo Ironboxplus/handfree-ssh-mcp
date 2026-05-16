@@ -13,6 +13,10 @@ export interface SSHConfig {
   commandBlacklist?: string[]; // Command blacklist (array of regex strings)
   socksProxy?: string; // SOCKS proxy URL, e.g. 'socks://user:pass@host:port'
   safeDirectory?: string; // Optional per-server safe directory for destructive ops (rm, etc.)
+  // SFTP-only path allowlists. Apply to upload/download/transfer tools.
+  // execute-command is NOT affected by these.
+  allowedRemoteDirectories?: string[]; // Absolute POSIX dirs that SFTP remotePath may live under. If unset/empty, SFTP is rejected.
+  allowedLocalDirectories?: string[]; // Absolute host dirs (in addition to process.cwd()) that SFTP localPath may live under.
 }
 
 /**
@@ -80,4 +84,5 @@ export interface ParsedArgs {
   configs: SshConnectionConfigMap;
   preConnect: boolean;
   enabledServers?: string[]; // List of enabled server names (if not set, all servers are enabled)
+  outputLogDir?: string; // Absolute host path; root dir for execute-command full-output logs. Defaults to <cwd>/.handfree-output
 }

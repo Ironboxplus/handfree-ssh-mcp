@@ -7,6 +7,12 @@
 # Whether to pre-connect to all servers on startup
 preConnect: false
 
+# Optional: directory where execute-command persists FULL stdout/stderr logs.
+# Per-call logs land under <outputLogDir>/<server-name>/<username>/<timestamp>-<pid>-<rand>.log.
+# Supports ~ expansion and relative paths (resolved against the MCP cwd).
+# Defaults to <cwd>/.handfree-output when not set.
+# outputLogDir: ~/handfree-logs
+
 # Server configurations
 servers:
   # Development server example
@@ -22,6 +28,15 @@ servers:
     # socksProxy: socks5://proxy-host:1085
     # Safe directory for rm commands (optional)
     # safeDirectory: /home/root
+    # SFTP path policy (upload / download / transfer ONLY — execute-command is unaffected).
+    # If `allowedRemoteDirectories` is unset or empty, SFTP is DISABLED for this server.
+    # allowedRemoteDirectories:
+    #   - /home/root
+    #   - /tmp
+    # Additional local directories permitted as upload source / download target.
+    # The MCP working directory is always allowed implicitly.
+    # allowedLocalDirectories:
+    #   - /path/to/extra/local/dir
     # Command security: whitelist of allowed command patterns (regex)
     whitelist:
       - "^ls( .*)?$"
@@ -41,7 +56,7 @@ servers:
   #   port: 22
   #   username: deploy
   #   password: your_production_password
-  #   socksProxy: socks5://192.168.1.100:1085
+  #   socksProxy: socks5://proxy.example.com:1085
   #   safeDirectory: /home/deploy  # rm only allowed here
   #   whitelist:
   #     - "^ls( .*)?$"

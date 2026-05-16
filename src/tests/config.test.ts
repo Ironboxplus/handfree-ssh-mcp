@@ -314,4 +314,229 @@ servers:
   });
 });
 
+describe("SFTP Path Allowlist Config", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "handfree-ssh-mcp-test-"));
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("should load allowedRemoteDirectories", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    allowedRemoteDirectories:
+      - /home/test
+      - /tmp
+`;
+    const p = path.join(tempDir, "ard.yaml");
+    fs.writeFileSync(p, configContent);
+
+    const result = loadConfigFromYaml(p);
+    assert.deepStrictEqual(
+      result.configs["dev"].allowedRemoteDirectories,
+      ["/home/test", "/tmp"],
+    );
+  });
+
+  it("should strip trailing slashes from allowedRemoteDirectories", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    allowedRemoteDirectories:
+      - /home/test/
+      - /tmp/
+      - /
+`;
+    const p = path.join(tempDir, "ard-slash.yaml");
+    fs.writeFileSync(p, configContent);
+
+    const result = loadConfigFromYaml(p);
+    assert.deepStrictEqual(
+      result.configs["dev"].allowedRemoteDirectories,
+      ["/home/test", "/tmp", "/"],
+    );
+  });
+
+  it("should reject relative paths in allowedRemoteDirectories", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    allowedRemoteDirectories:
+      - home/test
+`;
+    const p = path.join(tempDir, "ard-rel.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /absolute POSIX path/i,
+    );
+  });
+
+  it("should reject '..' segments in allowedRemoteDirectories", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    allowedRemoteDirectories:
+      - /home/test/../etc
+`;
+    const p = path.join(tempDir, "ard-dotdot.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /'\.\.'/,
+    );
+  });
+
+  it("should reject empty string entries in allowedRemoteDirectories", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    allowedRemoteDirectories:
+      - ""
+`;
+    const p = path.join(tempDir, "ard-empty.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /non-empty/i,
+    );
+  });
+
+  it("should resolve allowedLocalDirectories to absolute paths", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    allowedLocalDirectories:
+      - ~/uploads
+`;
+    const p = path.join(tempDir, "ald.yaml");
+    fs.writeFileSync(p, configContent);
+
+    const result = loadConfigFromYaml(p);
+    const resolved = result.configs["dev"].allowedLocalDirectories;
+    assert.ok(resolved && resolved.length === 1);
+    assert.ok(path.isAbsolute(resolved[0]));
+    assert.ok(resolved[0].includes(os.homedir()));
+  });
+
+  it("should leave allowedRemoteDirectories undefined when not set", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+`;
+    const p = path.join(tempDir, "no-ard.yaml");
+    fs.writeFileSync(p, configContent);
+
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.configs["dev"].allowedRemoteDirectories, undefined);
+    assert.strictEqual(result.configs["dev"].allowedLocalDirectories, undefined);
+  });
+});
+
+describe("Output Log Dir Config", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "handfree-ssh-mcp-test-"));
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("should leave outputLogDir undefined when not set", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+`;
+    const p = path.join(tempDir, "no-log.yaml");
+    fs.writeFileSync(p, configContent);
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.outputLogDir, undefined);
+  });
+
+  it("should resolve outputLogDir to an absolute path", () => {
+    const configContent = `
+outputLogDir: ./logs
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+`;
+    const p = path.join(tempDir, "log.yaml");
+    fs.writeFileSync(p, configContent);
+    const result = loadConfigFromYaml(p);
+    assert.ok(result.outputLogDir);
+    assert.ok(path.isAbsolute(result.outputLogDir!));
+    assert.ok(result.outputLogDir!.endsWith(path.normalize("logs")));
+  });
+
+  it("should expand ~ in outputLogDir", () => {
+    const configContent = `
+outputLogDir: ~/handfree-logs
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+`;
+    const p = path.join(tempDir, "log-tilde.yaml");
+    fs.writeFileSync(p, configContent);
+    const result = loadConfigFromYaml(p);
+    assert.ok(result.outputLogDir);
+    assert.ok(result.outputLogDir!.includes(os.homedir()));
+  });
+
+  it("should reject non-string outputLogDir", () => {
+    const configContent = `
+outputLogDir: 42
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+`;
+    const p = path.join(tempDir, "log-bad.yaml");
+    fs.writeFileSync(p, configContent);
+    assert.throws(() => loadConfigFromYaml(p), /non-empty string/i);
+  });
+});
+
 console.log("\n🧪 Running handfree-ssh-mcp tests...\n");

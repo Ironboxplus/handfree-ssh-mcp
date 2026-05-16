@@ -19,11 +19,14 @@ interface YamlServerConfig {
   whitelist?: string[];
   blacklist?: string[];
   safeDirectory?: string;
+  allowedRemoteDirectories?: string[];
+  allowedLocalDirectories?: string[];
 }
 
 interface YamlConfig {
   defaultServer?: string;
   preConnect?: boolean;
+  outputLogDir?: string;
   servers: Record<string, YamlServerConfig>;
 }
 
@@ -86,6 +89,16 @@ export function loadConfigFromYaml(configPath: string): ParsedArgs {
       ? expandTilde(serverConfig.privateKey)
       : undefined;
 
+    // Normalize and validate allowedRemoteDirectories (must be absolute POSIX paths)
+    const allowedRemoteDirectories = serverConfig.allowedRemoteDirectories
+      ? normalizeAllowedRemoteDirectories(name, serverConfig.allowedRemoteDirectories)
+      : undefined;
+
+    // Normalize allowedLocalDirectories (resolve to absolute, expand ~)
+    const allowedLocalDirectories = serverConfig.allowedLocalDirectories
+      ? normalizeAllowedLocalDirectories(name, serverConfig.allowedLocalDirectories)
+      : undefined;
+
     configMap[name] = {
       name,
       host: serverConfig.host,
@@ -98,6 +111,8 @@ export function loadConfigFromYaml(configPath: string): ParsedArgs {
       commandWhitelist: serverConfig.whitelist,
       commandBlacklist: serverConfig.blacklist,
       safeDirectory: serverConfig.safeDirectory,
+      allowedRemoteDirectories,
+      allowedLocalDirectories,
     };
 
     Logger.log(
@@ -112,9 +127,21 @@ export function loadConfigFromYaml(configPath: string): ParsedArgs {
 
   Logger.log(`Total servers loaded: ${Object.keys(configMap).length}`, "info");
 
+  // Resolve outputLogDir if provided. Default applied later (in ssh-connection-manager)
+  // so it always tracks the current cwd at execution time.
+  let outputLogDir: string | undefined;
+  if (config.outputLogDir !== undefined) {
+    if (typeof config.outputLogDir !== "string" || config.outputLogDir.length === 0) {
+      throw new Error("'outputLogDir' must be a non-empty string");
+    }
+    outputLogDir = path.resolve(expandTilde(config.outputLogDir));
+    Logger.log(`Output log dir (from YAML): ${outputLogDir}`, "info");
+  }
+
   return {
     configs: configMap,
     preConnect: config.preConnect === true,
+    outputLogDir,
   };
 }
 
@@ -139,4 +166,58 @@ export function getEnabledServersArg(args: string[]): string[] | null {
     return args[index + 1].split(",").map(s => s.trim()).filter(Boolean);
   }
   return null;
+}
+
+/**
+ * Normalize and validate allowedRemoteDirectories.
+ * Each entry must be an absolute POSIX path. Trailing slashes are stripped
+ * (except for the root "/"). ".." segments are rejected after normalization.
+ */
+function normalizeAllowedRemoteDirectories(serverName: string, raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' must be a list of absolute POSIX paths`);
+  }
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string" || entry.length === 0) {
+      throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' entries must be non-empty strings`);
+    }
+    if (entry.includes("\0")) {
+      throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' entry contains a null byte: ${entry}`);
+    }
+    if (!path.posix.isAbsolute(entry)) {
+      throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' entry must be an absolute POSIX path, got: ${entry}`);
+    }
+    // Reject '..' BEFORE normalization, otherwise '/a/../b' would silently collapse to '/b'.
+    if (entry.split("/").includes("..")) {
+      throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' entry must not contain '..' segments: ${entry}`);
+    }
+    const normalized = path.posix.normalize(entry);
+    const trimmed = normalized.length > 1 && normalized.endsWith("/")
+      ? normalized.slice(0, -1)
+      : normalized;
+    out.push(trimmed);
+  }
+  return out;
+}
+
+/**
+ * Normalize allowedLocalDirectories. Resolves each entry to an absolute
+ * host path (with ~ expansion). The MCP working directory is implicitly
+ * allowed and does NOT need to appear here.
+ */
+function normalizeAllowedLocalDirectories(serverName: string, raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    throw new Error(`Server '${serverName}': 'allowedLocalDirectories' must be a list of paths`);
+  }
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string" || entry.length === 0) {
+      throw new Error(`Server '${serverName}': 'allowedLocalDirectories' entries must be non-empty strings`);
+    }
+    const expanded = expandTilde(entry);
+    const resolved = path.resolve(expanded);
+    out.push(resolved);
+  }
+  return out;
 }
