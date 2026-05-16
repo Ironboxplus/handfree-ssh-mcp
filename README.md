@@ -91,10 +91,12 @@ The AI can now execute commands on your servers. All within your defined securit
 | Tool | Description |
 |------|-------------|
 | `execute-command` | Run SSH command (with optional `stream` for real-time output) |
-| `show-whitelist` | Show allowed commands for a server (helps LLM understand permissions) |
-| `upload` | Upload file to server |
-| `download` | Download file from server |
-| `list-servers` | List configured servers |
+| `show-whitelist` | Show allowed commands + SFTP policy + output-log path for a server |
+| `upload` | Upload local file to a remote server (CRLF-fix for shell scripts, skip-if-identical) |
+| `download` | Download remote file to local disk |
+| `transfer` | Unified upload / download / server-to-server relay (`mode`: `upload` / `download` / `relay`, optional `recursive`) |
+| `list-servers` | List configured (enabled) servers |
+| `help` | Self-describing help text for the MCP client |
 
 ### show-whitelist
 
@@ -139,8 +141,14 @@ Returns a formatted list of allowed command patterns with examples.
 ## 📄 YAML Config Reference
 
 ```yaml
-# Pre-connect on startup (optional)
+# Eagerly connect to all enabled servers on startup.
+# false (default) = lazy connect on first tool call.
 preConnect: false
+
+# Optional: root dir for execute-command full-output logs.
+# Per-call logs land under <outputLogDir>/<server>/<user>/<ts>-<pid>-<rand>.log.
+# Defaults to <cwd>/.handfree-output when unset. Supports ~ and relative paths.
+outputLogDir: ~/handfree-logs
 
 servers:
   server_name:
@@ -187,6 +195,13 @@ servers:
 
 Path matching is exact-equal or `dir + separator` prefix. `..` segments and null bytes are rejected. Use `show-whitelist` to inspect a server's current SFTP policy.
 
+### Connection lifecycle (connect / reconnect)
+
+- **Lazy by default.** A server's SSH client is created on its first tool call via `ensureConnected()`. Set `preConnect: true` (or pass `--pre-connect`) to open all enabled servers at startup in parallel; failures are logged but don't block startup.
+- **Auto-reconnect on `execute-command`.** Every command runs inside a retry loop (default 3 attempts: 1 initial + 2 retries) with exponential backoff. If the underlying error matches a connection-shaped pattern (`econnreset`, `epipe`, `socket`, `closed`, `channel`, `end of stream`, or a `SSH_CONNECTION_FAILED` ToolError), the manager closes the dead client, reconnects, and retries the command. Non-connection errors (permission denied, validation, command-not-found) are returned immediately without retry.
+- **SFTP transfers do NOT auto-retry.** `upload` / `download` / `transfer` lazy-connect via the same path, but a mid-transfer disconnect surfaces as a single failure — re-issue the call manually. This is a known gap.
+- **No background keepalive or health probe.** Dead connections are only discovered on the next tool call. If you idle for hours through a NATed network, expect the first call after the gap to fail-then-reconnect on its own (you'll see one retry in the logs).
+
 ### Upload behaviors
 
 - **CRLF auto-fix for shell scripts.** When uploading a `.sh`, `.bash`, or `.zsh` file, any `\r\n` line endings are automatically converted to `\n` before the bytes are sent. The response notes when this happens and how many line endings were rewritten. The local file on disk is left untouched.
@@ -216,6 +231,8 @@ servers:
 ```text
 --config          Path to YAML config file (REQUIRED)
 --enable-servers  Comma-separated list of servers to enable (REQUIRED for execute-command)
+--pre-connect     Eagerly connect to all enabled servers on startup
+                  (overrides `preConnect` in YAML). Default: lazy connect.
 ```
 
 > **Note**: `--enable-servers` controls which servers are available. The first server listed becomes the default when `connectionName` is not specified.
@@ -245,9 +262,12 @@ Example with selective servers:
 - [ ] **LLM-based whitelist**: Allow LLM to propose commands, with human approval adding to dynamic whitelist
 
 ### Nice to Have
-- [ ] **Command history**: Log executed commands per server for audit/debugging
+- [x] **Command history / output archive**: full stdout/stderr of every `execute-command` is persisted under `<outputLogDir>/<server>/<user>/*.log`
 - [x] **Multi-command execution**: Execute multiple commands in sequence with `&&` or `;` safely (fixed: `2>/dev/null` now allowed)
-- [ ] **Server health check**: Periodic ping to detect connection drops early
+- [x] **Connection auto-recovery**: `execute-command` retries with exponential backoff and forced reconnect on connection-shaped errors
+- [ ] **SFTP retry parity**: extend the retry-with-reconnect loop to `upload` / `download` / `transfer`
+- [ ] **TCP keepalive**: pass `keepaliveInterval` / `keepaliveCountMax` to `ssh2.Client` so half-open connections are detected without waiting for the next command
+- [ ] **Server health check**: optional periodic ping to detect drops proactively
 
 ## 📄 License
 
