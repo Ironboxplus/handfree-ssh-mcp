@@ -6,7 +6,12 @@ import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { registerAllTools } from "../tools/index.js";
 import { SERVER_CONFIG, SERVER_INSTRUCTIONS } from "../config/server.js";
-import { getConfigPath, getEnabledServersArg, loadConfigFromYaml } from "../config/config-loader.js";
+import {
+  getConfigPath,
+  getEnabledServersArg,
+  getPreConnectFlag,
+  loadConfigFromYaml,
+} from "../config/config-loader.js";
 import { ParsedArgs } from "../models/types.js";
 
 /**
@@ -77,6 +82,11 @@ export class SshMcpServer {
     
     Logger.log(`Enabled servers: ${enabledServers.join(", ")}`, "info");
     parsedArgs.enabledServers = enabledServers;
+
+    // CLI --pre-connect overrides YAML preConnect (CLI wins when present)
+    if (getPreConnectFlag(args)) {
+      parsedArgs.preConnect = true;
+    }
 
     const resolvedConfigPath = path.isAbsolute(configPath)
       ? configPath

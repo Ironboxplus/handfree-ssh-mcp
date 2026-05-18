@@ -169,6 +169,14 @@ export function getEnabledServersArg(args: string[]): string[] | null {
 }
 
 /**
+ * Check if --pre-connect flag is present on the CLI.
+ * Overrides the YAML `preConnect` setting when set.
+ */
+export function getPreConnectFlag(args: string[]): boolean {
+  return args.includes("--pre-connect");
+}
+
+/**
  * Normalize and validate allowedRemoteDirectories.
  * Each entry must be an absolute POSIX path. Trailing slashes are stripped
  * (except for the root "/"). ".." segments are rejected after normalization.

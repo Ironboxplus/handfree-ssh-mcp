@@ -94,7 +94,7 @@ The AI can now execute commands on your servers. All within your defined securit
 | `show-whitelist` | Show allowed commands + SFTP policy + output-log path for a server |
 | `upload` | Upload local file to a remote server (CRLF-fix for shell scripts, skip-if-identical) |
 | `download` | Download remote file to local disk |
-| `transfer` | Unified upload / download / server-to-server relay (`mode`: `upload` / `download` / `relay`, optional `recursive`) |
+| `transfer` | Unified upload / download / server-to-server relay (`mode`: `upload` / `download` / `relay`, optional `recursive`, optional `skipIfIdentical`) |
 | `list-servers` | List configured (enabled) servers |
 | `help` | Self-describing help text for the MCP client |
 
@@ -186,6 +186,10 @@ servers:
       - /path/to/extra/local/dir
 ```
 
+### Security note: command whitelist
+
+If a server's YAML omits `whitelist:` (or sets it to an empty list), `execute-command` falls back to a built-in default whitelist. That default covers common read-mostly tools like `git .*`, `curl .*`, `find .*`, `awk .*`, `sed .*` — broad enough that a determined LLM could write to disk via `awk 'BEGIN{system(...)}'` or similar. It is **strongly recommended to provide an explicit per-server `whitelist:`** narrowed to the commands you actually need. Startup logs a warning whenever a server is running on the default whitelist. See `show-whitelist` to inspect the effective whitelist at runtime.
+
 ### SFTP path policy
 
 | Field | Scope | Default behavior |
@@ -206,6 +210,7 @@ Path matching is exact-equal or `dir + separator` prefix. `..` segments and null
 
 - **CRLF auto-fix for shell scripts.** When uploading a `.sh`, `.bash`, or `.zsh` file, any `\r\n` line endings are automatically converted to `\n` before the bytes are sent. The response notes when this happens and how many line endings were rewritten. The local file on disk is left untouched.
 - **Skip-if-identical (default on).** Before transferring, `upload` checks whether the remote file already matches the local payload. Files ≤ 256 MiB are compared byte-for-byte; larger files are compared via MD5 (using `md5sum` on the remote host). **Shell scripts (`.sh` / `.bash` / `.zsh`) are compared in a line-ending-agnostic way — both sides are LF-normalized before the comparison, so a CRLF-only diff is treated as identical and the upload is still skipped.** If they match, the upload is skipped and the response says so. Pass `skipIfIdentical: false` to force a re-upload. Recursive `transfer` (`mode: upload`, `recursive: true`) applies the same check per file.
+- **Relay skip-if-identical (default on).** `transfer mode=relay` does the same check between two remote servers: matching size on both sides plus matching `md5sum` skips the transfer. If `md5sum` is missing on either server, the check falls back to a normal transfer.
 
 ### `execute-command` output capping & full logs
 

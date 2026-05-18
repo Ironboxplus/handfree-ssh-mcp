@@ -16,7 +16,7 @@ export function registerExecuteCommandTool(server: McpServer): void {
 
   server.tool(
     "execute-command",
-    "Execute a shell command on a remote server over SSH. Use this for command-line actions on the selected host. Streaming mode is enabled by default so long-running commands can emit progress; set stream=false for short commands where you only want the final output. The returned text is capped at maxOutputBytes (default 65536 bytes, tail-only); the FULL stdout/stderr is always persisted to a local log file under <cwd>/.handfree-output/<server>/<user>/, and the response includes that path whenever output was truncated.",
+    "Execute a shell command on a remote server over SSH. Use this for command-line actions on the selected host. Streaming mode is enabled by default so long-running commands can emit progress; set stream=false for short commands where you only want the final output. The returned text is tail-only-capped at maxOutputBytes PER STREAM (default 65536 bytes for stdout and 65536 bytes for stderr, so the response can be up to ~2x that); the FULL stdout/stderr is always persisted to a local log file under <cwd>/.handfree-output/<server>/<user>/, and the response includes that path whenever output was truncated.",
     {
       cmdString: z.string().describe("Exact remote shell command to run. Prefer a single command per call, for example 'pwd', 'ls -la', 'cat /etc/hostname', or 'git status'. Compound commands may be blocked by whitelist rules even if each subcommand is safe."),
       connectionName: z
@@ -41,7 +41,7 @@ export function registerExecuteCommandTool(server: McpServer): void {
         .nonnegative()
         .optional()
         .describe(
-          "Cap on bytes returned to the caller for stdout and stderr (each, tail-only). Defaults to 65536 (64 KiB). The full output is always saved to disk regardless; only the returned text is trimmed. Set higher when you need more context, lower to save tokens."
+          "Per-stream cap on bytes returned to the caller (tail-only). Applied independently to stdout and stderr, so the combined response can be up to ~2x this value. Defaults to 65536 (64 KiB). The full output is always saved to disk regardless; only the returned text is trimmed. Set higher when you need more context, lower to save tokens."
         ),
     },
     async ({ cmdString, connectionName, timeout, stream, maxOutputBytes }, extra) => {

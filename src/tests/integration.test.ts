@@ -6,12 +6,12 @@
  * 
  * Usage:
  *   npm run test:integration
- *   npm run test:integration -- --server sniffer426
- *   npm run test:integration -- --server DB427
- * 
+ *   npm run test:integration -- --server dev
+ *   npm run test:integration -- --server prod
+ *
  * Or directly:
  *   node build/tests/integration.test.js
- *   node build/tests/integration.test.js --server sniffer426
+ *   node build/tests/integration.test.js --server dev
  */
 
 import path from "node:path";

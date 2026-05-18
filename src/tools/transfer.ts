@@ -58,7 +58,10 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         "(upload/download only) When true, transfers an entire directory tree recursively. Default false.",
       ),
       skipIfIdentical: z.boolean().optional().describe(
-        "(upload only) When true (default), skip the upload if the remote file already matches the local file byte-for-byte (small files) or by MD5 hash (files larger than 256 MiB). Shell scripts (.sh / .bash / .zsh) are compared in a line-ending-agnostic way so CRLF\u2194LF differences alone do not trigger a re-upload. Set to false to force re-upload.",
+        "When true (default), skip the transfer if the destination already matches the source. " +
+          "Upload: byte-compare for files \u2264 256 MiB, MD5 otherwise; shell scripts (.sh / .bash / .zsh) ignore CRLF\u2194LF differences. " +
+          "Relay: size match + md5sum match on both servers (when available); falls back to transferring if md5sum is missing on either side. " +
+          "Download is never skipped. Set to false to force the transfer.",
       ),
     },
     async (params) => {
@@ -66,7 +69,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         const { mode } = params;
 
         if (mode === "relay") {
-          const { sourceServer, sourceRemotePath, destServer, destRemotePath } = params;
+          const { sourceServer, sourceRemotePath, destServer, destRemotePath, skipIfIdentical } = params;
           if (!sourceServer || !sourceRemotePath || !destServer || !destRemotePath) {
             return {
               content: [{ type: "text", text: "relay mode requires: sourceServer, sourceRemotePath, destServer, destRemotePath" }],
@@ -75,6 +78,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
           }
           const result = await sshManager.transferBetweenServers(
             sourceServer, sourceRemotePath, destServer, destRemotePath,
+            { skipIfIdentical: skipIfIdentical !== false },
           );
           return { content: [{ type: "text", text: result }] };
         }

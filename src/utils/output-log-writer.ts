@@ -10,8 +10,7 @@ import { Logger } from "./logger.js";
  *
  *   <root>/<server-name>/<username>/<timestamp>-<pid>-<rand>.log
  *
- * The file uses simple section markers so a human (or grep) can find each
- * stream:
+ * Format:
  *
  *   === META ===
  *   server: <server>
@@ -29,14 +28,15 @@ import { Logger } from "./logger.js";
  *   stderrBytes: <n>
  *   finished: <iso>
  *
- * Failures to write are logged and swallowed; they never abort the SSH
- * command. `getPath()` always returns the intended file path even if a
- * write fails (callers can still report it to the LLM).
+ * Streaming strategy: stdout and stderr each flow into their own temp file
+ * (`<path>.stdout.part`, `<path>.stderr.part`) as chunks arrive, so memory
+ * is bounded by a single chunk. On `close()`, we assemble the final file by
+ * streaming the header, then the stdout part, then the stderr marker, then
+ * the stderr part, then the footer, and delete the temp parts.
  *
- * Implementation note: stdout and stderr are buffered in memory until
- * `close()` so the markers stay contiguous in the file. For very large
- * outputs this still costs O(total bytes) RAM, but it keeps the log
- * readable and avoids interleaving issues with streaming.
+ * Any write failure is logged and swallowed; it never aborts the SSH
+ * command. `getPath()` always returns the intended final path so callers
+ * can still report it.
  */
 export interface OutputLogWriterOptions {
   rootDir: string;
@@ -48,14 +48,17 @@ export interface OutputLogWriterOptions {
 
 export class OutputLogWriter {
   private readonly filePath: string;
+  private readonly stdoutPartPath: string;
+  private readonly stderrPartPath: string;
   private readonly serverName: string;
   private readonly username: string;
   private readonly command: string;
   private readonly startedAt: Date;
-  private readonly stdoutChunks: Buffer[] = [];
-  private readonly stderrChunks: Buffer[] = [];
   private stdoutBytes = 0;
   private stderrBytes = 0;
+  private stdoutFd: number | null = null;
+  private stderrFd: number | null = null;
+  private dirEnsured = false;
   private closed = false;
   private writeFailed = false;
 
@@ -68,6 +71,8 @@ export class OutputLogWriter {
     const dir = path.join(opts.rootDir, this.serverName, this.username);
     const fileName = makeLogFileName(this.startedAt);
     this.filePath = path.join(dir, fileName);
+    this.stdoutPartPath = `${this.filePath}.stdout.part`;
+    this.stderrPartPath = `${this.filePath}.stderr.part`;
   }
 
   /**
@@ -79,66 +84,168 @@ export class OutputLogWriter {
 
   public appendStdout(chunk: Buffer | string): void {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
-    if (buf.length === 0) return;
-    this.stdoutChunks.push(buf);
-    this.stdoutBytes += buf.length;
+    if (buf.length === 0 || this.writeFailed || this.closed) return;
+    const fd = this.openPartLazily("stdout");
+    if (fd === null) return;
+    try {
+      fs.writeSync(fd, buf);
+      this.stdoutBytes += buf.length;
+    } catch (err) {
+      this.markFailed(`stdout write: ${(err as Error).message}`);
+    }
   }
 
   public appendStderr(chunk: Buffer | string): void {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
-    if (buf.length === 0) return;
-    this.stderrChunks.push(buf);
-    this.stderrBytes += buf.length;
+    if (buf.length === 0 || this.writeFailed || this.closed) return;
+    const fd = this.openPartLazily("stderr");
+    if (fd === null) return;
+    try {
+      fs.writeSync(fd, buf);
+      this.stderrBytes += buf.length;
+    } catch (err) {
+      this.markFailed(`stderr write: ${(err as Error).message}`);
+    }
   }
 
   /**
-   * Flush everything to disk and finalize the META footer.
-   * Safe to call multiple times; only the first call writes.
+   * Finalize the log: assemble header + stdout part + stderr part + footer
+   * into the final file, then delete the parts. Safe to call multiple
+   * times; only the first call performs work.
    */
   public close(meta: { exitCode: number | null; durationMs: number; finishedAt?: Date }): void {
     if (this.closed) return;
     this.closed = true;
 
+    // Always close FDs first so the parts are flushed on disk.
+    this.closeFd("stdout");
+    this.closeFd("stderr");
+
+    if (this.writeFailed) {
+      // Best-effort: clean up any partial parts so we don't leave junk.
+      this.unlinkQuiet(this.stdoutPartPath);
+      this.unlinkQuiet(this.stderrPartPath);
+      return;
+    }
+
     const finishedAt = meta.finishedAt ?? new Date();
-
     try {
-      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+      this.ensureDir();
 
-      const header = Buffer.from(
+      const header =
         `=== META ===\n` +
         `server: ${this.serverName}\n` +
         `user: ${this.username}\n` +
         `command: ${this.command}\n` +
         `started: ${this.startedAt.toISOString()}\n` +
-        `=== STDOUT ===\n`,
-        "utf8"
-      );
-      const stderrMarker = Buffer.from(`\n=== STDERR ===\n`, "utf8");
-      const footer = Buffer.from(
+        `=== STDOUT ===\n`;
+      const stderrMarker = `\n=== STDERR ===\n`;
+      const footer =
         `\n=== END ===\n` +
         `exitCode: ${meta.exitCode === null ? "null" : meta.exitCode}\n` +
         `durationMs: ${meta.durationMs}\n` +
         `stdoutBytes: ${this.stdoutBytes}\n` +
         `stderrBytes: ${this.stderrBytes}\n` +
-        `finished: ${finishedAt.toISOString()}\n`,
-        "utf8"
-      );
+        `finished: ${finishedAt.toISOString()}\n`;
 
-      const parts: Buffer[] = [header, ...this.stdoutChunks, stderrMarker, ...this.stderrChunks, footer];
-      const totalLen =
-        header.length + this.stdoutBytes + stderrMarker.length + this.stderrBytes + footer.length;
-      fs.writeFileSync(this.filePath, Buffer.concat(parts, totalLen));
+      const outFd = fs.openSync(this.filePath, "w");
+      try {
+        fs.writeSync(outFd, header);
+        this.appendPartTo(outFd, this.stdoutPartPath);
+        fs.writeSync(outFd, stderrMarker);
+        this.appendPartTo(outFd, this.stderrPartPath);
+        fs.writeSync(outFd, footer);
+      } finally {
+        fs.closeSync(outFd);
+      }
     } catch (err) {
-      this.writeFailed = true;
-      Logger.log(
-        `Failed to write output log to ${this.filePath}: ${(err as Error).message}`,
-        "error"
-      );
+      this.markFailed(`finalize: ${(err as Error).message}`);
+    } finally {
+      this.unlinkQuiet(this.stdoutPartPath);
+      this.unlinkQuiet(this.stderrPartPath);
     }
   }
 
   public didWriteFail(): boolean {
     return this.writeFailed;
+  }
+
+  /**
+   * Open the stdout/stderr part file on first use. Returns the FD or null
+   * if the open failed (in which case the writer is marked failed).
+   */
+  private openPartLazily(which: "stdout" | "stderr"): number | null {
+    const existing = which === "stdout" ? this.stdoutFd : this.stderrFd;
+    if (existing !== null) return existing;
+    try {
+      this.ensureDir();
+      const partPath = which === "stdout" ? this.stdoutPartPath : this.stderrPartPath;
+      const fd = fs.openSync(partPath, "w");
+      if (which === "stdout") this.stdoutFd = fd;
+      else this.stderrFd = fd;
+      return fd;
+    } catch (err) {
+      this.markFailed(`open ${which} part: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  private closeFd(which: "stdout" | "stderr"): void {
+    const fd = which === "stdout" ? this.stdoutFd : this.stderrFd;
+    if (fd === null) return;
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // Ignore close errors — we still want to attempt finalization.
+    }
+    if (which === "stdout") this.stdoutFd = null;
+    else this.stderrFd = null;
+  }
+
+  private ensureDir(): void {
+    if (this.dirEnsured) return;
+    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    this.dirEnsured = true;
+  }
+
+  /**
+   * Stream the contents of a part file into the given output FD, 64 KiB at
+   * a time. Missing parts are silently skipped (they just mean that stream
+   * never produced any bytes).
+   */
+  private appendPartTo(outFd: number, partPath: string): void {
+    let inFd: number;
+    try {
+      inFd = fs.openSync(partPath, "r");
+    } catch {
+      return; // part never created
+    }
+    try {
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      while (true) {
+        const n = fs.readSync(inFd, chunk, 0, chunk.length, null);
+        if (n <= 0) break;
+        fs.writeSync(outFd, chunk, 0, n);
+      }
+    } finally {
+      fs.closeSync(inFd);
+    }
+  }
+
+  private unlinkQuiet(p: string): void {
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      // Missing or in-use: ignore. Cleanup is best-effort.
+    }
+  }
+
+  private markFailed(reason: string): void {
+    this.writeFailed = true;
+    Logger.log(
+      `OutputLogWriter failure for ${this.filePath}: ${reason}`,
+      "error",
+    );
   }
 }
 

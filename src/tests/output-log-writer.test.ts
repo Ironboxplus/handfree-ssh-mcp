@@ -104,6 +104,106 @@ describe("OutputLogWriter", () => {
     assert.match(content, /\nexitCode: null\n/);
   });
 
+  it("streams large stdout through a .stdout.part temp file and cleans it up on close", () => {
+    const w = new OutputLogWriter({
+      rootDir: root,
+      serverName: "dev",
+      username: "alice",
+      command: "yes",
+    });
+
+    // 2 MiB of stdout in many small writes — should never live fully in RAM.
+    const chunk = Buffer.alloc(64 * 1024, 0x41); // 64 KiB of 'A'
+    for (let i = 0; i < 32; i++) {
+      w.appendStdout(chunk);
+    }
+    const partPath = `${w.getPath()}.stdout.part`;
+    assert.ok(fs.existsSync(partPath), "stdout part file must exist while streaming");
+    const partSize = fs.statSync(partPath).size;
+    assert.strictEqual(partSize, 32 * 64 * 1024);
+
+    w.close({ exitCode: 0, durationMs: 1 });
+
+    // Part file must be cleaned up.
+    assert.ok(!fs.existsSync(partPath), "stdout part file must be removed after close");
+
+    // Final file must contain all the stdout bytes intact.
+    const final = fs.readFileSync(w.getPath());
+    const stdoutStart = final.indexOf("=== STDOUT ===\n");
+    const stderrStart = final.indexOf("\n=== STDERR ===\n");
+    assert.ok(stdoutStart > 0 && stderrStart > stdoutStart);
+    const stdoutBody = final.subarray(
+      stdoutStart + "=== STDOUT ===\n".length,
+      stderrStart,
+    );
+    assert.strictEqual(stdoutBody.length, 32 * 64 * 1024);
+    // Spot check: every byte must be 'A'.
+    assert.strictEqual(stdoutBody[0], 0x41);
+    assert.strictEqual(stdoutBody[stdoutBody.length - 1], 0x41);
+
+    const content = final.toString("utf8");
+    assert.match(content, /\nstdoutBytes: 2097152\n/);
+    assert.match(content, /\nstderrBytes: 0\n/);
+  });
+
+  it("does not create part files when nothing is appended", () => {
+    const w = new OutputLogWriter({
+      rootDir: root,
+      serverName: "dev",
+      username: "alice",
+      command: "true",
+    });
+    w.close({ exitCode: 0, durationMs: 0 });
+
+    assert.ok(fs.existsSync(w.getPath()));
+    assert.ok(!fs.existsSync(`${w.getPath()}.stdout.part`));
+    assert.ok(!fs.existsSync(`${w.getPath()}.stderr.part`));
+    const content = fs.readFileSync(w.getPath(), "utf8");
+    // Empty stdout/stderr sections still produce the markers and zero byte counts.
+    assert.match(content, /\n=== STDOUT ===\n\n=== STDERR ===\n\n=== END ===\n/);
+    assert.match(content, /\nstdoutBytes: 0\n/);
+    assert.match(content, /\nstderrBytes: 0\n/);
+  });
+
+  it("preserves byte order across interleaved stdout/stderr appends", () => {
+    const w = new OutputLogWriter({
+      rootDir: root,
+      serverName: "dev",
+      username: "alice",
+      command: "noisy",
+    });
+    // Interleave to make sure we don't accidentally mix streams.
+    w.appendStdout("out-1\n");
+    w.appendStderr("err-1\n");
+    w.appendStdout("out-2\n");
+    w.appendStderr("err-2\n");
+    w.appendStdout("out-3\n");
+    w.close({ exitCode: 0, durationMs: 1 });
+
+    const content = fs.readFileSync(w.getPath(), "utf8");
+    const stdoutMatch = content.match(/=== STDOUT ===\n([\s\S]*?)\n=== STDERR ===/);
+    const stderrMatch = content.match(/=== STDERR ===\n([\s\S]*?)\n=== END ===/);
+    assert.ok(stdoutMatch && stderrMatch);
+    assert.strictEqual(stdoutMatch![1], "out-1\nout-2\nout-3\n");
+    assert.strictEqual(stderrMatch![1], "err-1\nerr-2\n");
+  });
+
+  it("ignores appends after close()", () => {
+    const w = new OutputLogWriter({
+      rootDir: root,
+      serverName: "dev",
+      username: "alice",
+      command: "ls",
+    });
+    w.appendStdout("before\n");
+    w.close({ exitCode: 0, durationMs: 1 });
+    const before = fs.readFileSync(w.getPath(), "utf8");
+    w.appendStdout("after\n");
+    w.appendStderr("after-err\n");
+    const after = fs.readFileSync(w.getPath(), "utf8");
+    assert.strictEqual(before, after);
+  });
+
   it("file names sort chronologically and avoid collisions for the same start time", () => {
     const fixedDate = new Date("2026-05-16T02:15:30.000Z");
     const a = new OutputLogWriter({

@@ -95,6 +95,10 @@ export class SSHConnectionManager {
   private configs: SshConnectionConfigMap = {};
   private connected: Map<string, boolean> = new Map();
   private statusCache: Map<string, ServerStatus> = new Map();
+  // In-flight connect() promises, keyed by server name. Used to dedupe
+  // concurrent connect attempts so we never create two SSH clients for the
+  // same server and leak the loser.
+  private connecting: Map<string, Promise<void>> = new Map();
   private defaultName: string = "default";
   private enabledServers: string[] | null = null; // null = all servers enabled
   private outputLogRoot: string | null = null; // null = use <cwd>/.handfree-output at write time
@@ -122,17 +126,24 @@ export class SSHConnectionManager {
   ): void {
     this.configs = configs;
     this.enabledServers = enabledServers || null;
-    
-    // Set default to first enabled server, or first server if none specified
-    if (enabledServers && enabledServers.length > 0) {
-      this.defaultName = enabledServers[0];
-    } else if (Object.keys(configs).length > 0) {
-      this.defaultName = Object.keys(configs)[0];
+
+    // Only single-server deployments have a meaningful "default". When >1
+    // server is enabled, every tool call must specify connectionName
+    // (enforced by resolveServer), so a default would just hide bugs.
+    const effectiveNames = enabledServers && enabledServers.length > 0
+      ? enabledServers
+      : Object.keys(configs);
+    if (effectiveNames.length === 1) {
+      this.defaultName = effectiveNames[0];
+    } else {
+      this.defaultName = "";
     }
-    
+
     if (this.enabledServers) {
       Logger.log(`Enabled servers: ${this.enabledServers.join(", ")}`, "info");
-      Logger.log(`Default server: ${this.defaultName}`, "info");
+      if (this.defaultName) {
+        Logger.log(`Default server: ${this.defaultName}`, "info");
+      }
     }
   }
 
@@ -302,13 +313,33 @@ export class SSHConnectionManager {
   }
 
   /**
-   * Connect to SSH with specified name
+   * Connect to SSH with specified name.
+   *
+   * Concurrent callers for the same server share a single in-flight promise,
+   * so we never create two SSH clients and leak the loser.
    */
   public async connect(name?: string): Promise<void> {
     const key = name || this.defaultName;
     if (this.connected.get(key) && this.clients.get(key)) {
       return;
     }
+    const inFlight = this.connecting.get(key);
+    if (inFlight) {
+      return inFlight;
+    }
+    const promise = this.doConnect(key).finally(() => {
+      this.connecting.delete(key);
+    });
+    this.connecting.set(key, promise);
+    return promise;
+  }
+
+  /**
+   * Actual SSH connect implementation. Callers must go through `connect()`
+   * so concurrent requests are deduped.
+   * @private
+   */
+  private async doConnect(key: string): Promise<void> {
     const config = this.getConfig(key);
     const client = new Client();
     await new Promise<void>(async (resolve, reject) => {
@@ -584,16 +615,10 @@ export class SSHConnectionManager {
    * @private
    */
   private isPathInSafeDirectory(filePath: string, safeDir: string): boolean {
-    // Must be absolute path starting with safe directory
-    if (!filePath.startsWith(safeDir)) {
-      return false;
-    }
-    
-    // Check for path traversal attempts
     // Normalize: remove redundant slashes, handle . and ..
     const parts = filePath.split('/').filter(p => p !== '' && p !== '.');
     const normalized: string[] = [];
-    
+
     for (const part of parts) {
       if (part === '..') {
         normalized.pop(); // Go up one directory
@@ -601,11 +626,13 @@ export class SSHConnectionManager {
         normalized.push(part);
       }
     }
-    
+
     const normalizedPath = '/' + normalized.join('/');
-    
-    // After normalization, must still be inside safe directory
-    return normalizedPath.startsWith(safeDir);
+
+    // After normalization, must be inside safe directory with a `/` boundary
+    // so `/home/alice-evil` is rejected when safeDir is `/home/alice`.
+    if (safeDir === "/") return true;
+    return normalizedPath === safeDir || normalizedPath.startsWith(safeDir + "/");
   }
 
   /**
@@ -1694,9 +1721,11 @@ export class SSHConnectionManager {
     sourceRemotePath: string,
     destName: string,
     destRemotePath: string,
+    options?: { skipIfIdentical?: boolean },
   ): Promise<string> {
     const validatedSourcePath = this.validateRemotePath(sourceRemotePath, sourceName);
     const validatedDestPath = this.validateRemotePath(destRemotePath, destName);
+    const skipIfIdentical = options?.skipIfIdentical !== false; // default true
 
     const srcClient = await this.ensureConnected(sourceName);
     const dstClient = await this.ensureConnected(destName);
@@ -1707,6 +1736,30 @@ export class SSHConnectionManager {
     try {
       // Get source file size before transfer
       const srcStat = await this.sftpStat(srcSftp, validatedSourcePath, "source");
+
+      // Skip-if-identical: same size on both sides AND matching md5sum (when
+      // available on both). We never pull bytes through the MCP host for the
+      // compare — if md5sum is missing on either side we just transfer.
+      if (skipIfIdentical) {
+        const dstStatProbe = await this.sftpStat(dstSftp, validatedDestPath, "dest")
+          .catch(() => null);
+        if (dstStatProbe && dstStatProbe.size === srcStat.size) {
+          const [srcMd5, dstMd5] = await Promise.all([
+            this.remoteMd5(srcClient, validatedSourcePath).catch(() => null),
+            this.remoteMd5(dstClient, validatedDestPath).catch(() => null),
+          ]);
+          if (srcMd5 && dstMd5 && srcMd5 === dstMd5) {
+            const srcConfig = this.getConfig(sourceName);
+            const dstConfig = this.getConfig(destName);
+            return (
+              `Transfer skipped: destination already identical ` +
+              `(size=${srcStat.size} bytes, md5=${srcMd5}). ` +
+              `${srcConfig.username}@${srcConfig.host}:${validatedSourcePath}` +
+              ` == ${dstConfig.username}@${dstConfig.host}:${validatedDestPath}`
+            );
+          }
+        }
+      }
 
       const readStream = srcSftp.createReadStream(validatedSourcePath);
       const writeStream = dstSftp.createWriteStream(validatedDestPath);
