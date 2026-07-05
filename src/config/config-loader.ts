@@ -402,7 +402,8 @@ export function getPreConnectFlag(args: string[]): boolean {
  *  - target with `jumpHost` must not also set `socksProxy` (mutually exclusive).
  *  - referenced jump host must exist in the same config.
  *  - self-reference is rejected.
- *  - single-level only: the jump host must not itself specify `jumpHost`.
+ *  - chained jumps are allowed to any depth (target -> J1 -> J2 -> ...), but the
+ *    chain must be acyclic — a cycle is rejected to prevent infinite recursion.
  */
 function validateJumpHosts(configMap: SshConnectionConfigMap): void {
   for (const [name, cfg] of Object.entries(configMap)) {
@@ -420,16 +421,31 @@ function validateJumpHosts(configMap: SshConnectionConfigMap): void {
     if (cfg.jumpHost === name) {
       throw new Error(`Server '${name}': 'jumpHost' must not reference itself`);
     }
-    const jump = configMap[cfg.jumpHost];
-    if (!jump) {
+    if (!configMap[cfg.jumpHost]) {
       throw new Error(
         `Server '${name}': 'jumpHost' references unknown server '${cfg.jumpHost}'`,
       );
     }
-    if (jump.jumpHost) {
-      throw new Error(
-        `Server '${name}': 'jumpHost' '${cfg.jumpHost}' itself sets 'jumpHost' — chained jumps are not supported`,
-      );
+
+    // Walk the jump chain and detect cycles. Every intermediate hop is itself a
+    // server entry, so its own socksProxy / existence rules are enforced when it
+    // is visited by the outer loop — here we only need to guard against a loop.
+    const seen = [name];
+    let hop: string | undefined = cfg.jumpHost;
+    while (hop !== undefined) {
+      if (seen.includes(hop)) {
+        throw new Error(
+          `Server '${name}': 'jumpHost' chain forms a cycle (${[...seen, hop].join(" -> ")})`,
+        );
+      }
+      seen.push(hop);
+      const next: SSHConfig | undefined = configMap[hop];
+      if (!next) {
+        throw new Error(
+          `Server '${hop}': 'jumpHost' references unknown server`,
+        );
+      }
+      hop = next.jumpHost;
     }
   }
 }

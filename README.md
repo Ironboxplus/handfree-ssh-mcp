@@ -262,7 +262,7 @@ servers:
 
 Rules (enforced at config load — bad configs fail fast):
 
-- **Single level only.** The referenced jump host must NOT itself set `jumpHost`. No chaining.
+- **Chaining to any depth.** The referenced jump host may itself set `jumpHost`, forming a chain `target -> J1 -> J2 -> ...`. The chain is built innermost-first (the deepest, directly-reachable hop connects first). Only **cycles** are rejected.
 - **Mutually exclusive with `socksProxy`** on the same target.
 - **Self-reference is rejected.** `target.jumpHost: target` is invalid.
 - **Independent policy.** The target authenticates with its OWN `username` / `password` / `privateKey`, and its own `whitelist` / `blacklist` / `safeDirectory` / `allowed*Directories` apply. The jump host is purely transport.

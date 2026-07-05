@@ -38,7 +38,8 @@ servers:
     # Optional: SOCKS proxy for connection
     # socksProxy: socks5://proxy-host:1085
     # Optional: tunnel SSH through another server in this file (ProxyJump-style).
-    # Single level only — the referenced server must not itself set `jumpHost`.
+    # Chains to any depth — the referenced server may itself set `jumpHost`
+    # (target -> J1 -> J2 -> ...); only cycles are rejected.
     # Mutually exclusive with `socksProxy`. The target uses its own credentials
     # and policy; the jump host is purely transport.
     # jumpHost: bastion

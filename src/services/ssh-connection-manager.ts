@@ -74,7 +74,7 @@ export class SSHConnectionManager {
   // target server name (NOT jump name), so each target that jumps through the
   // same bastion still gets its own jump client. This keeps tunnel lifetimes
   // tied 1:1 to the target connection and avoids cross-target interference.
-  private jumpClients: Map<string, Client> = new Map();
+  private jumpClients: Map<string, Client[]> = new Map();
   private defaultName: string = "default";
   private enabledServers: string[] | null = null; // null = all servers enabled
   private outputLogRoot: string | null = null; // null = use <cwd>/.handfree-output at write time
@@ -196,15 +196,7 @@ export class SSHConnectionManager {
       }
       this.clients.delete(name);
     }
-    const jumpClient = this.jumpClients.get(name);
-    if (jumpClient) {
-      try {
-        jumpClient.end();
-      } catch {
-        // Ignore close errors for dead jump clients.
-      }
-      this.jumpClients.delete(name);
-    }
+    this.teardownJumpChain(name);
     this.connected.set(name, false);
     this.connecting.delete(name);
   }
@@ -429,6 +421,12 @@ export class SSHConnectionManager {
             "info",
           );
         } catch (err) {
+          // A multi-hop chain may have partially connected (e.g. an inner hop
+          // came up but a later hop or the final forwardOut failed) before
+          // this rejected. Those already-connected hops were recorded in
+          // jumpClients as each one came up, so tear them down now instead of
+          // leaking live SSH sessions until the next connect attempt.
+          this.teardownJumpChain(key);
           return reject(
             new ToolError(
               "SSH_CONNECTION_FAILED",
@@ -547,55 +545,97 @@ export class SSHConnectionManager {
   }
 
   /**
-   * Open a TCP tunnel from `config.jumpHost` to `config.host:config.port`
-   * using a dedicated SSH client. Returns the duplex stream to be used as
-   * `sock` for the target SSH client.
+   * Open a TCP tunnel from the target's jump chain to `config.host:config.port`
+   * and return the duplex stream to be used as `sock` for the target SSH client.
    *
-   * The jump client is cached per target server so it can be torn down with
-   * the target connection. The jump host's own SSH client (the one tracked
-   * in `this.clients`) is intentionally NOT reused — jump usage and direct
-   * tool calls against the bastion stay isolated.
+   * Supports chained jumps to any depth: `target -> J1 -> J2 -> ...` where each
+   * hop's `jumpHost` names the next hop. The chain is built innermost-first —
+   * the deepest, directly-reachable hop connects normally, and each outer hop is
+   * connected through the previous hop's forwarded stream.
+   *
+   * Every hop's SSH client is cached (in order) under the target key so the whole
+   * chain can be torn down with the target connection. A hop's own client tracked
+   * in `this.clients` is intentionally NOT reused — jump usage and direct tool
+   * calls against a bastion stay isolated.
    * @private
    */
   private async openJumpTunnel(
     targetKey: string,
     config: SSHConfig,
   ): Promise<NodeJS.ReadWriteStream> {
-    const jumpName = config.jumpHost!;
+    // Tear down any stale jump chain for this target before opening a new one.
+    this.teardownJumpChain(targetKey);
+    this.jumpClients.set(targetKey, []);
+
+    const jumpClient = await this.connectJumpChain(targetKey, config.jumpHost!);
+    return this.forwardOutStream(jumpClient, config.host, config.port);
+  }
+
+  /**
+   * Recursively connect the SSH client for `jumpName`, tunneling through its own
+   * `jumpHost` first when set. Each connected hop is appended (innermost-first)
+   * to the target's jump-client chain. Returns the connected client for this hop.
+   * @private
+   */
+  private async connectJumpChain(
+    targetKey: string,
+    jumpName: string,
+  ): Promise<Client> {
     const jumpConfig = this.configs[jumpName];
     if (!jumpConfig) {
       // Should be caught at config load, but guard at runtime too.
       throw new Error(`jump host '${jumpName}' not found in config`);
     }
-    // Tear down any stale jump client for this target before opening a new one.
-    const stale = this.jumpClients.get(targetKey);
-    if (stale) {
-      try { stale.end(); } catch { /* ignore */ }
-      this.jumpClients.delete(targetKey);
+
+    // If this hop is itself reached through another jump, build that inner
+    // tunnel first and hand its stream to this hop as `sock`.
+    let sock: NodeJS.ReadWriteStream | undefined;
+    if (jumpConfig.jumpHost) {
+      const innerClient = await this.connectJumpChain(targetKey, jumpConfig.jumpHost);
+      sock = await this.forwardOutStream(innerClient, jumpConfig.host, jumpConfig.port);
     }
 
-    const jumpClient = new Client();
-    await new Promise<void>((resolve, reject) => {
-      jumpClient.on("ready", () => resolve());
+    const jumpClient = await this.connectJumpClient(targetKey, jumpName, jumpConfig, sock);
+    const chain = this.jumpClients.get(targetKey);
+    if (chain) {
+      chain.push(jumpClient);
+    } else {
+      this.jumpClients.set(targetKey, [jumpClient]);
+    }
+    return jumpClient;
+  }
+
+  /**
+   * Connect a single jump-host SSH client, optionally through `sock` (the stream
+   * from the previous hop). Wires a close handler that tears the whole target
+   * chain down so a dead hop surfaces as a clear failure on the next op.
+   * @private
+   */
+  private connectJumpClient(
+    targetKey: string,
+    jumpName: string,
+    jumpConfig: SSHConfig,
+    sock: NodeJS.ReadWriteStream | undefined,
+  ): Promise<Client> {
+    return new Promise<Client>((resolve, reject) => {
+      const jumpClient = new Client();
+      jumpClient.on("ready", () => resolve(jumpClient));
       jumpClient.on("error", (err: Error) => {
-        reject(new Error(`jump SSH connect failed: ${err.message}`));
+        reject(new Error(`jump SSH connect failed for '${jumpName}': ${err.message}`));
       });
       jumpClient.on("close", () => {
-        // If the jump client dies, kill the target too so callers get a
-        // clear failure on the next op and reconnect through a fresh tunnel.
-        this.connected.set(targetKey, false);
-        const t = this.clients.get(targetKey);
-        if (t) {
-          try { t.end(); } catch { /* ignore */ }
-          this.clients.delete(targetKey);
-        }
-        this.jumpClients.delete(targetKey);
+        // If any hop dies, kill the target too so callers get a clear failure on
+        // the next op and reconnect through a fresh chain.
+        this.teardownTargetViaJump(targetKey);
       });
       const jumpSsh: any = {
         host: jumpConfig.host,
         port: jumpConfig.port,
         username: jumpConfig.username,
       };
+      if (sock) {
+        jumpSsh.sock = sock;
+      }
       const jumpAgent = jumpConfig.agent === false
         ? undefined
         : jumpConfig.agent || (jumpConfig.identitiesOnly ? undefined : process.env.SSH_AUTH_SOCK);
@@ -621,19 +661,57 @@ export class SSHConnectionManager {
       }
       jumpClient.connect(jumpSsh);
     });
+  }
 
-    const stream = await new Promise<NodeJS.ReadWriteStream>((resolve, reject) => {
-      jumpClient.forwardOut(
-        "127.0.0.1", 0,
-        config.host, config.port,
-        (err, ch) => {
-          if (err) return reject(err);
-          resolve(ch as unknown as NodeJS.ReadWriteStream);
-        },
-      );
+  /**
+   * Open a forwarded TCP stream from `client` to `host:port`.
+   * @private
+   */
+  private forwardOutStream(
+    client: Client,
+    host: string,
+    port: number,
+  ): Promise<NodeJS.ReadWriteStream> {
+    return new Promise<NodeJS.ReadWriteStream>((resolve, reject) => {
+      client.forwardOut("127.0.0.1", 0, host, port, (err, ch) => {
+        if (err) return reject(err);
+        resolve(ch as unknown as NodeJS.ReadWriteStream);
+      });
     });
-    this.jumpClients.set(targetKey, jumpClient);
-    return stream;
+  }
+
+  /**
+   * End and forget every jump client in a target's chain (no target teardown).
+   * @private
+   */
+  private teardownJumpChain(targetKey: string): void {
+    const chain = this.jumpClients.get(targetKey);
+    if (!chain) {
+      return;
+    }
+    this.jumpClients.delete(targetKey);
+    for (const client of chain) {
+      try { client.end(); } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * Tear the target connection and its whole jump chain down together. Idempotent
+   * so re-entrant close events (ending one hop closes the next) settle quietly.
+   * @private
+   */
+  private teardownTargetViaJump(targetKey: string): void {
+    const chain = this.jumpClients.get(targetKey);
+    const target = this.clients.get(targetKey);
+    if (!chain && !target) {
+      return; // already torn down
+    }
+    this.connected.set(targetKey, false);
+    if (target) {
+      this.clients.delete(targetKey);
+      try { target.end(); } catch { /* ignore */ }
+    }
+    this.teardownJumpChain(targetKey);
   }
 
   /**
@@ -1810,8 +1888,10 @@ export class SSHConnectionManager {
       this.clients.clear();
     }
     if (this.jumpClients.size > 0) {
-      for (const client of this.jumpClients.values()) {
-        try { client.end(); } catch { /* ignore */ }
+      for (const chain of this.jumpClients.values()) {
+        for (const client of chain) {
+          try { client.end(); } catch { /* ignore */ }
+        }
       }
       this.jumpClients.clear();
     }

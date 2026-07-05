@@ -42,3 +42,6 @@ id_ed25519.*
 # execute-command persistent output logs.
 # These can contain remote file contents, hostnames, and command output.
 .handfree-output/
+# Local secrets / scratch
+pass/
+.omx/

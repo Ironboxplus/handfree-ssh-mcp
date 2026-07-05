@@ -956,7 +956,7 @@ servers:
     );
   });
 
-  it("should reject chained jumps (jump host itself sets jumpHost)", () => {
+  it("should accept chained jumps (jump host itself sets jumpHost)", () => {
     const configContent = `
 servers:
   outer:
@@ -977,9 +977,37 @@ servers:
     const p = path.join(tempDir, "jump-chain.yaml");
     fs.writeFileSync(p, configContent);
 
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.configs["target"].jumpHost, "bastion");
+    assert.strictEqual(result.configs["bastion"].jumpHost, "outer");
+    assert.strictEqual(result.configs["outer"].jumpHost, undefined);
+  });
+
+  it("should reject a jumpHost cycle", () => {
+    const configContent = `
+servers:
+  a:
+    host: 10.0.0.0
+    username: a
+    password: apass
+    jumpHost: b
+  b:
+    host: 10.0.0.1
+    username: b
+    password: bpass
+    jumpHost: c
+  c:
+    host: 10.0.0.2
+    username: c
+    password: cpass
+    jumpHost: a
+`;
+    const p = path.join(tempDir, "jump-cycle.yaml");
+    fs.writeFileSync(p, configContent);
+
     assert.throws(
       () => loadConfigFromYaml(p),
-      /chained jumps are not supported/,
+      /cycle/i,
     );
   });
 
