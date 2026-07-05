@@ -31,6 +31,7 @@ interface YamlServerConfig {
   safeDirectory?: string;
   allowedRemoteDirectories?: string[];
   allowedLocalDirectories?: string[];
+  disableSftpPathPolicy?: boolean;
 }
 
 interface YamlSshConfigOptions {
@@ -247,6 +248,9 @@ function buildYamlServerConfig(
       serverConfig.allowedLocalDirectories,
     );
   }
+  if (serverConfig.disableSftpPathPolicy !== undefined) {
+    merged.disableSftpPathPolicy = serverConfig.disableSftpPathPolicy === true;
+  }
 
   if (!allowPartial) {
     Logger.log(
@@ -276,6 +280,7 @@ function mergeConfigMaps(
       commandBlacklist: yamlConfig.commandBlacklist ?? merged[name]?.commandBlacklist,
       disableBuiltinGuards: yamlConfig.disableBuiltinGuards ?? merged[name]?.disableBuiltinGuards,
       disableBuiltinBlacklist: yamlConfig.disableBuiltinBlacklist ?? merged[name]?.disableBuiltinBlacklist,
+      disableSftpPathPolicy: yamlConfig.disableSftpPathPolicy ?? merged[name]?.disableSftpPathPolicy,
       safeDirectory: yamlConfig.safeDirectory ?? merged[name]?.safeDirectory,
     };
   }

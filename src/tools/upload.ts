@@ -12,12 +12,12 @@ export function registerUploadTool(server: McpServer): void {
 
   server.tool(
     "upload",
-    "Upload a local file from the MCP host to the remote server over SFTP. Use this when the file already exists locally and must be copied to the selected SSH server. The remote destination must live inside one of the server's allowedRemoteDirectories; call show-whitelist to discover the allowed paths. " +
+    "Upload a local file from the MCP host to the remote server over SFTP. Use this when the file already exists locally and must be copied to the selected SSH server. By default any absolute remote path is allowed; if the server configures allowedRemoteDirectories, the destination must live inside one of those entries — call show-whitelist to check. " +
       "Shell scripts (.sh / .bash / .zsh) with CRLF line endings are auto-converted to LF before upload (the response notes when this happens). " +
       "By default the upload is skipped if the remote file is already identical to the local one (byte-compare for files \u2264 256 MiB, MD5 otherwise; shell scripts are compared in a line-ending-agnostic way so CRLF\u2194LF differences alone do not trigger a re-upload) \u2014 pass skipIfIdentical=false to force a re-upload.",
     {
       localPath: z.string().describe("Path to a local file on the MCP host. Must be inside the MCP working directory or one of the server's allowedLocalDirectories."),
-      remotePath: z.string().describe("Destination path on the remote server. Must be an absolute POSIX path inside one of the server's allowedRemoteDirectories (e.g. /home/user/uploads/file.txt)."),
+      remotePath: z.string().describe("Destination path on the remote server. Must be an absolute POSIX path (e.g. /home/user/uploads/file.txt); restricted to allowedRemoteDirectories only if the server configures that list."),
       connectionName: z.string().optional().describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
       skipIfIdentical: z.boolean().optional().describe("When true (default), skip the upload if the remote file is already identical (byte-compare for files \u2264 256 MiB, MD5 otherwise; shell scripts ignore CRLF\u2194LF differences). Set to false to force re-upload."),
     },

@@ -46,14 +46,19 @@ servers:
     # Safe directory for rm commands (optional)
     # safeDirectory: /home/root
     # SFTP path policy (upload / download / transfer ONLY — execute-command is unaffected).
-    # If `allowedRemoteDirectories` is unset or empty, SFTP is DISABLED for this server.
+    # Default is OPEN: with `allowedRemoteDirectories` unset or empty, any absolute
+    # POSIX remote path is allowed. Configure it to opt into an allowlist instead.
     # allowedRemoteDirectories:
     #   - /home/root
     #   - /tmp
     # Additional local directories permitted as upload source / download target.
-    # The MCP working directory is always allowed implicitly.
+    # The MCP working directory is always allowed implicitly; with no
+    # `allowedLocalDirectories`, only that directory is allowed as the local side.
     # allowedLocalDirectories:
     #   - /path/to/extra/local/dir
+    # Set true to bypass both the remote allowlist and the local directory check
+    # entirely (any remote path, any local path). Overrides allowedRemoteDirectories.
+    # disableSftpPathPolicy: true
     # Command security. Default mode is blacklist: commands are allowed unless
     # they hit the built-in dangerous blacklist or one of these patterns.
     # Use `commandMode: whitelist` when you want whitelist patterns to be required.

@@ -744,25 +744,37 @@ describe("SFTP path validators", () => {
 
   // -------- validateRemotePath --------
 
-  it("should reject SFTP when allowedRemoteDirectories is unset", () => {
+  it("should allow any absolute remote path by default when allowedRemoteDirectories is unset", () => {
     manager.setConfig({ dev: baseConfig() }, ["dev"]);
-    assert.throws(
-      () => manager.validateRemotePath("/home/test/file.txt", "dev"),
-      (e: unknown) =>
-        e instanceof ToolError &&
-        e.code === "REMOTE_PATH_NOT_ALLOWED" &&
-        /no 'allowedRemoteDirectories' configured/.test(e.message),
+    assert.strictEqual(
+      manager.validateRemotePath("/home/test/file.txt", "dev"),
+      "/home/test/file.txt",
+    );
+    assert.strictEqual(
+      manager.validateRemotePath("/etc/passwd", "dev"),
+      "/etc/passwd",
     );
   });
 
-  it("should reject SFTP when allowedRemoteDirectories is empty", () => {
+  it("should allow any absolute remote path when allowedRemoteDirectories is empty", () => {
     manager.setConfig(
       { dev: baseConfig({ allowedRemoteDirectories: [] }) },
       ["dev"],
     );
-    assert.throws(
-      () => manager.validateRemotePath("/home/test/file.txt", "dev"),
-      (e: unknown) => e instanceof ToolError && e.code === "REMOTE_PATH_NOT_ALLOWED",
+    assert.strictEqual(
+      manager.validateRemotePath("/home/test/file.txt", "dev"),
+      "/home/test/file.txt",
+    );
+  });
+
+  it("should allow any absolute remote path when disableSftpPathPolicy is set, even with a restrictive allowlist", () => {
+    manager.setConfig(
+      { dev: baseConfig({ allowedRemoteDirectories: ["/home/test"], disableSftpPathPolicy: true }) },
+      ["dev"],
+    );
+    assert.strictEqual(
+      manager.validateRemotePath("/etc/passwd", "dev"),
+      "/etc/passwd",
     );
   });
 
@@ -905,6 +917,16 @@ describe("SFTP path validators", () => {
           /not inside any allowed directory/.test(e.message),
       );
     }
+  });
+
+  it("should allow any local path when disableSftpPathPolicy is set", () => {
+    const tmp = path.resolve(os.tmpdir());
+    manager.setConfig(
+      { dev: baseConfig({ disableSftpPathPolicy: true }) },
+      ["dev"],
+    );
+    const file = path.join(tmp, "handfree-test-open.txt");
+    assert.strictEqual(manager.validateLocalPath(file, "dev"), file);
   });
 });
 

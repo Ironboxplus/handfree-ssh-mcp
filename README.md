@@ -216,7 +216,8 @@ servers:
 
     # SFTP path policy — applies ONLY to upload / download / transfer.
     # execute-command is NOT affected by these lists.
-    # If `allowedRemoteDirectories` is unset or empty, SFTP is DISABLED for the server.
+    # Default is OPEN: with `allowedRemoteDirectories` unset/empty, any absolute
+    # POSIX remote path is allowed. Configure it to opt into an allowlist instead.
     allowedRemoteDirectories:
       - /home/user
       - /tmp
@@ -224,20 +225,23 @@ servers:
     # The MCP working directory is always permitted implicitly.
     allowedLocalDirectories:
       - /path/to/extra/local/dir
+    # Bypasses both the remote allowlist and the local directory check entirely.
+    # disableSftpPathPolicy: true
 ```
 
 ### Security note: command policy
 
-`execute-command` defaults to `commandMode: blacklist`. In that mode commands are allowed unless they match built-in destructive guards, the built-in dangerous-command blacklist, or a server's configured `blacklist:` patterns. Built-in blocked operations include hidden/chained destructive file operations, risky absolute-path output redirection, system power commands (`reboot`, `shutdown`, `halt`, `poweroff`), recursive force delete (`rm -rf`), destructive disk writes (`dd ... of=`), and filesystem formatting commands. Set `commandMode: whitelist` to require every command to match `whitelist:` after blacklist checks. For compatibility, a YAML server that contains `whitelist:` without `commandMode:` is treated as whitelist mode.
+`execute-command` defaults to `commandMode: blacklist`. In that mode commands are allowed unless they match built-in destructive guards, the built-in dangerous-command blacklist, or a server's configured `blacklist:` patterns. Built-in blocked operations include hidden/chained destructive file operations, risky absolute-path output redirection, system power commands (`reboot`, `shutdown`, `halt`, `poweroff`), recursive force delete (`rm -rf`), destructive disk writes (`dd ... of=`), and filesystem formatting commands. Set `commandMode: whitelist` to require every command to match `whitelist:` after blacklist checks. For compatibility, a YAML server that contains `whitelist:` without `commandMode:` is treated as whitelist mode. Set `disableBuiltinGuards: true` and/or `disableBuiltinBlacklist: true` to turn off the built-in guards/blacklist for a server (your own `blacklist:`/`whitelist:` still apply).
 
 ### SFTP path policy
 
 | Field | Scope | Default behavior |
 |---|---|---|
-| `allowedRemoteDirectories` | `upload` / `download` / `transfer` only | **Unset = SFTP disabled.** Must list absolute POSIX directories. |
+| `allowedRemoteDirectories` | `upload` / `download` / `transfer` only | **Unset/empty = open.** Any absolute POSIX path is allowed. Configuring this list opts into restricting SFTP to those directories. |
 | `allowedLocalDirectories` | `upload` / `download` only | Unset = only the MCP working directory is allowed. |
+| `disableSftpPathPolicy` | all SFTP tools | When `true`, bypasses both checks above entirely — any remote path, any local path. |
 
-Path matching is exact-equal or `dir + separator` prefix. `..` segments and null bytes are rejected. Use `show-whitelist` to inspect a server's current SFTP policy.
+Path matching (when an allowlist is configured) is exact-equal or `dir + separator` prefix. `..` segments and null bytes are always rejected regardless of policy. Use `show-whitelist` to inspect a server's current SFTP policy.
 
 ### Jump host (ProxyJump-style)
 

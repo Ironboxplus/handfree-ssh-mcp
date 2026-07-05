@@ -37,7 +37,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         "(upload/download only) Path on the MCP host. Must be inside the MCP working directory or one of the server's allowedLocalDirectories.",
       ),
       remotePath: z.string().optional().describe(
-        "(upload/download only) Absolute POSIX path on the remote server. Must live inside one of the server's allowedRemoteDirectories — call show-whitelist to discover the allowed paths.",
+        "(upload/download only) Absolute POSIX path on the remote server. Any path is allowed by default; restricted to allowedRemoteDirectories only if the server configures that list — call show-whitelist to check.",
       ),
       connectionName: z.string().optional().describe(
         "(upload/download only) Target server name from list-servers. Required when multiple servers are enabled.",
@@ -46,13 +46,13 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         "(relay only) Server name to download the file from.",
       ),
       sourceRemotePath: z.string().optional().describe(
-        "(relay only) Absolute POSIX file path on the source server. Must live inside the source server's allowedRemoteDirectories.",
+        "(relay only) Absolute POSIX file path on the source server. Any path is allowed by default unless the source server configures allowedRemoteDirectories.",
       ),
       destServer: z.string().optional().describe(
         "(relay only) Server name to upload the file to.",
       ),
       destRemotePath: z.string().optional().describe(
-        "(relay only) Absolute POSIX destination path on the target server. Must live inside the destination server's allowedRemoteDirectories.",
+        "(relay only) Absolute POSIX destination path on the target server. Any path is allowed by default unless the destination server configures allowedRemoteDirectories.",
       ),
       recursive: z.boolean().optional().describe(
         "(upload/download only) When true, transfers an entire directory tree recursively. Default false.",

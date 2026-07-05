@@ -19,15 +19,17 @@ export interface SSHConfig {
   disableBuiltinBlacklist?: boolean; // When true, skip the built-in dangerous-command blacklist for this server.
   socksProxy?: string; // SOCKS proxy URL, e.g. 'socks://user:pass@host:port'
   // Name of another server in the same config to use as an SSH jump host (ProxyJump).
-  // Single-level only: the referenced jump host must not itself specify `jumpHost`.
-  // Mutually exclusive with `socksProxy`. The target uses its own credentials and
-  // policy (whitelists, allowed directories); the jump host is purely transport.
+  // Chains to any depth (the referenced jump host may itself set `jumpHost`); only
+  // cycles are rejected. Mutually exclusive with `socksProxy`. The target uses its
+  // own credentials and policy (whitelists, allowed directories); the jump host is
+  // purely transport.
   jumpHost?: string;
   safeDirectory?: string; // Optional per-server safe directory for destructive ops (rm, etc.)
   // SFTP-only path allowlists. Apply to upload/download/transfer tools.
   // execute-command is NOT affected by these.
-  allowedRemoteDirectories?: string[]; // Absolute POSIX dirs that SFTP remotePath may live under. If unset/empty, SFTP is rejected.
+  allowedRemoteDirectories?: string[]; // Absolute POSIX dirs that SFTP remotePath may live under. If unset/empty, SFTP is rejected unless disableSftpPathPolicy is set.
   allowedLocalDirectories?: string[]; // Absolute host dirs (in addition to process.cwd()) that SFTP localPath may live under.
+  disableSftpPathPolicy?: boolean; // When true, skip allowedRemoteDirectories/allowedLocalDirectories containment checks entirely (any absolute remote path, any local path allowed).
 }
 
 /**

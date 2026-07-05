@@ -1451,15 +1451,19 @@ export class SSHConnectionManager {
    */
   private validateLocalPath(localPath: string, name?: string): string {
     const resolvedPath = path.resolve(localPath);
+    const config = name ? this.getServerConfig(name) : undefined;
+
+    // disableSftpPathPolicy fully opens the local side too (any path allowed).
+    if (config?.disableSftpPathPolicy) {
+      return resolvedPath;
+    }
+
     const allowedRoots = new Set<string>([process.cwd()]);
 
     // Add per-server allowedLocalDirectories if a server is targeted
-    if (name) {
-      const config = this.getServerConfig(name);
-      if (config?.allowedLocalDirectories) {
-        for (const dir of config.allowedLocalDirectories) {
-          allowedRoots.add(dir);
-        }
+    if (config?.allowedLocalDirectories) {
+      for (const dir of config.allowedLocalDirectories) {
+        allowedRoots.add(dir);
       }
     }
 
@@ -1526,13 +1530,11 @@ export class SSHConnectionManager {
     const config = this.getConfig(name);
     const allowedRoots = config.allowedRemoteDirectories ?? [];
 
-    if (allowedRoots.length === 0) {
-      throw new ToolError(
-        "REMOTE_PATH_NOT_ALLOWED",
-        `SFTP is disabled for server '${name}': no 'allowedRemoteDirectories' configured. ` +
-          `Add at least one absolute POSIX directory to 'allowedRemoteDirectories' in the YAML config to permit upload/download.`,
-        false,
-      );
+    // Default is OPEN: with no 'allowedRemoteDirectories' configured (or
+    // disableSftpPathPolicy set), any absolute POSIX path is allowed. Configure
+    // 'allowedRemoteDirectories' to opt into an allowlist for this server.
+    if (config.disableSftpPathPolicy || allowedRoots.length === 0) {
+      return normalized;
     }
 
     const isAllowed = allowedRoots.some((root) =>
