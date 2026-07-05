@@ -181,6 +181,67 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
       generationBefore + 1,
     );
   });
+
+  it("resets a target when an upstream jump host's connection fields change", () => {
+    manager.setConfig(
+      {
+        bastion: baseConfig({ name: "bastion" }),
+        target: baseConfig({ name: "target", jumpHost: "bastion" }),
+      },
+      ["bastion", "target"],
+    );
+    // Pretend the target is live through the chain.
+    manager.connected.set("target", true);
+    manager.clients.set("target", { end() {} });
+    const genBefore = manager.connectionGenerations.get("target") ?? 0;
+
+    manager.replaceConfig(
+      {
+        // Upstream hop changed; the target's own fields are untouched.
+        bastion: baseConfig({ name: "bastion", host: "10.9.9.9" }),
+        target: baseConfig({ name: "target", jumpHost: "bastion" }),
+      },
+      ["bastion", "target"],
+    );
+
+    assert.strictEqual(manager.connected.get("target"), false);
+    assert.strictEqual(
+      manager.connectionGenerations.get("target"),
+      genBefore + 1,
+    );
+  });
+
+  it("leaves a target connected when nothing in its jump chain changed", () => {
+    manager.setConfig(
+      {
+        bastion: baseConfig({ name: "bastion" }),
+        target: baseConfig({ name: "target", jumpHost: "bastion" }),
+      },
+      ["bastion", "target"],
+    );
+    manager.connected.set("target", true);
+    manager.clients.set("target", { end() {} });
+    const genBefore = manager.connectionGenerations.get("target") ?? 0;
+
+    // A policy-only change on the target (not a connection field).
+    manager.replaceConfig(
+      {
+        bastion: baseConfig({ name: "bastion" }),
+        target: baseConfig({
+          name: "target",
+          jumpHost: "bastion",
+          safeDirectory: "/tmp",
+        }),
+      },
+      ["bastion", "target"],
+    );
+
+    assert.strictEqual(manager.connected.get("target"), true);
+    assert.strictEqual(
+      manager.connectionGenerations.get("target"),
+      genBefore,
+    );
+  });
 });
 
 describe("SSHConnectionManager default-server semantics", () => {

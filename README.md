@@ -268,7 +268,7 @@ Rules (enforced at config load — bad configs fail fast):
 - **Independent policy.** The target authenticates with its OWN `username` / `password` / `privateKey`, and its own `whitelist` / `blacklist` / `safeDirectory` / `allowed*Directories` apply. The jump host is purely transport.
 - **Jump host is still a normal server.** You can run tools against `bastion` directly; its connection is separate from the tunneling one.
 
-**Hot-reload note:** `jumpHost` is connection-level, not policy-level. Editing it in `servers.yaml` while the server is running will NOT take effect — the hot-reloader only refreshes whitelist / blacklist / `safeDirectory` / `allowed*Directories`. Restart the MCP server to pick up `jumpHost` changes.
+**Hot-reload note:** `jumpHost` is a connection-level field, so it hot-reloads. Editing a server's `jumpHost` (or any hop's connection fields) in `servers.yaml` resets the affected connection on the fly — the change takes effect on the next tool call, no restart needed. This is chain-aware: if an intermediate hop's host / port / credentials change, every target that tunnels through it is reset too.
 
 ### Connection lifecycle (connect / reconnect)
 

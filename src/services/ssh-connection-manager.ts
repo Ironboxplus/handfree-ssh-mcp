@@ -133,23 +133,63 @@ export class SSHConnectionManager {
     enabledServers?: string[],
   ): void {
     const previous = this.configs;
-    const changedConnections: string[] = [];
 
+    // Pass 1: servers whose own connection fields changed (or that vanished).
+    const directlyChanged = new Set<string>();
     for (const [name, oldConfig] of Object.entries(previous)) {
       const nextConfig = configs[name];
       if (!nextConfig || this.connectionFieldsChanged(oldConfig, nextConfig)) {
-        this.closeClient(name, true);
-        this.statusCache.delete(name);
-        changedConnections.push(name);
+        directlyChanged.add(name);
       }
+    }
+
+    // Pass 2: a target must ALSO reset if any hop in its jump chain directly
+    // changed — otherwise it keeps tunneling through a stale intermediate hop.
+    // Walk both the old and new chains so topology shifts (added/removed hops)
+    // are covered too.
+    const toReset = new Set<string>(directlyChanged);
+    for (const name of Object.keys(previous)) {
+      if (toReset.has(name)) continue;
+      if (
+        this.jumpChainTouchesChanged(name, previous, directlyChanged) ||
+        this.jumpChainTouchesChanged(name, configs, directlyChanged)
+      ) {
+        toReset.add(name);
+      }
+    }
+
+    for (const name of toReset) {
+      this.closeClient(name, true);
+      this.statusCache.delete(name);
     }
 
     this.setConfig(configs, enabledServers);
     Logger.log(
       `Hot-reloaded SSH config: ${Object.keys(configs).length} server(s), ` +
-      `${changedConnections.length} connection(s) reset`,
+      `${toReset.size} connection(s) reset`,
       "info",
     );
+  }
+
+  /**
+   * Walk `name`'s jump chain in `configMap` and report whether any hop is in the
+   * `changed` set. Guards against cycles defensively (config load rejects them).
+   * @private
+   */
+  private jumpChainTouchesChanged(
+    name: string,
+    configMap: SshConnectionConfigMap,
+    changed: Set<string>,
+  ): boolean {
+    const seen = new Set<string>([name]);
+    let hop = configMap[name]?.jumpHost;
+    while (hop !== undefined) {
+      if (changed.has(hop)) return true;
+      if (seen.has(hop)) break;
+      seen.add(hop);
+      hop = configMap[hop]?.jumpHost;
+    }
+    return false;
   }
 
   /**
