@@ -539,4 +539,159 @@ servers:
   });
 });
 
+describe("Jump Host Config", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "handfree-ssh-mcp-test-"));
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("should accept a valid jumpHost reference", () => {
+    const configContent = `
+servers:
+  bastion:
+    host: 10.0.0.1
+    username: gate
+    password: gatepass
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: bastion
+`;
+    const p = path.join(tempDir, "jump-ok.yaml");
+    fs.writeFileSync(p, configContent);
+
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.configs["target"].jumpHost, "bastion");
+    assert.strictEqual(result.configs["bastion"].jumpHost, undefined);
+  });
+
+  it("should resolve forward references (jumpHost defined later in file)", () => {
+    const configContent = `
+servers:
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: bastion
+  bastion:
+    host: 10.0.0.1
+    username: gate
+    password: gatepass
+`;
+    const p = path.join(tempDir, "jump-forward.yaml");
+    fs.writeFileSync(p, configContent);
+
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.configs["target"].jumpHost, "bastion");
+  });
+
+  it("should reject unknown jumpHost references", () => {
+    const configContent = `
+servers:
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: nope
+`;
+    const p = path.join(tempDir, "jump-unknown.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /references unknown server 'nope'/,
+    );
+  });
+
+  it("should reject self-referencing jumpHost", () => {
+    const configContent = `
+servers:
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: target
+`;
+    const p = path.join(tempDir, "jump-self.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /must not reference itself/,
+    );
+  });
+
+  it("should reject jumpHost when socksProxy is also set", () => {
+    const configContent = `
+servers:
+  bastion:
+    host: 10.0.0.1
+    username: gate
+    password: gatepass
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    socksProxy: socks5://127.0.0.1:1080
+    jumpHost: bastion
+`;
+    const p = path.join(tempDir, "jump-socks.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /mutually exclusive/,
+    );
+  });
+
+  it("should reject chained jumps (jump host itself sets jumpHost)", () => {
+    const configContent = `
+servers:
+  outer:
+    host: 10.0.0.0
+    username: outer
+    password: outerpass
+  bastion:
+    host: 10.0.0.1
+    username: gate
+    password: gatepass
+    jumpHost: outer
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: bastion
+`;
+    const p = path.join(tempDir, "jump-chain.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /chained jumps are not supported/,
+    );
+  });
+
+  it("should leave jumpHost undefined when not set", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+`;
+    const p = path.join(tempDir, "no-jump.yaml");
+    fs.writeFileSync(p, configContent);
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.configs["dev"].jumpHost, undefined);
+  });
+});
+
 console.log("\n🧪 Running handfree-ssh-mcp tests...\n");

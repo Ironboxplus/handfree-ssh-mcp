@@ -99,6 +99,11 @@ export class SSHConnectionManager {
   // concurrent connect attempts so we never create two SSH clients for the
   // same server and leak the loser.
   private connecting: Map<string, Promise<void>> = new Map();
+  // Dedicated tunneling clients for targets that use a `jumpHost`. Keyed by
+  // target server name (NOT jump name), so each target that jumps through the
+  // same bastion still gets its own jump client. This keeps tunnel lifetimes
+  // tied 1:1 to the target connection and avoids cross-target interference.
+  private jumpClients: Map<string, Client> = new Map();
   private defaultName: string = "default";
   private enabledServers: string[] | null = null; // null = all servers enabled
   private outputLogRoot: string | null = null; // null = use <cwd>/.handfree-output at write time
@@ -390,6 +395,26 @@ export class SSHConnectionManager {
         port: config.port,
         username: config.username,
       };
+      // Add jump-host tunnel if provided. Mutually exclusive with socksProxy
+      // (enforced at config load time).
+      if (config.jumpHost) {
+        try {
+          const sock = await this.openJumpTunnel(key, config);
+          sshConfig.sock = sock;
+          Logger.log(
+            `Using jump host '${config.jumpHost}' for [${key}]`,
+            "info",
+          );
+        } catch (err) {
+          return reject(
+            new ToolError(
+              "SSH_CONNECTION_FAILED",
+              `Failed to open jump tunnel for [${key}] via '${config.jumpHost}': ${(err as Error).message}`,
+              true,
+            ),
+          );
+        }
+      }
       // Add SOCKS proxy configuration if provided
       if (config.socksProxy) {
         try {
@@ -474,6 +499,85 @@ export class SSHConnectionManager {
       client.connect(sshConfig);
     });
     this.clients.set(key, client);
+  }
+
+  /**
+   * Open a TCP tunnel from `config.jumpHost` to `config.host:config.port`
+   * using a dedicated SSH client. Returns the duplex stream to be used as
+   * `sock` for the target SSH client.
+   *
+   * The jump client is cached per target server so it can be torn down with
+   * the target connection. The jump host's own SSH client (the one tracked
+   * in `this.clients`) is intentionally NOT reused — jump usage and direct
+   * tool calls against the bastion stay isolated.
+   * @private
+   */
+  private async openJumpTunnel(
+    targetKey: string,
+    config: SSHConfig,
+  ): Promise<NodeJS.ReadWriteStream> {
+    const jumpName = config.jumpHost!;
+    const jumpConfig = this.configs[jumpName];
+    if (!jumpConfig) {
+      // Should be caught at config load, but guard at runtime too.
+      throw new Error(`jump host '${jumpName}' not found in config`);
+    }
+    // Tear down any stale jump client for this target before opening a new one.
+    const stale = this.jumpClients.get(targetKey);
+    if (stale) {
+      try { stale.end(); } catch { /* ignore */ }
+      this.jumpClients.delete(targetKey);
+    }
+
+    const jumpClient = new Client();
+    await new Promise<void>((resolve, reject) => {
+      jumpClient.on("ready", () => resolve());
+      jumpClient.on("error", (err: Error) => {
+        reject(new Error(`jump SSH connect failed: ${err.message}`));
+      });
+      jumpClient.on("close", () => {
+        // If the jump client dies, kill the target too so callers get a
+        // clear failure on the next op and reconnect through a fresh tunnel.
+        this.connected.set(targetKey, false);
+        const t = this.clients.get(targetKey);
+        if (t) {
+          try { t.end(); } catch { /* ignore */ }
+          this.clients.delete(targetKey);
+        }
+        this.jumpClients.delete(targetKey);
+      });
+      const jumpSsh: any = {
+        host: jumpConfig.host,
+        port: jumpConfig.port,
+        username: jumpConfig.username,
+      };
+      if (jumpConfig.privateKey) {
+        try {
+          jumpSsh.privateKey = fs.readFileSync(jumpConfig.privateKey, "utf8");
+          if (jumpConfig.passphrase) jumpSsh.passphrase = jumpConfig.passphrase;
+        } catch (err) {
+          return reject(new Error(`read jump private key failed: ${(err as Error).message}`));
+        }
+      } else if (jumpConfig.password) {
+        jumpSsh.password = jumpConfig.password;
+      } else {
+        return reject(new Error(`jump host '${jumpName}' has no password or privateKey`));
+      }
+      jumpClient.connect(jumpSsh);
+    });
+
+    const stream = await new Promise<NodeJS.ReadWriteStream>((resolve, reject) => {
+      jumpClient.forwardOut(
+        "127.0.0.1", 0,
+        config.host, config.port,
+        (err, ch) => {
+          if (err) return reject(err);
+          resolve(ch as unknown as NodeJS.ReadWriteStream);
+        },
+      );
+    });
+    this.jumpClients.set(targetKey, jumpClient);
+    return stream;
   }
 
   /**
@@ -1645,32 +1749,60 @@ export class SSHConnectionManager {
       }
       this.clients.clear();
     }
+    if (this.jumpClients.size > 0) {
+      for (const client of this.jumpClients.values()) {
+        try { client.end(); } catch { /* ignore */ }
+      }
+      this.jumpClients.clear();
+    }
   }
 
   /**
-   * Get basic information of all configured servers
+   * Get basic information of all configured servers.
+   *
+   * Lean by default — returns only identity + connection state. Pass
+   * `verbose: true` to include the cached `status` block (hostname, CPU,
+   * memory, disk, GPUs, etc.). The status block is large and rarely useful
+   * for routing decisions, so the LLM should opt in.
    */
-  public getAllServerInfos(): Array<{
+  public getAllServerInfos(opts: { verbose?: boolean } = {}): Array<{
     name: string;
     host: string;
     port: number;
     username: string;
     connected: boolean;
     enabled: boolean;
+    jumpHost?: string;
     status?: ServerStatus;
   }> {
+    const verbose = opts.verbose === true;
     return Object.keys(this.configs).map((key) => {
       const config = this.configs[key];
-      const status = this.statusCache.get(key);
-      return {
+      const info: {
+        name: string;
+        host: string;
+        port: number;
+        username: string;
+        connected: boolean;
+        enabled: boolean;
+        jumpHost?: string;
+        status?: ServerStatus;
+      } = {
         name: key,
         host: config.host,
         port: config.port,
         username: config.username,
         connected: this.connected.get(key) === true,
         enabled: this.isServerEnabled(key),
-        status: status,
       };
+      if (config.jumpHost) {
+        info.jumpHost = config.jumpHost;
+      }
+      if (verbose) {
+        const status = this.statusCache.get(key);
+        if (status) info.status = status;
+      }
+      return info;
     });
   }
 

@@ -16,6 +16,7 @@ interface YamlServerConfig {
   privateKey?: string;
   passphrase?: string;
   socksProxy?: string;
+  jumpHost?: string;
   whitelist?: string[];
   blacklist?: string[];
   safeDirectory?: string;
@@ -108,6 +109,7 @@ export function loadConfigFromYaml(configPath: string): ParsedArgs {
       privateKey,
       passphrase: serverConfig.passphrase,
       socksProxy: serverConfig.socksProxy,
+      jumpHost: serverConfig.jumpHost,
       commandWhitelist: serverConfig.whitelist,
       commandBlacklist: serverConfig.blacklist,
       safeDirectory: serverConfig.safeDirectory,
@@ -124,6 +126,9 @@ export function loadConfigFromYaml(configPath: string): ParsedArgs {
   if (Object.keys(configMap).length === 0) {
     throw new Error("No servers defined in config file");
   }
+
+  // Validate jumpHost references after all servers are loaded.
+  validateJumpHosts(configMap);
 
   Logger.log(`Total servers loaded: ${Object.keys(configMap).length}`, "info");
 
@@ -174,6 +179,45 @@ export function getEnabledServersArg(args: string[]): string[] | null {
  */
 export function getPreConnectFlag(args: string[]): boolean {
   return args.includes("--pre-connect");
+}
+
+/**
+ * Validate every server's `jumpHost` reference.
+ *
+ * Rules:
+ *  - target with `jumpHost` must not also set `socksProxy` (mutually exclusive).
+ *  - referenced jump host must exist in the same config.
+ *  - self-reference is rejected.
+ *  - single-level only: the jump host must not itself specify `jumpHost`.
+ */
+function validateJumpHosts(configMap: SshConnectionConfigMap): void {
+  for (const [name, cfg] of Object.entries(configMap)) {
+    if (cfg.jumpHost === undefined) {
+      continue;
+    }
+    if (typeof cfg.jumpHost !== "string" || cfg.jumpHost.length === 0) {
+      throw new Error(`Server '${name}': 'jumpHost' must be a non-empty string`);
+    }
+    if (cfg.socksProxy) {
+      throw new Error(
+        `Server '${name}': 'jumpHost' and 'socksProxy' are mutually exclusive`,
+      );
+    }
+    if (cfg.jumpHost === name) {
+      throw new Error(`Server '${name}': 'jumpHost' must not reference itself`);
+    }
+    const jump = configMap[cfg.jumpHost];
+    if (!jump) {
+      throw new Error(
+        `Server '${name}': 'jumpHost' references unknown server '${cfg.jumpHost}'`,
+      );
+    }
+    if (jump.jumpHost) {
+      throw new Error(
+        `Server '${name}': 'jumpHost' '${cfg.jumpHost}' itself sets 'jumpHost' — chained jumps are not supported`,
+      );
+    }
+  }
 }
 
 /**
