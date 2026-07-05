@@ -446,6 +446,73 @@ describe("SSHConnectionManager regressions", () => {
     manager.setConfig({}, undefined);
   });
 
+  it("should default to blacklist mode and allow commands outside a whitelist", () => {
+    manager.setConfig(
+      {
+        dev: baseConfig(),
+      },
+      ["dev"],
+    );
+
+    const result = manager.validateCommand("ver", "dev");
+    assert.strictEqual(result.isAllowed, true);
+  });
+
+  it("should apply the built-in dangerous blacklist in default mode", () => {
+    manager.setConfig(
+      {
+        dev: baseConfig(),
+      },
+      ["dev"],
+    );
+
+    for (const command of [
+      "reboot",
+      "shutdown /s /t 0",
+      "rm -rf /root/test-file",
+      "rm -r -f /root/test-file",
+      "Remove-Item -Recurse -Force C:\\Users\\Arc\\test-file",
+      "del /s /q C:\\Users\\Arc\\test-file",
+      "Restart-Computer",
+      "dd if=/dev/zero of=/dev/sda",
+    ]) {
+      const result = manager.validateCommand(command, "dev");
+      assert.strictEqual(result.isAllowed, false, command);
+      assert.match(result.reason ?? "", /blacklist|blocked/i);
+    }
+  });
+
+  it("should ignore whitelist patterns when commandMode is blacklist", () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandMode: "blacklist",
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const result = manager.validateCommand("ver", "dev");
+    assert.strictEqual(result.isAllowed, true);
+  });
+
+  it("should block non-matching commands in explicit whitelist mode", () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandMode: "whitelist",
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const result = manager.validateCommand("ver", "dev");
+    assert.strictEqual(result.isAllowed, false);
+    assert.match(result.reason ?? "", /whitelist/i);
+  });
+
   it("should require safe rm to still match the whitelist", () => {
     manager.setConfig(
       {

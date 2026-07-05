@@ -1,8 +1,83 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
+import { SSHConfig } from "../models/types.js";
+import {
+  BUILT_IN_COMMAND_BLACKLIST,
+  BUILT_IN_DESTRUCTIVE_GUARDS,
+  SSHConnectionManager,
+} from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { ToolError, formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
+
+export function formatCommandPolicy(config: SSHConfig): string {
+  const whitelist = config.commandWhitelist || [];
+  const blacklist = config.commandBlacklist || [];
+  const commandMode = config.commandMode
+    ?? (whitelist.length > 0 ? "whitelist" : "blacklist");
+
+  let output = `## Command Policy\n\n`;
+  output += `Mode: \`${commandMode}\``;
+  if (!config.commandMode && whitelist.length > 0) {
+    output += ` _(legacy whitelist config)_`;
+  }
+  output += `\n\n`;
+
+  output += `Built-in destructive command guards:\n\n`;
+  for (const { regex, reason } of BUILT_IN_DESTRUCTIVE_GUARDS) {
+    output += `- \`${regex.source}\` -> ${reason}\n`;
+  }
+  output += `\n`;
+
+  output += `Built-in dangerous-command blacklist:\n\n`;
+  for (const { regex, reason } of BUILT_IN_COMMAND_BLACKLIST) {
+    output += `- \`${regex.source}\` -> ${reason}\n`;
+  }
+  output += `\n`;
+
+  output += `## Allowed Commands (Whitelist)\n\n`;
+  if (commandMode !== "whitelist") {
+    output += `Whitelist is inactive in blacklist mode.\n\n`;
+  } else if (whitelist.length === 0) {
+    output += `WARNING: Whitelist mode is active but no whitelist patterns are configured, so all commands are blocked after blacklist checks.\n\n`;
+  } else {
+    output += `${whitelist.length} patterns:\n\n`;
+    for (const pattern of whitelist) {
+      const readable = patternToReadable(pattern);
+      output += `- \`${pattern}\``;
+      if (readable !== pattern) {
+        output += ` -> ${readable}`;
+      }
+      output += `\n`;
+    }
+    output += `\n`;
+  }
+
+  if (blacklist.length > 0) {
+    output += `## Blocked Commands (Blacklist)\n\n`;
+    output += `${blacklist.length} patterns:\n\n`;
+    for (const pattern of blacklist) {
+      const readable = patternToReadable(pattern);
+      output += `- \`${pattern}\``;
+      if (readable !== pattern) {
+        output += ` -> ${readable}`;
+      }
+      output += `\n`;
+    }
+    output += `\n`;
+  }
+
+  if (commandMode === "whitelist" && whitelist.length > 0) {
+    output += `## Example Commands\n\n`;
+    output += `Based on the active whitelist, here are some commands you can likely use:\n\n`;
+    const examples = generateExamples(whitelist);
+    for (const ex of examples.slice(0, 10)) {
+      output += `- \`${ex}\`\n`;
+    }
+    output += `\n`;
+  }
+
+  return output;
+}
 
 /**
  * Register show-whitelist tool
@@ -14,7 +89,7 @@ export function registerShowWhitelistTool(server: McpServer): void {
 
   server.tool(
     "show-whitelist",
-    "Show the configured whitelist, blacklist, and SFTP path policy (allowedRemoteDirectories / allowedLocalDirectories) for a server. Use this before execute-command when you need to understand which commands are allowed, why a command may be rejected, or what command patterns are safe to try next. Also use it before upload / download / transfer to see which paths SFTP is permitted to touch.",
+    "Show the configured command policy, blacklist/whitelist patterns, and SFTP path policy (allowedRemoteDirectories / allowedLocalDirectories) for a server. Use this before execute-command when you need to understand which commands are allowed, why a command may be rejected, or what command patterns are safe to try next. Also use it before upload / download / transfer to see which paths SFTP is permitted to touch.",
     {
       connectionName: z
         .string()
@@ -41,43 +116,9 @@ export function registerShowWhitelistTool(server: McpServer): void {
           };
         }
 
-        const whitelist = config.commandWhitelist || [];
-        const blacklist = config.commandBlacklist || [];
-        
         let output = `# Command Permissions for: ${config.name}\n\n`;
         output += `Host: ${config.username}@${config.host}:${config.port}\n\n`;
-        
-        // Whitelist
-        output += `## ✅ Allowed Commands (Whitelist)\n\n`;
-        if (whitelist.length === 0) {
-          output += `⚠️ No whitelist configured - using default safe commands.\n\n`;
-        } else {
-          output += `${whitelist.length} patterns:\n\n`;
-          for (const pattern of whitelist) {
-            const readable = patternToReadable(pattern);
-            output += `- \`${pattern}\``;
-            if (readable !== pattern) {
-              output += ` → ${readable}`;
-            }
-            output += `\n`;
-          }
-          output += `\n`;
-        }
-        
-        // Blacklist
-        if (blacklist.length > 0) {
-          output += `## ❌ Blocked Commands (Blacklist)\n\n`;
-          output += `${blacklist.length} patterns:\n\n`;
-          for (const pattern of blacklist) {
-            const readable = patternToReadable(pattern);
-            output += `- \`${pattern}\``;
-            if (readable !== pattern) {
-              output += ` → ${readable}`;
-            }
-            output += `\n`;
-          }
-          output += `\n`;
-        }
+        output += formatCommandPolicy(config);
 
         // SFTP path policy (upload / download / transfer tools only)
         const allowedRemoteDirs = config.allowedRemoteDirectories ?? [];
@@ -132,14 +173,6 @@ export function registerShowWhitelistTool(server: McpServer): void {
         output += `- File name: \`<timestamp>-<pid>-<rand>.log\` with \`=== META / STDOUT / STDERR / END ===\` markers.\n`;
         output += `- When output is truncated, the response includes an \`[OUTPUT TRUNCATED]\` header with the on-disk log path.\n\n`;
 
-        // Quick examples
-        output += `## 💡 Example Commands\n\n`;
-        output += `Based on the whitelist, here are some commands you can likely use:\n\n`;
-        const examples = generateExamples(whitelist);
-        for (const ex of examples.slice(0, 10)) {
-          output += `- \`${ex}\`\n`;
-        }
-        
         return {
           content: [{ type: "text", text: output }],
         };

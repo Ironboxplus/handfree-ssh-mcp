@@ -10,7 +10,7 @@ handfree-ssh-mcp 使 AI 助手能够通过标准化的 MCP 接口执行远程 SS
 
 - **🔒 安全连接**：支持密码认证、私钥认证（含密码短语支持）
 - **🧩 自动读取 SSH 配置**：默认加载用户目录下的 `~/.ssh/config`，可用 YAML 增量覆盖连接字段和安全策略
-- **🛡️ 命令安全控制**：通过白名单和黑名单机制过滤命令
+- **🛡️ 命令安全控制**：默认黑名单模式，支持切换到白名单模式
 - **🔄 标准化 MCP 接口**：与 AI 助手（Cursor、Claude 等）无缝集成
 - **📂 文件传输**：双向文件传输（上传/下载）
 - **🔑 凭证隔离**：SSH 凭证本地管理，永不暴露给 AI 模型
@@ -64,7 +64,7 @@ MCP 配置可以直接写：
       "command": "npx",
       "args": [
         "-y",
-        "handfree-ssh-mcp",
+        "@aaarc/handfree-ssh-mcp",
         "--enable-servers", "dev"
       ]
     }
@@ -81,20 +81,21 @@ sshConfig: true
 
 servers:
   dev:
+    # 默认 commandMode: blacklist，只拦内置危险命令和 blacklist 命中的命令。
+    blacklist:
+      - "^docker system prune.*$"
+
+  prod:
+    host: prod.example.com
+    username: deploy
+    privateKey: ~/.ssh/id_ed25519
+    commandMode: whitelist
     whitelist:
       - "^pwd$"
       - "^ls( .*)?$"
       - "^cat .*$"
     blacklist:
       - "^rm.*$"
-
-  prod:
-    host: prod.example.com
-    username: deploy
-    privateKey: ~/.ssh/id_ed25519
-    whitelist:
-      - "^ls( .*)?$"
-      - "^tail .*$"
 ```
 
 然后在 MCP 配置中传入 YAML：
@@ -106,7 +107,7 @@ servers:
       "command": "npx",
       "args": [
         "-y",
-        "handfree-ssh-mcp",
+        "@aaarc/handfree-ssh-mcp",
         "--config", "/path/to/servers.yaml",
         "--enable-servers", "dev,prod"
       ]
@@ -134,7 +135,7 @@ servers:
 
 ## 🛡️ 安全注意事项
 
-- **命令白名单**：强烈建议使用以限制可执行命令
+- **命令策略**：默认黑名单模式会拦截内置破坏性 guard、内置危险命令（如 `rm -rf`、`reboot`、`shutdown`、`dd ... of=`）和自定义 `blacklist`；需要更严格控制时设置 `commandMode: whitelist`
 - **私钥安全**：确保运行此服务器的机器安全
 - **速率限制**：考虑在防火墙后运行并启用速率限制
 - **路径遍历**：内置保护，但请注意上传/下载路径

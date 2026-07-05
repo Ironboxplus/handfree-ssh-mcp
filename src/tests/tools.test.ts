@@ -7,6 +7,11 @@
 
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert";
+import {
+  BUILT_IN_COMMAND_BLACKLIST,
+  BUILT_IN_DESTRUCTIVE_GUARDS,
+} from "../services/ssh-connection-manager.js";
+import { formatCommandPolicy } from "../tools/show-whitelist.js";
 
 /**
  * Mock SSHConnectionManager for testing tools without real SSH connections
@@ -246,6 +251,24 @@ describe("show-whitelist Tool", () => {
     
     assert.ok(result);
     assert.deepStrictEqual(result.commandBlacklist, ["^rm.*$", "^shutdown.*$"]);
+  });
+
+  it("should show every built-in command policy blocker", () => {
+    const output = formatCommandPolicy({
+      name: "dev",
+      host: "192.168.1.1",
+      port: 22,
+      username: "test",
+      commandMode: "blacklist",
+    });
+
+    for (const { regex, reason } of [
+      ...BUILT_IN_DESTRUCTIVE_GUARDS,
+      ...BUILT_IN_COMMAND_BLACKLIST,
+    ]) {
+      assert.ok(output.includes(regex.source), regex.source);
+      assert.ok(output.includes(reason), reason);
+    }
   });
 });
 

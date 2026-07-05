@@ -48,18 +48,12 @@ servers:
     # The MCP working directory is always allowed implicitly.
     # allowedLocalDirectories:
     #   - /path/to/extra/local/dir
-    # Command security: whitelist of allowed command patterns (regex)
-    whitelist:
-      - "^ls( .*)?$"
-      - "^cat .*$"
-      - "^head .*$"
-      - "^tail .*$"
-      - "^pwd$"
-      - "^echo .*$"
-      - "^ping -c \\d+ .*$"
-      - "^git .*$"
-      - "^docker ps.*$"
-      - "^docker logs.*$"
+    # Command security. Default mode is blacklist: commands are allowed unless
+    # they hit the built-in dangerous blacklist or one of these patterns.
+    # Use `commandMode: whitelist` when you want whitelist patterns to be required.
+    commandMode: blacklist
+    blacklist:
+      - "^docker system prune.*$"
 
   # Production server example (commented out)
   # prod:
@@ -69,6 +63,7 @@ servers:
   #   password: your_production_password
   #   socksProxy: socks5://proxy.example.com:1085
   #   safeDirectory: /home/deploy  # rm only allowed here
+  #   commandMode: whitelist
   #   whitelist:
   #     - "^ls( .*)?$"
   #     - "^cat .*$"

@@ -182,19 +182,6 @@ export class SshMcpServer {
     this.sshManager.setConfig(parsedArgs.configs, parsedArgs.enabledServers);
     this.sshManager.setOutputLogRoot(parsedArgs.outputLogDir);
 
-    // Security warning
-    const allConfigs = Object.values(parsedArgs.configs);
-    if (
-      allConfigs.some(
-        (c) => !c.commandWhitelist || c.commandWhitelist.length === 0
-      )
-    ) {
-      Logger.log(
-        "WARNING: Running without a command whitelist is strongly discouraged. Please configure a whitelist to restrict the commands that can be executed.",
-        "info"
-      );
-    }
-
     // Pre-connect to enabled servers if flag is set
     if (parsedArgs.preConnect) {
       Logger.log("Pre-connecting to enabled SSH servers...", "info");

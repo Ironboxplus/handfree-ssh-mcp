@@ -13,7 +13,7 @@ The original ssh-mcp-server requires passing credentials and options via CLI arg
 **handfree-ssh-mcp** takes a different approach:
 
 1. **Reuse your existing `~/.ssh/config`** automatically, or configure servers once in YAML
-2. **Set your security whitelists** per server through a YAML overlay
+2. **Set command policies** per server through a YAML overlay
 3. **Let the LLM call whatever it needs** - hands-free
 
 Less manual interventions. Just autonomous SSH execution with safeguards.
@@ -24,7 +24,7 @@ Less manual interventions. Just autonomous SSH execution with safeguards.
 |---------|----------|------------------|
 | Configuration | CLI args | **OpenSSH `~/.ssh/config` + optional YAML overlay** |
 | Multi-server | Messy `--ssh` flags | **Clean YAML structure** |
-| Whitelists | Single comma-separated string | **Per-server arrays** |
+| Command policy | Single comma-separated whitelist | **Blacklist mode by default, optional whitelist mode** |
 | Streaming | Not supported | **Real-time output with `stream` param** |
 | Discoverability | None | **`show-whitelist` tool for LLM** |
 
@@ -48,7 +48,7 @@ you can start the MCP without a YAML file:
   "mcpServers": {
     "ssh": {
       "command": "npx",
-      "args": ["-y", "handfree-ssh-mcp", "--enable-servers", "dev"]
+      "args": ["-y", "@aaarc/handfree-ssh-mcp", "--enable-servers", "dev"]
     }
   }
 }
@@ -65,19 +65,17 @@ servers:
   dev:  # Server name - use this in --enable-servers
     # host / port / username / privateKey can be omitted when dev exists in ~/.ssh/config.
     # Values here override the OpenSSH config entry when present.
-    whitelist:
-      - "^ls.*$"
-      - "^cat.*$"
-      - "^pwd$"
-      - "^docker.*$"
-      - "^git.*$"
-      # Add whatever commands you trust the LLM to run
+    # commandMode defaults to blacklist: commands are allowed unless they
+    # match the built-in dangerous blacklist or a pattern below.
+    blacklist:
+      - "^docker system prune.*$"
 
   prod:
     host: XXXXX
     port: 22
     username: deploy
     privateKey: ~/.ssh/id_rsa
+    commandMode: whitelist
     whitelist:
       - "^ls.*$"        # Read only
       - "^cat.*$"
@@ -116,7 +114,7 @@ The AI can now execute commands on your servers. All within your defined securit
 | Tool | Description |
 |------|-------------|
 | `execute-command` | Run SSH command (with optional `stream` for real-time output) |
-| `show-whitelist` | Show allowed commands + SFTP policy + output-log path for a server |
+| `show-whitelist` | Show active command policy + SFTP policy + output-log path for a server |
 | `upload` | Upload local file to a remote server (CRLF-fix for shell scripts, skip-if-identical) |
 | `download` | Download remote file to local disk |
 | `transfer` | Unified upload / download / server-to-server relay (`mode`: `upload` / `download` / `relay`, optional `recursive`, optional `skipIfIdentical`) |
@@ -125,7 +123,7 @@ The AI can now execute commands on your servers. All within your defined securit
 
 ### show-whitelist
 
-**Use this first!** Let the LLM know what it's allowed to do:
+**Use this first!** Let the LLM inspect the active command policy:
 
 ```json
 {
@@ -136,7 +134,7 @@ The AI can now execute commands on your servers. All within your defined securit
 }
 ```
 
-Returns a formatted list of allowed command patterns with examples.
+Returns command mode, built-in command guards, configured whitelist/blacklist patterns, and examples when whitelist mode is active.
 
 ### execute-command
 
@@ -202,12 +200,14 @@ servers:
     # Network
     socksProxy: socks5://host:port
     
-    # Security (regex patterns)
-    whitelist:                  # Only allow matching commands
+    # Command policy (regex patterns)
+    # Default is blacklist. Set commandMode: whitelist to require a whitelist.
+    commandMode: blacklist
+    whitelist:                  # Active only in whitelist mode
       - "^ls.*$"
       - "^cat.*$"
     blacklist:                  # Block matching commands
-      - "^rm -rf.*$"
+      - "^docker system prune.*$"
     
     # Safe directory for destructive commands (rm, etc.)
     safeDirectory: /home/user   # rm allowed only within this path
@@ -224,9 +224,9 @@ servers:
       - /path/to/extra/local/dir
 ```
 
-### Security note: command whitelist
+### Security note: command policy
 
-If a server's YAML omits `whitelist:` (or sets it to an empty list), `execute-command` falls back to a built-in default whitelist. That default covers common read-mostly tools like `git .*`, `curl .*`, `find .*`, `awk .*`, `sed .*` — broad enough that a determined LLM could write to disk via `awk 'BEGIN{system(...)}'` or similar. It is **strongly recommended to provide an explicit per-server `whitelist:`** narrowed to the commands you actually need. Startup logs a warning whenever a server is running on the default whitelist. See `show-whitelist` to inspect the effective whitelist at runtime.
+`execute-command` defaults to `commandMode: blacklist`. In that mode commands are allowed unless they match built-in destructive guards, the built-in dangerous-command blacklist, or a server's configured `blacklist:` patterns. Built-in blocked operations include hidden/chained destructive file operations, risky absolute-path output redirection, system power commands (`reboot`, `shutdown`, `halt`, `poweroff`), recursive force delete (`rm -rf`), destructive disk writes (`dd ... of=`), and filesystem formatting commands. Set `commandMode: whitelist` to require every command to match `whitelist:` after blacklist checks. For compatibility, a YAML server that contains `whitelist:` without `commandMode:` is treated as whitelist mode.
 
 ### SFTP path policy
 
@@ -302,7 +302,7 @@ Example with selective servers:
 
 ## 🛡️ Security
 
-- **Whitelist everything**: Define exactly what commands are allowed
+- **Pick the right command policy**: use default blacklist mode for flexible automation, or `commandMode: whitelist` for locked-down hosts
 - **Keep secrets safe**: Add `servers.yaml` to `.gitignore`
 - **Per-server control**: Prod can be locked down, dev can be permissive
 

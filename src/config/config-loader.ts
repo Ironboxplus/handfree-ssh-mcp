@@ -22,6 +22,7 @@ interface YamlServerConfig {
   passphrase?: string;
   agent?: string;
   socksProxy?: string;
+  commandMode?: string;
   whitelist?: string[];
   blacklist?: string[];
   safeDirectory?: string;
@@ -204,8 +205,15 @@ function buildYamlServerConfig(
     merged.authOptional = false;
   }
   if (serverConfig.socksProxy !== undefined) merged.socksProxy = serverConfig.socksProxy ?? undefined;
+  if (serverConfig.commandMode !== undefined) {
+    if (serverConfig.commandMode !== "blacklist" && serverConfig.commandMode !== "whitelist") {
+      throw new Error(`Server '${name}': 'commandMode' must be 'blacklist' or 'whitelist'`);
+    }
+    merged.commandMode = serverConfig.commandMode;
+  }
   if (serverConfig.whitelist !== undefined) {
     merged.commandWhitelist = serverConfig.whitelist ?? undefined;
+    merged.commandMode ??= "whitelist";
   }
   if (serverConfig.blacklist !== undefined) {
     merged.commandBlacklist = serverConfig.blacklist ?? undefined;
@@ -248,6 +256,7 @@ function mergeConfigMaps(
       name,
       allowedRemoteDirectories: yamlConfig.allowedRemoteDirectories ?? merged[name]?.allowedRemoteDirectories,
       allowedLocalDirectories: yamlConfig.allowedLocalDirectories ?? merged[name]?.allowedLocalDirectories,
+      commandMode: yamlConfig.commandMode ?? merged[name]?.commandMode,
       commandWhitelist: yamlConfig.commandWhitelist ?? merged[name]?.commandWhitelist,
       commandBlacklist: yamlConfig.commandBlacklist ?? merged[name]?.commandBlacklist,
       safeDirectory: yamlConfig.safeDirectory ?? merged[name]?.safeDirectory,

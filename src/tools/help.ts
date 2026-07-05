@@ -35,7 +35,7 @@ Examples:
   execute-command { cmdString: "docker ps -a", connectionName: "prod", stream: false }
   execute-command { cmdString: "tail -f /var/log/syslog", stream: true, timeout: 600000 }`,
 
-  "show-whitelist": `show-whitelist — Show allowed/blocked command patterns for a server.
+  "show-whitelist": `show-whitelist — Show the active command policy for a server.
 
 Parameters:
   connectionName  (string, see below)  Target server name from list-servers.
@@ -44,7 +44,7 @@ connectionName rule:
   • If only one server is enabled → optional (auto-selected).
   • If multiple servers are enabled → REQUIRED.
 
-Returns: Whitelist patterns, blacklist patterns, and example commands.`,
+Returns: Command mode, built-in blacklist, configured whitelist/blacklist patterns, and example commands when whitelist mode is active.`,
 
   "upload": `upload — Upload a single local file to a remote server over SFTP.
 
@@ -124,7 +124,7 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
 
   list-servers      Discover available SSH servers and their status.
   execute-command   Run a shell command on a remote server.
-  show-whitelist    Show allowed/blocked command patterns.
+  show-whitelist    Show the active command policy.
   upload            Upload a single file to a remote server.
   download          Download a single file from a remote server.
   transfer          Move files: single, recursive, or cross-server relay.
@@ -132,7 +132,7 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
 
 Quick start:
   1. list-servers → discover server names
-  2. show-whitelist { connectionName: "<name>" } → see what's allowed
+  2. show-whitelist { connectionName: "<name>" } → inspect command policy
   3. execute-command { cmdString: "pwd", connectionName: "<name>" }`;
 
 /**

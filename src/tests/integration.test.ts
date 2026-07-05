@@ -242,7 +242,7 @@ async function main() {
         throw new Error("Config host mismatch");
       }
       if (!config.commandWhitelist || config.commandWhitelist.length === 0) {
-        info("No custom whitelist - using defaults");
+        info("No custom whitelist - using blacklist mode");
       } else {
         info(`Whitelist has ${config.commandWhitelist.length} patterns`);
       }

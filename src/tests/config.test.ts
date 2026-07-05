@@ -486,6 +486,7 @@ servers:
       "^cat .*$",
       "^docker ps.*$"
     ]);
+    assert.strictEqual(result.configs["dev"].commandMode, "whitelist");
   });
 
   it("should load blacklist patterns", () => {
@@ -508,6 +509,7 @@ servers:
       "^rm .*$",
       "^shutdown.*$"
     ]);
+    assert.strictEqual(result.configs["dev"].commandMode, undefined);
   });
 
   it("should load both whitelist and blacklist", () => {
@@ -529,6 +531,45 @@ servers:
     
     assert.deepStrictEqual(result.configs["dev"].commandWhitelist, ["^.*$"]);
     assert.deepStrictEqual(result.configs["dev"].commandBlacklist, ["^rm -rf.*$"]);
+    assert.strictEqual(result.configs["dev"].commandMode, "whitelist");
+  });
+
+  it("should allow explicit blacklist command mode with whitelist patterns present", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    commandMode: blacklist
+    whitelist:
+      - "^pwd$"
+`;
+    const tempConfigPath = path.join(tempDir, "blacklist-mode.yaml");
+    fs.writeFileSync(tempConfigPath, configContent);
+
+    const result = loadConfigFromYaml(tempConfigPath);
+
+    assert.strictEqual(result.configs["dev"].commandMode, "blacklist");
+    assert.deepStrictEqual(result.configs["dev"].commandWhitelist, ["^pwd$"]);
+  });
+
+  it("should reject invalid command mode", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    commandMode: permissive
+`;
+    const tempConfigPath = path.join(tempDir, "invalid-command-mode.yaml");
+    fs.writeFileSync(tempConfigPath, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(tempConfigPath),
+      /commandMode.*blacklist.*whitelist/,
+    );
   });
 });
 

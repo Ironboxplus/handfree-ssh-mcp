@@ -1,6 +1,6 @@
 {
   "name": "@aaarc/handfree-ssh-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Handfree SSH MCP Server - A hands-free SSH automation tool via MCP protocol",
   "main": "build/index.js",
   "type": "module",
@@ -15,6 +15,9 @@
     "url": "https://github.com/Ironboxplus/handfree-ssh-mcp/issues"
   },
   "homepage": "https://github.com/Ironboxplus/handfree-ssh-mcp#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "npm run build && node --test build/tests/config.test.js build/tests/command-validation.test.js build/tests/tool-error.test.js build/tests/tools.test.js build/tests/output-collector.test.js build/tests/output-log-writer.test.js build/tests/recent-fixes.test.js",
     "test:config": "npm run build && node --test build/tests/config.test.js",
@@ -47,6 +50,12 @@
     "typescript": "^5.8.2"
   },
   "files": [
-    "build/**/*"
+    "build/config/**/*",
+    "build/core/**/*",
+    "build/models/**/*",
+    "build/services/**/*",
+    "build/tools/**/*",
+    "build/utils/**/*",
+    "build/index.js"
   ]
 }

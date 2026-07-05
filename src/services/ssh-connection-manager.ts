@@ -24,79 +24,34 @@ const CONNECTION_RESET_FIELDS: Array<keyof SSHConfig> = [
   "socksProxy",
 ];
 
-/**
- * Default command whitelist - only allow safe Linux commands
- * These patterns are regex strings that match allowed commands
- */
-/**
- * Default command whitelist - only allow safe Linux commands
- * These patterns are regex strings that match allowed commands
- * 
- * SECURITY: Commands not matching any pattern will be BLOCKED with an error message
- */
-const DEFAULT_COMMAND_WHITELIST: string[] = [
-  // Basic file operations (READ-ONLY)
-  "^ls( .*)?$",
-  "^cat .*$",
-  "^head .*$",
-  "^tail .*$",
-  "^less .*$",
-  "^more .*$",
-  "^wc .*$",
-  "^file .*$",
-  "^stat .*$",
-  "^find .*$",
-  "^grep .*$",
-  "^awk .*$",
-  "^sed .*$",
-  // Directory navigation
-  "^pwd$",
-  "^cd .*$",
-  // System info (read-only)
-  "^echo .*$",
-  "^hostname$",
-  "^whoami$",
-  "^id$",
-  "^uname .*$",
-  "^df .*$",
-  "^du .*$",
-  "^free .*$",
-  "^top -bn1.*$",
-  "^ps .*$",
-  "^uptime$",
-  "^date$",
-  "^env$",
-  "^printenv.*$",
-  // Network diagnostics (read-only)
-  "^ping -c \\d+ .*$",
-  "^curl .*$",
-  "^wget .*$",
-  "^netstat .*$",
-  "^ss .*$",
-  "^ip .*$",
-  // Git operations
-  "^git .*$",
-  // Systemctl (read-only)
-  "^systemctl status .*$",
-  "^systemctl list-.*$",
-  "^journalctl .*$",
-  // Docker (read-only)
-  "^docker ps.*$",
-  "^docker logs.*$",
-  "^docker images.*$",
-  "^docker inspect.*$",
-  
-  // ============================================
-  // DANGEROUS COMMANDS - EXPLICITLY BANNED:
-  // - rm, rmdir (delete files/dirs)
-  // - mv (can overwrite/move files)
-  // - cp (can overwrite files)
-  // - chmod, chown (change permissions)
-  // - kill, pkill (terminate processes)
-  // - mkdir, touch (create files/dirs)
-  // - >, >> (redirect/overwrite files)
-  // - wget -O, curl -o (download and overwrite)
-  // ============================================
+export const BUILT_IN_COMMAND_BLACKLIST: Array<{ regex: RegExp; reason: string }> = [
+  { regex: /^\s*(?:sudo\s+)?(?:reboot|shutdown|halt|poweroff)(?:\s|$)/i, reason: "system power command" },
+  { regex: /\b(?:Restart-Computer|Stop-Computer)\b/i, reason: "Windows power command" },
+  { regex: /^\s*(?:sudo\s+)?(?:init\s+[06]|telinit\s+[06])(?:\s|$)/i, reason: "system runlevel power command" },
+  { regex: /^\s*(?:sudo\s+)?rm\b(?=.*(?:\s--recursive\b|\s-\S*r))(?=.*(?:\s--force\b|\s-\S*f))/i, reason: "recursive force rm" },
+  { regex: /\bRemove-Item\b(?=.*\s-Recurse(?:\s|$))(?=.*\s-Force(?:\s|$))/i, reason: "recursive force Remove-Item" },
+  { regex: /^\s*(?:del|erase|rd)\b(?=.*(?:\/s\b|\s-Recurse(?:\s|$)))(?=.*(?:\/q\b|\s-Force(?:\s|$)))/i, reason: "recursive quiet Windows delete" },
+  { regex: /^\s*(?:sudo\s+)?rmdir\s+(?:\/|\*|~|\$HOME|%USERPROFILE%|[A-Za-z]:\\)(?:\s|$)/i, reason: "dangerous rmdir target" },
+  { regex: /^\s*(?:sudo\s+)?dd\b.*\bof=/i, reason: "dd with of= (can overwrite devices/files)" },
+  { regex: /^\s*(?:sudo\s+)?mkfs(?:\.\S+)?\b/i, reason: "filesystem formatting command" },
+  { regex: /^\s*(?:sudo\s+)?(?:diskpart|format)(?:\s|$)/i, reason: "disk formatting command" },
+  { regex: /\b(?:Format-Volume|Clear-Disk|Remove-Partition)\b/i, reason: "Windows disk destructive command" },
+  { regex: /^\s*(?:sudo\s+)?chmod\s+-R\s+777\b/i, reason: "recursive world-writable chmod" },
+  { regex: /^\s*(?:sudo\s+)?chown\s+-R\s+\S+\s+\/(?:\s|$)/i, reason: "recursive chown on root" },
+];
+
+export const BUILT_IN_DESTRUCTIVE_GUARDS: Array<{ regex: RegExp; reason: string }> = [
+  { regex: /\brm\b/, reason: "rm in command chain" },
+  { regex: /\brmdir\b/, reason: "rmdir in command chain" },
+  { regex: /\bunlink\b/, reason: "unlink in command chain" },
+  { regex: /\bshred\b/, reason: "shred in command chain" },
+  { regex: /\btruncate\b/, reason: "truncate in command chain" },
+  { regex: /-delete\b/, reason: "find -delete detected" },
+  { regex: /-exec\s+rm\b/, reason: "find -exec rm detected" },
+  { regex: /\bmv\b/, reason: "mv detected (can overwrite)" },
+  { regex: /\bcp\b.*-f/, reason: "cp -f detected (force overwrite)" },
+  { regex: /(?<![0-9])>\s*\/(?!dev\/null)/, reason: "output redirection to absolute path" },
+  { regex: />\s*~/, reason: "output redirection to home path" },
 ];
 
 /**
@@ -206,59 +161,6 @@ export class SSHConnectionManager {
    */
   public getOutputLogRoot(): string {
     return this.outputLogRoot ?? path.join(process.cwd(), ".handfree-output");
-  }
-
-  /**
-   * Hot-reload mutable policy fields from a fresh config map.
-   * Only updates whitelist, blacklist, safeDirectory, allowedRemoteDirectories,
-   * and allowedLocalDirectories for servers that already exist. Does NOT touch
-   * SSH connections or credentials.
-   */
-  public updatePolicies(freshConfigs: SshConnectionConfigMap): void {
-    let changed = 0;
-
-    for (const [name, existing] of Object.entries(this.configs)) {
-      const fresh = freshConfigs[name];
-      if (!fresh) continue;
-
-      const wlChanged =
-        JSON.stringify(existing.commandWhitelist) !==
-        JSON.stringify(fresh.commandWhitelist);
-      const blChanged =
-        JSON.stringify(existing.commandBlacklist) !==
-        JSON.stringify(fresh.commandBlacklist);
-      const sdChanged = existing.safeDirectory !== fresh.safeDirectory;
-      const ardChanged =
-        JSON.stringify(existing.allowedRemoteDirectories) !==
-        JSON.stringify(fresh.allowedRemoteDirectories);
-      const aldChanged =
-        JSON.stringify(existing.allowedLocalDirectories) !==
-        JSON.stringify(fresh.allowedLocalDirectories);
-
-      if (wlChanged || blChanged || sdChanged || ardChanged || aldChanged) {
-        existing.commandWhitelist = fresh.commandWhitelist;
-        existing.commandBlacklist = fresh.commandBlacklist;
-        existing.safeDirectory = fresh.safeDirectory;
-        existing.allowedRemoteDirectories = fresh.allowedRemoteDirectories;
-        existing.allowedLocalDirectories = fresh.allowedLocalDirectories;
-        changed++;
-
-        const parts: string[] = [];
-        if (wlChanged) parts.push(`whitelist(${(fresh.commandWhitelist ?? []).length})`);
-        if (blChanged) parts.push(`blacklist(${(fresh.commandBlacklist ?? []).length})`);
-        if (sdChanged) parts.push(`safeDirectory(${fresh.safeDirectory ?? "none"})`);
-        if (ardChanged) parts.push(`allowedRemoteDirectories(${(fresh.allowedRemoteDirectories ?? []).length})`);
-        if (aldChanged) parts.push(`allowedLocalDirectories(${(fresh.allowedLocalDirectories ?? []).length})`);
-        Logger.log(
-          `Hot-reloaded policies for [${name}]: ${parts.join(", ")}`,
-          "info",
-        );
-      }
-    }
-
-    if (changed === 0) {
-      Logger.log("Config file changed but no policy updates detected", "info");
-    }
   }
 
   private connectionFieldsChanged(oldConfig: SSHConfig, nextConfig: SSHConfig): boolean {
@@ -727,24 +629,7 @@ export class SSHConnectionManager {
    */
   private getDestructiveMatch(command: string): string | null {
     // This catches: "cd /; rm -rf *", "echo test && rm file", "$(rm file)", and risky writes like "> /etc/..."
-    const destructivePatterns: Array<{ regex: RegExp; reason: string }> = [
-      { regex: /\brm\b/, reason: "rm in command chain" },
-      { regex: /\brmdir\b/, reason: "rmdir in command chain" },
-      { regex: /\bunlink\b/, reason: "unlink in command chain" },
-      { regex: /\bshred\b/, reason: "shred in command chain" },
-      { regex: /\btruncate\b/, reason: "truncate in command chain" },
-      { regex: /-delete\b/, reason: "find -delete detected" },
-      { regex: /-exec\s+rm\b/, reason: "find -exec rm detected" },
-      { regex: /\bdd\b.*\bof=/, reason: "dd with of= (can overwrite files)" },
-      { regex: /\bmv\b/, reason: "mv detected (can overwrite)" },
-      { regex: /\bcp\b.*-f/, reason: "cp -f detected (force overwrite)" },
-      // Allow stderr redirection to /dev/null (2>/dev/null, 2>&1>/dev/null, etc.)
-      // Block dangerous writes like: echo x > /etc/passwd, cat > /bin/bash
-      { regex: /(?<![0-9])>\s*\/(?!dev\/null)/, reason: "output redirection to absolute path" },
-      { regex: />\s*~/, reason: "output redirection to home path" },
-    ];
-    
-    for (const { regex, reason } of destructivePatterns) {
+    for (const { regex, reason } of BUILT_IN_DESTRUCTIVE_GUARDS) {
       if (regex.test(command)) {
         return reason;
       }
@@ -883,35 +768,20 @@ export class SSHConnectionManager {
     }
     
     // ========================================
-    // LAYER 2: Whitelist check for non-destructive commands
+    // LAYER 2: Built-in blacklist for high-risk operations
     // ========================================
-    
-    // Use config whitelist if provided, otherwise use default whitelist
-    const whitelist = (config.commandWhitelist && config.commandWhitelist.length > 0)
-      ? config.commandWhitelist
-      : DEFAULT_COMMAND_WHITELIST;
-    
-    // Check whitelist - command must match one of the patterns to be allowed
-    const matchesWhitelist = whitelist.some((pattern) => {
-      try {
-        const regex = new RegExp(pattern);
-        return regex.test(command);
-      } catch (e) {
-        Logger.log(`Invalid whitelist regex pattern: ${pattern}`, "error");
-        return false;
+    for (const { regex, reason } of BUILT_IN_COMMAND_BLACKLIST) {
+      if (regex.test(command)) {
+        Logger.log(`Command blocked by built-in blacklist (${reason}): ${command}`, "info");
+        return {
+          isAllowed: false,
+          reason: `Command blocked by built-in blacklist: ${reason}`,
+        };
       }
-    });
-    
-    if (!matchesWhitelist) {
-      Logger.log(`Command blocked by whitelist: ${command}`, "info");
-      return {
-        isAllowed: false,
-        reason: `Command not in whitelist, execution forbidden. Command: "${command}"`,
-      };
     }
-    
+
     // ========================================
-    // LAYER 3: Blacklist check
+    // LAYER 3: User blacklist check
     // ========================================
     if (config.commandBlacklist && config.commandBlacklist.length > 0) {
       const matchesBlacklist = config.commandBlacklist.some((pattern) => {
@@ -931,7 +801,33 @@ export class SSHConnectionManager {
         };
       }
     }
-    
+
+    // ========================================
+    // LAYER 4: Optional whitelist mode
+    // ========================================
+    const commandMode = config.commandMode
+      ?? ((config.commandWhitelist && config.commandWhitelist.length > 0) ? "whitelist" : "blacklist");
+    if (commandMode === "whitelist") {
+      const whitelist = config.commandWhitelist ?? [];
+      const matchesWhitelist = whitelist.some((pattern) => {
+        try {
+          const regex = new RegExp(pattern);
+          return regex.test(command);
+        } catch (e) {
+          Logger.log(`Invalid whitelist regex pattern: ${pattern}`, "error");
+          return false;
+        }
+      });
+
+      if (!matchesWhitelist) {
+        Logger.log(`Command blocked by whitelist: ${command}`, "info");
+        return {
+          isAllowed: false,
+          reason: `Command not in whitelist, execution forbidden. Command: "${command}"`,
+        };
+      }
+    }
+
     // Validation passed
     return {
       isAllowed: true,
@@ -1086,7 +982,7 @@ export class SSHConnectionManager {
    * Execute SSH command with auto-retry on connection errors
    * 
    * Features:
-   * - Validates command against whitelist/blacklist before execution
+   * - Validates command against command policy before execution
    * - Auto-reconnects and retries on connection failures
    * - Exponential backoff between retries (500ms, 1000ms, 2000ms)
    * - Configurable timeout per command
@@ -1189,7 +1085,7 @@ export class SSHConnectionManager {
    * Execute SSH command with real-time streaming output via progress callback
    * 
    * Features:
-   * - Validates command against whitelist/blacklist before execution
+   * - Validates command against command policy before execution
    * - Streams stdout/stderr chunks to the onProgress callback in real-time
    * - Auto-reconnects and retries on connection failures
    * - Longer default timeout suitable for long-running tasks

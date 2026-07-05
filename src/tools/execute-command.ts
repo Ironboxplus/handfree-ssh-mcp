@@ -18,7 +18,7 @@ export function registerExecuteCommandTool(server: McpServer): void {
     "execute-command",
     "Execute a shell command on a remote server over SSH. Use this for command-line actions on the selected host. Streaming mode is enabled by default so long-running commands can emit progress; set stream=false for short commands where you only want the final output. The returned text is tail-only-capped at maxOutputBytes PER STREAM (default 65536 bytes for stdout and 65536 bytes for stderr, so the response can be up to ~2x that); the FULL stdout/stderr is always persisted to a local log file under <cwd>/.handfree-output/<server>/<user>/, and the response includes that path whenever output was truncated.",
     {
-      cmdString: z.string().describe("Exact remote shell command to run. Prefer a single command per call, for example 'pwd', 'ls -la', 'cat /etc/hostname', or 'git status'. Compound commands may be blocked by whitelist rules even if each subcommand is safe."),
+      cmdString: z.string().describe("Exact remote shell command to run. Prefer a single command per call, for example 'pwd', 'ls -la', 'cat /etc/hostname', or 'git status'. Compound commands may be blocked by command policy even if each subcommand is safe."),
       connectionName: z
         .string()
         .optional()
