@@ -118,7 +118,7 @@ The AI can now execute commands on your servers. All within your defined securit
 | `upload` | Upload local file to a remote server (CRLF-fix for shell scripts, skip-if-identical) |
 | `download` | Download remote file to local disk |
 | `transfer` | Unified upload / download / server-to-server relay (`mode`: `upload` / `download` / `relay`, optional `recursive`, optional `skipIfIdentical`) |
-| `list-servers` | List configured (enabled) servers |
+| `list-servers` | List configured (enabled) servers. Lean by default; `verbose:true` adds cached system status, `refresh:true` re-collects it (implies verbose). |
 | `help` | Self-describing help text for the MCP client |
 
 ### show-whitelist
@@ -197,8 +197,10 @@ servers:
     agent: /path/to/ssh-agent.sock
     passphrase: key_password    # If privateKey is encrypted
     
-    # Network
-    socksProxy: socks5://host:port
+    # Network — at most ONE of `socksProxy` or `jumpHost`. See "Jump host" below.
+    # socksProxy: socks5://host:port
+    # jumpHost: bastion
+
     
     # Command policy (regex patterns)
     # Default is blacklist. Set commandMode: whitelist to require a whitelist.
@@ -236,6 +238,37 @@ servers:
 | `allowedLocalDirectories` | `upload` / `download` only | Unset = only the MCP working directory is allowed. |
 
 Path matching is exact-equal or `dir + separator` prefix. `..` segments and null bytes are rejected. Use `show-whitelist` to inspect a server's current SFTP policy.
+
+### Jump host (ProxyJump-style)
+
+Tunnel a target's SSH connection through another server defined in the same YAML. Useful when the target isn't directly reachable from your machine but a bastion is.
+
+```yaml
+servers:
+  bastion:
+    host: 1.2.3.4
+    username: gate
+    privateKey: ~/.ssh/id_rsa
+
+  target:                       # NOT directly reachable
+    host: 10.0.0.5
+    username: app
+    password: <target-password>
+    jumpHost: bastion           # <- tunnel through `bastion`
+    whitelist:                  # target's own policy
+      - "^ls( .*)?$"
+      - "^pwd$"
+```
+
+Rules (enforced at config load — bad configs fail fast):
+
+- **Single level only.** The referenced jump host must NOT itself set `jumpHost`. No chaining.
+- **Mutually exclusive with `socksProxy`** on the same target.
+- **Self-reference is rejected.** `target.jumpHost: target` is invalid.
+- **Independent policy.** The target authenticates with its OWN `username` / `password` / `privateKey`, and its own `whitelist` / `blacklist` / `safeDirectory` / `allowed*Directories` apply. The jump host is purely transport.
+- **Jump host is still a normal server.** You can run tools against `bastion` directly; its connection is separate from the tunneling one.
+
+**Hot-reload note:** `jumpHost` is connection-level, not policy-level. Editing it in `servers.yaml` while the server is running will NOT take effect — the hot-reloader only refreshes whitelist / blacklist / `safeDirectory` / `allowed*Directories`. Restart the MCP server to pick up `jumpHost` changes.
 
 ### Connection lifecycle (connect / reconnect)
 

@@ -23,6 +23,7 @@ interface YamlServerConfig {
   agent?: string;
   socksProxy?: string;
   commandMode?: string;
+  jumpHost?: string;
   whitelist?: string[];
   blacklist?: string[];
   safeDirectory?: string;
@@ -147,6 +148,10 @@ function loadYamlConfig(configPath: string, options: { requireServers: boolean }
     throw new Error("No servers defined in config file");
   }
 
+  if (options.requireServers) {
+    validateMergedConfigs(configMap);
+  }
+
   Logger.log(`Total YAML servers loaded: ${Object.keys(configMap).length}`, "info");
 
   // Resolve outputLogDir if provided. Default applied later (in ssh-connection-manager)
@@ -205,6 +210,7 @@ function buildYamlServerConfig(
     merged.authOptional = false;
   }
   if (serverConfig.socksProxy !== undefined) merged.socksProxy = serverConfig.socksProxy ?? undefined;
+  if (serverConfig.jumpHost !== undefined) merged.jumpHost = serverConfig.jumpHost ?? undefined;
   if (serverConfig.commandMode !== undefined) {
     if (serverConfig.commandMode !== "blacklist" && serverConfig.commandMode !== "whitelist") {
       throw new Error(`Server '${name}': 'commandMode' must be 'blacklist' or 'whitelist'`);
@@ -256,6 +262,7 @@ function mergeConfigMaps(
       name,
       allowedRemoteDirectories: yamlConfig.allowedRemoteDirectories ?? merged[name]?.allowedRemoteDirectories,
       allowedLocalDirectories: yamlConfig.allowedLocalDirectories ?? merged[name]?.allowedLocalDirectories,
+      jumpHost: yamlConfig.jumpHost ?? merged[name]?.jumpHost,
       commandMode: yamlConfig.commandMode ?? merged[name]?.commandMode,
       commandWhitelist: yamlConfig.commandWhitelist ?? merged[name]?.commandWhitelist,
       commandBlacklist: yamlConfig.commandBlacklist ?? merged[name]?.commandBlacklist,
@@ -291,6 +298,7 @@ function validateMergedConfigs(configs: SshConnectionConfigMap): void {
       );
     }
   }
+  validateJumpHosts(configs);
 }
 
 function resolveSshConfigEnabled(
@@ -385,6 +393,45 @@ export function getLoadUserSshConfigFlag(args: string[]): boolean | undefined {
  */
 export function getPreConnectFlag(args: string[]): boolean {
   return args.includes("--pre-connect");
+}
+
+/**
+ * Validate every server's `jumpHost` reference.
+ *
+ * Rules:
+ *  - target with `jumpHost` must not also set `socksProxy` (mutually exclusive).
+ *  - referenced jump host must exist in the same config.
+ *  - self-reference is rejected.
+ *  - single-level only: the jump host must not itself specify `jumpHost`.
+ */
+function validateJumpHosts(configMap: SshConnectionConfigMap): void {
+  for (const [name, cfg] of Object.entries(configMap)) {
+    if (cfg.jumpHost === undefined) {
+      continue;
+    }
+    if (typeof cfg.jumpHost !== "string" || cfg.jumpHost.length === 0) {
+      throw new Error(`Server '${name}': 'jumpHost' must be a non-empty string`);
+    }
+    if (cfg.socksProxy) {
+      throw new Error(
+        `Server '${name}': 'jumpHost' and 'socksProxy' are mutually exclusive`,
+      );
+    }
+    if (cfg.jumpHost === name) {
+      throw new Error(`Server '${name}': 'jumpHost' must not reference itself`);
+    }
+    const jump = configMap[cfg.jumpHost];
+    if (!jump) {
+      throw new Error(
+        `Server '${name}': 'jumpHost' references unknown server '${cfg.jumpHost}'`,
+      );
+    }
+    if (jump.jumpHost) {
+      throw new Error(
+        `Server '${name}': 'jumpHost' '${cfg.jumpHost}' itself sets 'jumpHost' — chained jumps are not supported`,
+      );
+    }
+  }
 }
 
 /**

@@ -10,7 +10,8 @@ type HostOptionKey =
   | "port"
   | "identityfile"
   | "identityagent"
-  | "identitiesonly";
+  | "identitiesonly"
+  | "proxyjump";
 
 interface Directive {
   key: string;
@@ -35,6 +36,7 @@ const SUPPORTED_KEYS = new Set<HostOptionKey>([
   "identityfile",
   "identityagent",
   "identitiesonly",
+  "proxyjump",
 ]);
 
 export function getDefaultUserSshConfigPath(): string {
@@ -59,10 +61,11 @@ export function loadSshConfigFiles(
   }
 
   const rawHosts = buildRawHostConfigs(directives);
+  const aliases = new Map(rawHosts.map((raw) => [raw.alias.toLowerCase(), raw.alias]));
   const configs: SshConnectionConfigMap = {};
 
   for (const raw of rawHosts) {
-    configs[raw.alias] = toSshConfig(raw);
+    configs[raw.alias] = toSshConfig(raw, aliases);
   }
 
   const configCount = Object.keys(configs).length;
@@ -185,7 +188,7 @@ function buildRawHostConfigs(directives: Directive[]): RawHostConfig[] {
   return rawHosts;
 }
 
-function toSshConfig(raw: RawHostConfig): SSHConfig {
+function toSshConfig(raw: RawHostConfig, aliases: Map<string, string>): SSHConfig {
   const rawHost = raw.options.get("hostname") ?? raw.alias;
   const rawUser = raw.options.get("user") ?? os.userInfo().username;
   const rawPort = raw.options.get("port") ?? "22";
@@ -248,7 +251,58 @@ function toSshConfig(raw: RawHostConfig): SSHConfig {
     );
   }
 
+  const jumpHost = resolveProxyJumpAlias(raw.alias, raw.options.get("proxyjump"), aliases);
+  if (jumpHost) {
+    config.jumpHost = jumpHost;
+  }
+
   return config;
+}
+
+function resolveProxyJumpAlias(
+  alias: string,
+  proxyJump: string | undefined,
+  aliases: Map<string, string>,
+): string | undefined {
+  if (!proxyJump) return undefined;
+  if (proxyJump.toLowerCase() === "none") return undefined;
+  if (proxyJump.includes(",")) {
+    Logger.log(
+      `SSH config Host '${alias}': ProxyJump chains are not supported by native jumpHost; ignoring '${proxyJump}'`,
+      "info",
+    );
+    return undefined;
+  }
+
+  const jumpAlias = extractProxyJumpHost(proxyJump);
+  if (!jumpAlias) return undefined;
+  const canonical = aliases.get(jumpAlias.toLowerCase());
+  if (!canonical) {
+    Logger.log(
+      `SSH config Host '${alias}': ProxyJump '${proxyJump}' does not reference a loaded Host alias; ignoring`,
+      "info",
+    );
+    return undefined;
+  }
+  return canonical;
+}
+
+function extractProxyJumpHost(proxyJump: string): string | undefined {
+  let endpoint = proxyJump.trim();
+  if (!endpoint) return undefined;
+  const atIndex = endpoint.lastIndexOf("@");
+  if (atIndex >= 0) {
+    endpoint = endpoint.slice(atIndex + 1);
+  }
+  if (endpoint.startsWith("[")) {
+    const closeIndex = endpoint.indexOf("]");
+    return closeIndex > 1 ? endpoint.slice(1, closeIndex) : undefined;
+  }
+  const colonIndex = endpoint.lastIndexOf(":");
+  if (colonIndex > 0 && endpoint.indexOf(":") === colonIndex) {
+    endpoint = endpoint.slice(0, colonIndex);
+  }
+  return endpoint || undefined;
 }
 
 function findDefaultIdentityFile(): string | undefined {

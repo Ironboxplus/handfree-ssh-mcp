@@ -355,6 +355,24 @@ Host locked
     assert.strictEqual(result.configs.locked.identitiesOnly, true);
   });
 
+  it("should map OpenSSH ProxyJump aliases to jumpHost", () => {
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    fs.writeFileSync(sshConfigPath, `
+Host bastion
+  HostName bastion.example.com
+  User gate
+
+Host target
+  HostName target.internal
+  User app
+  ProxyJump bastion
+`);
+
+    const result = loadSshConfigFiles([sshConfigPath]);
+    assert.strictEqual(result.configs.target.jumpHost, "bastion");
+    assert.strictEqual(result.configs.bastion.jumpHost, undefined);
+  });
+
   it("should load Include files", () => {
     const includedPath = path.join(tempDir, "included.conf");
     const sshConfigPath = path.join(tempDir, "ssh_config");
@@ -397,6 +415,33 @@ servers:
     assert.strictEqual(result.configs.dev.username, "sshuser");
     assert.deepStrictEqual(result.configs.dev.commandWhitelist, ["^pwd$"]);
     assert.deepStrictEqual(result.configs.dev.allowedRemoteDirectories, []);
+  });
+
+  it("should validate YAML jumpHost after merging with OpenSSH config", () => {
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    const yamlPath = path.join(tempDir, "servers.yaml");
+    fs.writeFileSync(sshConfigPath, `
+Host bastion
+  HostName bastion.example.com
+  User gate
+
+Host target
+  HostName target.internal
+  User app
+`);
+    fs.writeFileSync(yamlPath, `
+servers:
+  target:
+    jumpHost: bastion
+    commandMode: blacklist
+`);
+
+    const result = loadConfigFromSources({
+      yamlConfigPath: yamlPath,
+      sshConfigPaths: [sshConfigPath],
+    });
+    assert.strictEqual(result.configs.target.jumpHost, "bastion");
+    assert.strictEqual(result.configs.target.commandMode, "blacklist");
   });
 
   it("should still reject YAML-only servers without auth", () => {
@@ -795,6 +840,161 @@ servers:
     const p = path.join(tempDir, "log-bad.yaml");
     fs.writeFileSync(p, configContent);
     assert.throws(() => loadConfigFromYaml(p), /non-empty string/i);
+  });
+});
+
+describe("Jump Host Config", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "handfree-ssh-mcp-test-"));
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("should accept a valid jumpHost reference", () => {
+    const configContent = `
+servers:
+  bastion:
+    host: 10.0.0.1
+    username: gate
+    password: gatepass
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: bastion
+`;
+    const p = path.join(tempDir, "jump-ok.yaml");
+    fs.writeFileSync(p, configContent);
+
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.configs["target"].jumpHost, "bastion");
+    assert.strictEqual(result.configs["bastion"].jumpHost, undefined);
+  });
+
+  it("should resolve forward references (jumpHost defined later in file)", () => {
+    const configContent = `
+servers:
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: bastion
+  bastion:
+    host: 10.0.0.1
+    username: gate
+    password: gatepass
+`;
+    const p = path.join(tempDir, "jump-forward.yaml");
+    fs.writeFileSync(p, configContent);
+
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.configs["target"].jumpHost, "bastion");
+  });
+
+  it("should reject unknown jumpHost references", () => {
+    const configContent = `
+servers:
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: nope
+`;
+    const p = path.join(tempDir, "jump-unknown.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /references unknown server 'nope'/,
+    );
+  });
+
+  it("should reject self-referencing jumpHost", () => {
+    const configContent = `
+servers:
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: target
+`;
+    const p = path.join(tempDir, "jump-self.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /must not reference itself/,
+    );
+  });
+
+  it("should reject jumpHost when socksProxy is also set", () => {
+    const configContent = `
+servers:
+  bastion:
+    host: 10.0.0.1
+    username: gate
+    password: gatepass
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    socksProxy: socks5://127.0.0.1:1080
+    jumpHost: bastion
+`;
+    const p = path.join(tempDir, "jump-socks.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /mutually exclusive/,
+    );
+  });
+
+  it("should reject chained jumps (jump host itself sets jumpHost)", () => {
+    const configContent = `
+servers:
+  outer:
+    host: 10.0.0.0
+    username: outer
+    password: outerpass
+  bastion:
+    host: 10.0.0.1
+    username: gate
+    password: gatepass
+    jumpHost: outer
+  target:
+    host: 10.0.0.2
+    username: app
+    password: apppass
+    jumpHost: bastion
+`;
+    const p = path.join(tempDir, "jump-chain.yaml");
+    fs.writeFileSync(p, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(p),
+      /chained jumps are not supported/,
+    );
+  });
+
+  it("should leave jumpHost undefined when not set", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+`;
+    const p = path.join(tempDir, "no-jump.yaml");
+    fs.writeFileSync(p, configContent);
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.configs["dev"].jumpHost, undefined);
   });
 });
 
