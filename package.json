@@ -9,12 +9,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/woqucc/handfree-ssh-mcp.git"
+    "url": "git+https://github.com/Ironboxplus/handfree-ssh-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/woqucc/handfree-ssh-mcp/issues"
+    "url": "https://github.com/Ironboxplus/handfree-ssh-mcp/issues"
   },
-  "homepage": "https://github.com/woqucc/handfree-ssh-mcp#readme",
+  "homepage": "https://github.com/Ironboxplus/handfree-ssh-mcp#readme",
   "scripts": {
     "test": "npm run build && node --test build/tests/config.test.js build/tests/command-validation.test.js build/tests/tool-error.test.js build/tests/tools.test.js build/tests/output-collector.test.js build/tests/output-log-writer.test.js build/tests/recent-fixes.test.js",
     "test:config": "npm run build && node --test build/tests/config.test.js",

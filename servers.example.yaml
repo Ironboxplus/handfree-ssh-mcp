@@ -7,6 +7,15 @@
 # Whether to pre-connect to all servers on startup
 preConnect: false
 
+# OpenSSH config loading is enabled by default. Same-named entries below can
+# override connection fields or add security policy for a Host from ~/.ssh/config.
+# sshConfig: true
+# sshConfig:
+#   enabled: true
+#   paths:
+#     - ~/.ssh/config
+#     - ~/.ssh/config.d/work
+
 # Optional: directory where execute-command persists FULL stdout/stderr logs.
 # Per-call logs land under <outputLogDir>/<server-name>/<username>/<timestamp>-<pid>-<rand>.log.
 # Supports ~ expansion and relative paths (resolved against the MCP cwd).
@@ -17,6 +26,8 @@ preConnect: false
 servers:
   # Development server example
   dev:
+    # These connection fields are optional when a same-named `Host dev`
+    # exists in ~/.ssh/config. YAML values override OpenSSH config values.
     host: 192.168.1.100
     port: 22
     username: root

@@ -12,8 +12,8 @@ The original ssh-mcp-server requires passing credentials and options via CLI arg
 
 **handfree-ssh-mcp** takes a different approach:
 
-1. **Configure your servers once** in a YAML file
-2. **Set your security whitelists** per server
+1. **Reuse your existing `~/.ssh/config`** automatically, or configure servers once in YAML
+2. **Set your security whitelists** per server through a YAML overlay
 3. **Let the LLM call whatever it needs** - hands-free
 
 Less manual interventions. Just autonomous SSH execution with safeguards.
@@ -22,7 +22,7 @@ Less manual interventions. Just autonomous SSH execution with safeguards.
 
 | Feature | Original | handfree-ssh-mcp |
 |---------|----------|------------------|
-| Configuration | CLI args | **YAML config file only** |
+| Configuration | CLI args | **OpenSSH `~/.ssh/config` + optional YAML overlay** |
 | Multi-server | Messy `--ssh` flags | **Clean YAML structure** |
 | Whitelists | Single comma-separated string | **Per-server arrays** |
 | Streaming | Not supported | **Real-time output with `stream` param** |
@@ -30,16 +30,41 @@ Less manual interventions. Just autonomous SSH execution with safeguards.
 
 ## 🚀 Quick Start
 
-### 1. Create `servers.yaml`
+### 1. Use your existing `~/.ssh/config`
+
+If you already have:
+
+```sshconfig
+Host dev
+  HostName 192.168.1.100
+  User root
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+you can start the MCP without a YAML file:
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "npx",
+      "args": ["-y", "handfree-ssh-mcp", "--enable-servers", "dev"]
+    }
+  }
+}
+```
+
+`--enable-servers` is optional. If you omit it, every concrete `Host` entry loaded from `~/.ssh/config` (plus YAML entries, if any) is enabled.
+
+### 2. Optional: create `servers.yaml` for policies or overrides
 
 ```yaml
+sshConfig: true  # default; loads ~/.ssh/config before applying this YAML
+
 servers:
   dev:  # Server name - use this in --enable-servers
-    host: xxxxx
-    port: 22
-    username: myuser
-    password: mypassword
-    # Define what the LLM is allowed to do
+    # host / port / username / privateKey can be omitted when dev exists in ~/.ssh/config.
+    # Values here override the OpenSSH config entry when present.
     whitelist:
       - "^ls.*$"
       - "^cat.*$"
@@ -63,7 +88,7 @@ servers:
       - "^reboot.*$"
 ```
 
-### 2. Add to MCP Config
+### 3. Add to MCP Config
 
 ```json
 {
@@ -80,7 +105,7 @@ servers:
 }
 ```
 
-### 3. Done. Let the LLM Work.
+### 4. Done. Let the LLM Work.
 
 The AI can now execute commands on your servers. All within your defined security boundaries.
 
@@ -141,6 +166,15 @@ Returns a formatted list of allowed command patterns with examples.
 ## 📄 YAML Config Reference
 
 ```yaml
+# OpenSSH config loading is enabled by default.
+# true = load ~/.ssh/config, false = use YAML only.
+# You can also provide explicit paths:
+sshConfig:
+  enabled: true
+  paths:
+    - ~/.ssh/config
+    - ~/.ssh/config.d/work
+
 # Eagerly connect to all enabled servers on startup.
 # false (default) = lazy connect on first tool call.
 preConnect: false
@@ -152,13 +186,17 @@ outputLogDir: ~/handfree-logs
 
 servers:
   server_name:
-    host: 192.168.1.1          # Required
-    port: 22                    # Optional, default 22
-    username: root              # Required
+    # Required only for YAML-only servers. If a same-named Host exists in
+    # ~/.ssh/config, these fields are optional overrides.
+    host: 192.168.1.1
+    port: 22
+    username: root
     
-    # Auth: use ONE of these
+    # Auth: use ONE of these. Omit agent to use SSH_AUTH_SOCK when present;
+    # set agent only when you need a specific socket path.
     password: xxx
     privateKey: ~/.ssh/id_rsa
+    agent: /path/to/ssh-agent.sock
     passphrase: key_password    # If privateKey is encrypted
     
     # Network
@@ -234,13 +272,22 @@ servers:
 ## ⚙️ CLI Options
 
 ```text
---config          Path to YAML config file (REQUIRED)
---enable-servers  Comma-separated list of servers to enable (REQUIRED for execute-command)
+--config          Optional path to YAML config/policy overlay
+--ssh-config      Optional OpenSSH config path(s), comma-separated or repeated
+--no-ssh-config   Disable automatic ~/.ssh/config loading
+--enable-servers  Optional comma-separated list of servers to enable
 --pre-connect     Eagerly connect to all enabled servers on startup
                   (overrides `preConnect` in YAML). Default: lazy connect.
 ```
 
 > **Note**: `--enable-servers` controls which servers are available. The first server listed becomes the default when `connectionName` is not specified.
+> If `--enable-servers` is omitted, all loaded servers are enabled; when more than one server is enabled, tools require `connectionName`.
+
+### OpenSSH config support
+
+The loader understands concrete `Host` entries and applies normal OpenSSH-style first-value matching against wildcard defaults. It supports `HostName`, `User`, `Port`, `IdentityFile`, `IdentityAgent`, `Include`, and common tokens such as `%h`, `%n`, `%p`, `%r`, `%u`, `%d`, and `%%`. Wildcard-only `Host *` blocks are used as defaults but are not exposed as runnable server names. `Match` blocks are ignored.
+
+Connection settings are hot-reloaded when the loaded YAML/OpenSSH config files change. If host, user, port, identity, agent, passphrase, or proxy settings change, the existing SSH client for that server is closed and the next tool call reconnects with the new values. Whitelist, blacklist, SFTP policy, and output log settings also update live.
 
 Example with selective servers:
 

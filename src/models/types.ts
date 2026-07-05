@@ -9,6 +9,9 @@ export interface SSHConfig {
   password?: string;
   privateKey?: string;
   passphrase?: string;
+  agent?: string | false;
+  identitiesOnly?: boolean; // True when OpenSSH IdentitiesOnly=yes disables default identity/agent fallback.
+  authOptional?: boolean; // True for OpenSSH config entries that may rely on agent/default identities.
   commandWhitelist?: string[]; // Command whitelist (array of regex strings)
   commandBlacklist?: string[]; // Command blacklist (array of regex strings)
   socksProxy?: string; // SOCKS proxy URL, e.g. 'socks://user:pass@host:port'

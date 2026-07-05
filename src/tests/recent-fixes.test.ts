@@ -155,6 +155,32 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
       manager.doConnect = originalDoConnect;
     }
   });
+
+  it("invalidates pending clients when hot-reload changes connection fields", () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+    const pendingClient = {
+      ended: false,
+      end() {
+        this.ended = true;
+      },
+    };
+    manager.pendingClients.set("dev", pendingClient);
+    manager.connecting.set("dev", Promise.resolve());
+    const generationBefore = manager.connectionGenerations.get("dev") ?? 0;
+
+    manager.replaceConfig(
+      { dev: baseConfig({ host: "127.0.0.2" }) },
+      ["dev"],
+    );
+
+    assert.strictEqual(pendingClient.ended, true);
+    assert.strictEqual(manager.pendingClients.has("dev"), false);
+    assert.strictEqual(manager.connecting.has("dev"), false);
+    assert.strictEqual(
+      manager.connectionGenerations.get("dev"),
+      generationBefore + 1,
+    );
+  });
 });
 
 describe("SSHConnectionManager default-server semantics", () => {

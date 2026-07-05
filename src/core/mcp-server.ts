@@ -1,5 +1,4 @@
 import fs from "fs";
-import path from "path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
@@ -9,10 +8,13 @@ import { SERVER_CONFIG, SERVER_INSTRUCTIONS } from "../config/server.js";
 import {
   getConfigPath,
   getEnabledServersArg,
+  getLoadUserSshConfigFlag,
   getPreConnectFlag,
-  loadConfigFromYaml,
+  getSshConfigPathsArg,
+  type ConfigSourceOptions,
+  type LoadedConfig,
+  loadConfigFromSources,
 } from "../config/config-loader.js";
-import { ParsedArgs } from "../models/types.js";
 
 /**
  * MCP Server class
@@ -22,6 +24,9 @@ import { ParsedArgs } from "../models/types.js";
 export class SshMcpServer {
   private server: McpServer;
   private sshManager: SSHConnectionManager;
+  private configWatchers: Map<string, fs.FSWatcher> = new Map();
+  private configWatchersToRefresh: Set<string> = new Set();
+  private configReloadTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     this.server = new McpServer(SERVER_CONFIG, {
@@ -38,97 +43,133 @@ export class SshMcpServer {
   }
 
   /**
-   * Load configuration from YAML file
+   * Load configuration from OpenSSH config and optional YAML overlay.
    * 
-   * Required: --config <path-to-yaml>
-   * Required: --enable-servers <server1,server2,...>
+   * Optional: --config <path-to-yaml>
+   * Optional: --ssh-config <path-to-openssh-config>
+   * Optional: --enable-servers <server1,server2,...>
    */
-  private loadConfig(): ParsedArgs & { resolvedConfigPath: string } {
+  private loadConfig(): LoadedConfig {
     const args = process.argv.slice(2);
-    
-    // YAML config is required
-    const configPath = getConfigPath(args);
-    
-    if (!configPath) {
-      throw new Error(
-        "Missing required --config argument.\n\n" +
-        "Usage: handfree-ssh-mcp --config <servers.yaml> --enable-servers <server1,server2>\n\n" +
-        "See README for YAML configuration format."
-      );
-    }
-    
-    Logger.log(`Loading config from: ${configPath}`, "info");
-    const parsedArgs = loadConfigFromYaml(configPath);
-    
-    // --enable-servers is required
+    const parsedArgs = loadConfigFromSources(this.getConfigSourceOptions(args));
+
     const enabledServers = getEnabledServersArg(args);
-    if (!enabledServers || enabledServers.length === 0) {
-      throw new Error(
-        "Missing required --enable-servers argument.\n\n" +
-        "Usage: handfree-ssh-mcp --config <servers.yaml> --enable-servers <server1,server2>\n\n" +
-        "Available servers in config: " + Object.keys(parsedArgs.configs).join(", ")
-      );
-    }
-    
-    // Validate that all enabled servers exist in config
-    for (const serverName of enabledServers) {
-      if (!parsedArgs.configs[serverName]) {
-        throw new Error(
-          `Server '${serverName}' not found in config.\n\n` +
-          "Available servers: " + Object.keys(parsedArgs.configs).join(", ")
-        );
+    if (enabledServers && enabledServers.length > 0) {
+      // Validate that all enabled servers exist in config
+      for (const serverName of enabledServers) {
+        if (!parsedArgs.configs[serverName]) {
+          throw new Error(
+            `Server '${serverName}' not found in config.\n\n` +
+            "Available servers: " + Object.keys(parsedArgs.configs).join(", ")
+          );
+        }
       }
+
+      Logger.log(`Enabled servers: ${enabledServers.join(", ")}`, "info");
+      parsedArgs.enabledServers = enabledServers;
+    } else {
+      Logger.log("No --enable-servers provided; all loaded servers are enabled", "info");
     }
-    
-    Logger.log(`Enabled servers: ${enabledServers.join(", ")}`, "info");
-    parsedArgs.enabledServers = enabledServers;
 
     // CLI --pre-connect overrides YAML preConnect (CLI wins when present)
     if (getPreConnectFlag(args)) {
       parsedArgs.preConnect = true;
     }
-
-    const resolvedConfigPath = path.isAbsolute(configPath)
-      ? configPath
-      : path.resolve(process.cwd(), configPath);
     
-    return { ...parsedArgs, resolvedConfigPath };
+    return parsedArgs;
+  }
+
+  private getConfigSourceOptions(args: string[]): ConfigSourceOptions {
+    return {
+      yamlConfigPath: getConfigPath(args),
+      sshConfigPaths: getSshConfigPathsArg(args),
+      loadUserSshConfig: getLoadUserSshConfigFlag(args),
+    };
   }
 
   /**
-   * Watch the YAML config file for changes and hot-reload policies
-   * (whitelist, blacklist, safeDirectory) without restarting.
+   * Watch loaded config files for changes and hot-reload connection settings
+   * plus policies without restarting the MCP process.
    */
-  private watchConfig(configPath: string): void {
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-
-    try {
-      fs.watch(configPath, (eventType) => {
-        if (eventType !== "change") return;
-
-        // Debounce: editors often fire multiple events per save
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          try {
-            Logger.log("Config file changed, hot-reloading policies...", "info");
-            const fresh = loadConfigFromYaml(configPath);
-            this.sshManager.updatePolicies(fresh.configs);
-            this.sshManager.setOutputLogRoot(fresh.outputLogDir);
-          } catch (error) {
-            Logger.log(
-              `Failed to hot-reload config: ${(error as Error).message}`,
-              "error",
-            );
+  private watchConfig(config: LoadedConfig): void {
+    const args = process.argv.slice(2);
+    const enabledServers = config.enabledServers;
+    const scheduleReload = () => {
+      if (this.configReloadTimer) clearTimeout(this.configReloadTimer);
+      this.configReloadTimer = setTimeout(reload, 500);
+    };
+    const reload = () => {
+      try {
+        Logger.log("Config file changed, hot-reloading SSH config...", "info");
+        const fresh = loadConfigFromSources(this.getConfigSourceOptions(args));
+        if (enabledServers) {
+          for (const serverName of enabledServers) {
+            if (!fresh.configs[serverName]) {
+              throw new Error(
+                `Enabled server '${serverName}' no longer exists after reload. Available servers: ${Object.keys(fresh.configs).join(", ")}`,
+              );
+            }
           }
-        }, 500);
-      });
+          fresh.enabledServers = enabledServers;
+        }
+        this.sshManager.replaceConfig(fresh.configs, fresh.enabledServers);
+        this.sshManager.setOutputLogRoot(fresh.outputLogDir);
+        this.reconcileConfigWatchers(fresh.watchPaths, scheduleReload);
+      } catch (error) {
+        Logger.log(
+          `Failed to hot-reload config: ${(error as Error).message}`,
+          "error",
+        );
+      }
+    };
 
-      Logger.log(`Watching config file for live policy updates: ${configPath}`, "info");
-    } catch (error) {
-      Logger.log(
-        `Could not watch config file (hot-reload disabled): ${(error as Error).message}`,
-        "error",
-      );
+    this.reconcileConfigWatchers(config.watchPaths, scheduleReload);
+  }
+
+  private reconcileConfigWatchers(
+    watchPaths: string[],
+    scheduleReload: () => void,
+  ): void {
+    if (watchPaths.length === 0) {
+      Logger.log("No config files to watch for live updates", "info");
+    }
+
+    const nextPaths = new Set(watchPaths);
+    for (const [configPath, watcher] of this.configWatchers) {
+      if (
+        nextPaths.has(configPath) &&
+        !this.configWatchersToRefresh.has(configPath)
+      ) {
+        continue;
+      }
+      try {
+        watcher.close();
+      } catch {
+        // Ignore close errors for already-dead watchers.
+      }
+      this.configWatchers.delete(configPath);
+    }
+
+    for (const configPath of nextPaths) {
+      if (this.configWatchers.has(configPath)) continue;
+      try {
+        const watcher = fs.watch(configPath, (eventType) => {
+          if (eventType !== "change" && eventType !== "rename") return;
+          if (eventType === "rename") {
+            this.configWatchersToRefresh.add(configPath);
+          }
+          scheduleReload();
+        });
+        this.configWatchers.set(configPath, watcher);
+        this.configWatchersToRefresh.delete(configPath);
+
+        Logger.log(`Watching config file for live updates: ${configPath}`, "info");
+      } catch (error) {
+        Logger.log(
+          `Could not watch config file ${configPath} (hot-reload disabled for this file): ${(error as Error).message}`,
+          "error",
+        );
+      }
     }
   }
 
@@ -137,7 +178,7 @@ export class SshMcpServer {
    */
   public async run(): Promise<void> {
     // Initialize SSH configuration
-    const { resolvedConfigPath, ...parsedArgs } = this.loadConfig();
+    const parsedArgs = this.loadConfig();
     this.sshManager.setConfig(parsedArgs.configs, parsedArgs.enabledServers);
     this.sshManager.setOutputLogRoot(parsedArgs.outputLogDir);
 
@@ -168,8 +209,8 @@ export class SshMcpServer {
       }
     }
 
-    // Watch config file for live policy hot-reload
-    this.watchConfig(resolvedConfigPath);
+    // Watch config files for live hot-reload
+    this.watchConfig(parsedArgs);
 
     // Register tools
     this.registerTools();

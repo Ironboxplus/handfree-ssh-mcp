@@ -10,7 +10,7 @@ import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
 export function registerListServersTool(server: McpServer): void {
   server.tool(
     "list-servers",
-    "List the SSH servers that were loaded from YAML and enabled for this MCP process. Use this first to discover valid connectionName values, confirm whether a server is enabled, and see basic connection state before calling other tools. Set refresh=true to collect live system status (hostname, CPU, memory, disk, GPUs) from connected servers.",
+    "List the SSH servers that were loaded from OpenSSH config and/or YAML and enabled for this MCP process. Use this first to discover valid connectionName values, confirm whether a server is enabled, and see basic connection state before calling other tools. Set refresh=true to collect live system status (hostname, CPU, memory, disk, GPUs) from connected servers.",
     {
       refresh: z.boolean().optional().describe("When true, re-collects live system status from all enabled servers before returning. Without this, cached status from connection time is returned."),
     },

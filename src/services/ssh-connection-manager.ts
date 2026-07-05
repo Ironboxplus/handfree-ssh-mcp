@@ -11,6 +11,19 @@ import path from "path";
 import crypto from "crypto";
 import { SFTPWrapper } from "ssh2";
 
+const CONNECTION_RESET_FIELDS: Array<keyof SSHConfig> = [
+  "host",
+  "port",
+  "username",
+  "password",
+  "privateKey",
+  "passphrase",
+  "agent",
+  "identitiesOnly",
+  "authOptional",
+  "socksProxy",
+];
+
 /**
  * Default command whitelist - only allow safe Linux commands
  * These patterns are regex strings that match allowed commands
@@ -95,6 +108,8 @@ export class SSHConnectionManager {
   private configs: SshConnectionConfigMap = {};
   private connected: Map<string, boolean> = new Map();
   private statusCache: Map<string, ServerStatus> = new Map();
+  private connectionGenerations: Map<string, number> = new Map();
+  private pendingClients: Map<string, Client> = new Map();
   // In-flight connect() promises, keyed by server name. Used to dedupe
   // concurrent connect attempts so we never create two SSH clients for the
   // same server and leak the loser.
@@ -145,6 +160,35 @@ export class SSHConnectionManager {
         Logger.log(`Default server: ${this.defaultName}`, "info");
       }
     }
+  }
+
+  /**
+   * Replace the full config map during hot-reload. Connections whose host,
+   * port, username, authentication, or proxy settings changed are closed so
+   * the next tool call reconnects with the fresh OpenSSH/YAML values.
+   */
+  public replaceConfig(
+    configs: SshConnectionConfigMap,
+    enabledServers?: string[],
+  ): void {
+    const previous = this.configs;
+    const changedConnections: string[] = [];
+
+    for (const [name, oldConfig] of Object.entries(previous)) {
+      const nextConfig = configs[name];
+      if (!nextConfig || this.connectionFieldsChanged(oldConfig, nextConfig)) {
+        this.closeClient(name, true);
+        this.statusCache.delete(name);
+        changedConnections.push(name);
+      }
+    }
+
+    this.setConfig(configs, enabledServers);
+    Logger.log(
+      `Hot-reloaded SSH config: ${Object.keys(configs).length} server(s), ` +
+      `${changedConnections.length} connection(s) reset`,
+      "info",
+    );
   }
 
   /**
@@ -215,6 +259,44 @@ export class SSHConnectionManager {
     if (changed === 0) {
       Logger.log("Config file changed but no policy updates detected", "info");
     }
+  }
+
+  private connectionFieldsChanged(oldConfig: SSHConfig, nextConfig: SSHConfig): boolean {
+    return CONNECTION_RESET_FIELDS.some((key) => oldConfig[key] !== nextConfig[key]);
+  }
+
+  private closeClient(name: string, bumpGeneration = false): void {
+    if (bumpGeneration) {
+      this.bumpConnectionGeneration(name);
+    }
+    const pendingClient = this.pendingClients.get(name);
+    if (pendingClient) {
+      try {
+        pendingClient.end();
+      } catch {
+        // Ignore close errors for dead pending clients.
+      }
+      this.pendingClients.delete(name);
+    }
+
+    const client = this.clients.get(name);
+    if (client) {
+      try {
+        client.end();
+      } catch {
+        // Ignore close errors for dead clients.
+      }
+      this.clients.delete(name);
+    }
+    this.connected.set(name, false);
+    this.connecting.delete(name);
+  }
+
+  private bumpConnectionGeneration(name: string): void {
+    this.connectionGenerations.set(
+      name,
+      (this.connectionGenerations.get(name) ?? 0) + 1,
+    );
   }
 
   /**
@@ -342,12 +424,28 @@ export class SSHConnectionManager {
   private async doConnect(key: string): Promise<void> {
     const config = this.getConfig(key);
     const client = new Client();
-    await new Promise<void>(async (resolve, reject) => {
-      client.on("ready", () => {
-        this.connected.set(key, true);
-        Logger.log(
-          `Successfully connected to SSH server [${key}] ${config.host}:${config.port}`
-        );
+    const generation = this.connectionGenerations.get(key) ?? 0;
+    this.pendingClients.set(key, client);
+    try {
+      await new Promise<void>(async (resolve, reject) => {
+        client.on("ready", () => {
+          if ((this.connectionGenerations.get(key) ?? 0) !== generation) {
+            try {
+              client.end();
+            } catch {
+              // Ignore stale-client close errors.
+          }
+          reject(new ToolError(
+            "SSH_CONNECTION_FAILED",
+            `SSH connection [${key}] was superseded by a config reload`,
+            true,
+          ));
+            return;
+          }
+          this.connected.set(key, true);
+          Logger.log(
+            `Successfully connected to SSH server [${key}] ${config.host}:${config.port}`
+          );
 
         // 先 resolve，让用户命令可以立即执行
         resolve();
@@ -378,11 +476,18 @@ export class SSHConnectionManager {
         }, 1000); // 延迟 1 秒，确保用户命令有足够的时间窗口
       });
       client.on("error", (err: Error) => {
-        this.connected.set(key, false);
+        if ((this.connectionGenerations.get(key) ?? 0) === generation) {
+          this.connected.set(key, false);
+        }
         reject(new ToolError("SSH_CONNECTION_FAILED", `SSH connection [${key}] failed: ${err.message}`, true));
       });
       client.on("close", () => {
-        this.connected.set(key, false);
+        if (
+          (this.connectionGenerations.get(key) ?? 0) === generation &&
+          this.clients.get(key) === client
+        ) {
+          this.connected.set(key, false);
+        }
         Logger.log(`SSH connection [${key}] closed`, "info");
       });
       const sshConfig: any = {
@@ -390,6 +495,12 @@ export class SSHConnectionManager {
         port: config.port,
         username: config.username,
       };
+      const agent = config.agent === false
+        ? undefined
+        : config.agent || (config.identitiesOnly ? undefined : process.env.SSH_AUTH_SOCK);
+      if (agent) {
+        sshConfig.agent = agent;
+      }
       // Add SOCKS proxy configuration if provided
       if (config.socksProxy) {
         try {
@@ -462,6 +573,11 @@ export class SSHConnectionManager {
       } else if (config.password) {
         sshConfig.password = config.password;
         Logger.log(`Using password authentication for [${key}]`, "info");
+      } else if (agent || config.authOptional) {
+        Logger.log(
+          `Using SSH agent/default authentication for [${key}]`,
+          "info",
+        );
       } else {
         return reject(
           new ToolError(
@@ -471,8 +587,25 @@ export class SSHConnectionManager {
           )
         );
       }
-      client.connect(sshConfig);
-    });
+        client.connect(sshConfig);
+      });
+    } finally {
+      if (this.pendingClients.get(key) === client) {
+        this.pendingClients.delete(key);
+      }
+    }
+    if ((this.connectionGenerations.get(key) ?? 0) !== generation) {
+      try {
+        client.end();
+      } catch {
+        // Ignore stale-client close errors.
+      }
+      throw new ToolError(
+        "SSH_CONNECTION_FAILED",
+        `SSH connection [${key}] was superseded by a config reload`,
+        true,
+      );
+    }
     this.clients.set(key, client);
   }
 
@@ -545,6 +678,16 @@ export class SSHConnectionManager {
       }
       this.clients.delete(key);
     }
+    const pendingClient = this.pendingClients.get(key);
+    if (pendingClient) {
+      try {
+        pendingClient.end();
+      } catch (e) {
+        // Ignore errors when closing dead connection
+      }
+      this.pendingClients.delete(key);
+    }
+    this.bumpConnectionGeneration(key);
     this.connected.set(key, false);
     
     // Reconnect

@@ -3,7 +3,7 @@ export const SERVER_CONFIG = {
   version: "1.4.0",
 };
 
-export const SERVER_INSTRUCTIONS = `This server provides SSH access to the specific servers enabled at startup via --enable-servers.
+export const SERVER_INSTRUCTIONS = `This server provides SSH access to servers loaded from OpenSSH config (~/.ssh/config by default) and optional YAML config/policy overlays.
 
 Recommended workflow:
 1. Call list-servers first to discover which server names are available, enabled, and currently connected.
@@ -23,4 +23,4 @@ Behavior notes:
 - Command execution is restricted by the configured whitelist and blacklist. If a command is rejected, inspect the whitelist rather than retrying the same command repeatedly.
 - Some commands return no output on success; this is normal.
 - File transfer tools use SFTP and can fail if the remote path is missing or permissions are insufficient.
-- Whitelist, blacklist, and safeDirectory changes in the YAML config are hot-reloaded without restarting the server.`;
+- OpenSSH/YAML config changes are hot-reloaded without restarting the server. Connection-field changes close the old client so the next tool call reconnects with fresh settings.`;
