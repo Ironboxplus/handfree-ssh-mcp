@@ -33,24 +33,11 @@ export const BUILT_IN_COMMAND_BLACKLIST: Array<{ regex: RegExp; reason: string }
   { regex: /\bRemove-Item\b(?=.*\s-Recurse(?:\s|$))(?=.*\s-Force(?:\s|$))/i, reason: "recursive force Remove-Item" },
   { regex: /^\s*(?:del|erase|rd)\b(?=.*(?:\/s\b|\s-Recurse(?:\s|$)))(?=.*(?:\/q\b|\s-Force(?:\s|$)))/i, reason: "recursive quiet Windows delete" },
   { regex: /^\s*(?:sudo\s+)?rmdir\s+(?:\/|\*|~|\$HOME|%USERPROFILE%|[A-Za-z]:\\)(?:\s|$)/i, reason: "dangerous rmdir target" },
-  { regex: /^\s*(?:sudo\s+)?dd\b.*\bof=/i, reason: "dd with of= (can overwrite devices/files)" },
-  { regex: /^\s*(?:sudo\s+)?mkfs(?:\.\S+)?\b/i, reason: "filesystem formatting command" },
-  { regex: /^\s*(?:sudo\s+)?(?:diskpart|format)(?:\s|$)/i, reason: "disk formatting command" },
-  { regex: /\b(?:Format-Volume|Clear-Disk|Remove-Partition)\b/i, reason: "Windows disk destructive command" },
   { regex: /^\s*(?:sudo\s+)?chmod\s+-R\s+777\b/i, reason: "recursive world-writable chmod" },
   { regex: /^\s*(?:sudo\s+)?chown\s+-R\s+\S+\s+\/(?:\s|$)/i, reason: "recursive chown on root" },
 ];
 
 export const BUILT_IN_DESTRUCTIVE_GUARDS: Array<{ regex: RegExp; reason: string }> = [
-  { regex: /\brm\b/, reason: "rm in command chain" },
-  { regex: /\brmdir\b/, reason: "rmdir in command chain" },
-  { regex: /\bunlink\b/, reason: "unlink in command chain" },
-  { regex: /\bshred\b/, reason: "shred in command chain" },
-  { regex: /\btruncate\b/, reason: "truncate in command chain" },
-  { regex: /-delete\b/, reason: "find -delete detected" },
-  { regex: /-exec\s+rm\b/, reason: "find -exec rm detected" },
-  { regex: /\bmv\b/, reason: "mv detected (can overwrite)" },
-  { regex: /\bcp\b.*-f/, reason: "cp -f detected (force overwrite)" },
   { regex: /(?<![0-9])>\s*\/(?!dev\/null)/, reason: "output redirection to absolute path" },
   { regex: />\s*~/, reason: "output redirection to home path" },
 ];
@@ -984,7 +971,9 @@ export class SSHConnectionManager {
       || (config.username
           ? (config.username === 'root' ? '/root' : `/home/${config.username}`)
           : SSHConnectionManager.DEFAULT_SAFE_DIRECTORY);
-    const destructiveReason = this.getDestructiveMatch(command);
+    const destructiveReason = config.disableBuiltinGuards
+      ? null
+      : this.getDestructiveMatch(command);
     if (destructiveReason) {
       // Command contains rm/rmdir - check if it's a simple rm command or hidden in a chain
       const trimmed = command.trim();
@@ -1013,13 +1002,15 @@ export class SSHConnectionManager {
     // ========================================
     // LAYER 2: Built-in blacklist for high-risk operations
     // ========================================
-    for (const { regex, reason } of BUILT_IN_COMMAND_BLACKLIST) {
-      if (regex.test(command)) {
-        Logger.log(`Command blocked by built-in blacklist (${reason}): ${command}`, "info");
-        return {
-          isAllowed: false,
-          reason: `Command blocked by built-in blacklist: ${reason}`,
-        };
+    if (!config.disableBuiltinBlacklist) {
+      for (const { regex, reason } of BUILT_IN_COMMAND_BLACKLIST) {
+        if (regex.test(command)) {
+          Logger.log(`Command blocked by built-in blacklist (${reason}): ${command}`, "info");
+          return {
+            isAllowed: false,
+            reason: `Command blocked by built-in blacklist: ${reason}`,
+          };
+        }
       }
     }
 

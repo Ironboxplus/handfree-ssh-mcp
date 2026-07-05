@@ -15,6 +15,8 @@ export interface SSHConfig {
   commandMode?: "blacklist" | "whitelist"; // Default: blacklist. Legacy whitelist configs opt into whitelist mode.
   commandWhitelist?: string[]; // Command whitelist (array of regex strings)
   commandBlacklist?: string[]; // Command blacklist (array of regex strings)
+  disableBuiltinGuards?: boolean; // When true, skip the built-in destructive command guards for this server.
+  disableBuiltinBlacklist?: boolean; // When true, skip the built-in dangerous-command blacklist for this server.
   socksProxy?: string; // SOCKS proxy URL, e.g. 'socks://user:pass@host:port'
   // Name of another server in the same config to use as an SSH jump host (ProxyJump).
   // Single-level only: the referenced jump host must not itself specify `jumpHost`.

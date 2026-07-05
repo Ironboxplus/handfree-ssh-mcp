@@ -26,6 +26,8 @@ interface YamlServerConfig {
   jumpHost?: string;
   whitelist?: string[];
   blacklist?: string[];
+  disableBuiltinGuards?: boolean;
+  disableBuiltinBlacklist?: boolean;
   safeDirectory?: string;
   allowedRemoteDirectories?: string[];
   allowedLocalDirectories?: string[];
@@ -224,6 +226,12 @@ function buildYamlServerConfig(
   if (serverConfig.blacklist !== undefined) {
     merged.commandBlacklist = serverConfig.blacklist ?? undefined;
   }
+  if (serverConfig.disableBuiltinGuards !== undefined) {
+    merged.disableBuiltinGuards = serverConfig.disableBuiltinGuards === true;
+  }
+  if (serverConfig.disableBuiltinBlacklist !== undefined) {
+    merged.disableBuiltinBlacklist = serverConfig.disableBuiltinBlacklist === true;
+  }
   if (serverConfig.safeDirectory !== undefined) {
     merged.safeDirectory = serverConfig.safeDirectory ?? undefined;
   }
@@ -266,6 +274,8 @@ function mergeConfigMaps(
       commandMode: yamlConfig.commandMode ?? merged[name]?.commandMode,
       commandWhitelist: yamlConfig.commandWhitelist ?? merged[name]?.commandWhitelist,
       commandBlacklist: yamlConfig.commandBlacklist ?? merged[name]?.commandBlacklist,
+      disableBuiltinGuards: yamlConfig.disableBuiltinGuards ?? merged[name]?.disableBuiltinGuards,
+      disableBuiltinBlacklist: yamlConfig.disableBuiltinBlacklist ?? merged[name]?.disableBuiltinBlacklist,
       safeDirectory: yamlConfig.safeDirectory ?? merged[name]?.safeDirectory,
     };
   }

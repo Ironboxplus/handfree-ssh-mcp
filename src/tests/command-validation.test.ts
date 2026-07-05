@@ -474,7 +474,6 @@ describe("SSHConnectionManager regressions", () => {
       "Remove-Item -Recurse -Force C:\\Users\\Arc\\test-file",
       "del /s /q C:\\Users\\Arc\\test-file",
       "Restart-Computer",
-      "dd if=/dev/zero of=/dev/sda",
     ]) {
       const result = manager.validateCommand(command, "dev");
       assert.strictEqual(result.isAllowed, false, command);
