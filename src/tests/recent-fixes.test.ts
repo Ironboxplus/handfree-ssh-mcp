@@ -136,6 +136,56 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
     }
   });
 
+  it("does not let a closed stale connect promise delete a newer in-flight connect", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const originalDoConnect = manager.doConnect;
+    let doConnectCalls = 0;
+    let resolveFirst!: () => void;
+    let resolveSecond!: () => void;
+
+    manager.doConnect = async () => {
+      doConnectCalls += 1;
+      if (doConnectCalls === 1) {
+        return new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return new Promise<void>((resolve) => {
+        resolveSecond = resolve;
+      });
+    };
+
+    try {
+      const firstConnect = manager.connect("dev");
+      const firstTracked = manager.connecting.get("dev");
+      assert.ok(firstTracked, "first connect should install an in-flight promise");
+
+      manager.closeConnection("dev");
+      assert.strictEqual(manager.connecting.has("dev"), false);
+
+      const secondConnect = manager.connect("dev");
+      const secondTracked = manager.connecting.get("dev");
+      assert.ok(secondTracked, "second connect should install a fresh in-flight promise");
+      assert.notStrictEqual(secondTracked, firstTracked);
+
+      resolveFirst();
+      await firstConnect;
+      assert.strictEqual(
+        manager.connecting.get("dev"),
+        secondTracked,
+        "stale first connect must not delete the newer in-flight entry",
+      );
+
+      resolveSecond();
+      await secondConnect;
+      assert.strictEqual(manager.connecting.has("dev"), false);
+      assert.strictEqual(doConnectCalls, 2);
+    } finally {
+      manager.doConnect = originalDoConnect;
+    }
+  });
+
   it("returns immediately for an already-connected server without invoking doConnect", async () => {
     manager.setConfig({ dev: baseConfig() }, ["dev"]);
     manager.connected.set("dev", true);

@@ -1,4 +1,5 @@
 import { Client, ClientChannel } from "ssh2";
+import type { SFTPWrapper, TransferOptions } from "ssh2";
 import { SocksClient } from "socks";
 import { SSHConfig, SshConnectionConfigMap, ServerStatus } from "../models/types.js";
 import { Logger } from "../utils/logger.js";
@@ -9,7 +10,6 @@ import { OutputLogWriter } from "../utils/output-log-writer.js";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { SFTPWrapper } from "ssh2";
 
 const CONNECTION_RESET_FIELDS: Array<keyof SSHConfig> = [
   "host",
@@ -42,11 +42,30 @@ export const BUILT_IN_DESTRUCTIVE_GUARDS: Array<{ regex: RegExp; reason: string 
   { regex: />\s*~/, reason: "output redirection to home path" },
 ];
 
+type SshDebugSink = (line: string) => void;
+type AcquiredSshClient = { client: Client; close: () => void };
+type SshClientPurpose = "command" | "sftp";
+type SshAcquireOptions = {
+  reuseConnection?: boolean;
+  timeout?: number;
+  debug?: SshDebugSink;
+  purpose?: SshClientPurpose;
+};
+type SftpOptions = {
+  reuseConnection?: boolean;
+  timeout?: number;
+  vvv?: boolean;
+  fast?: boolean;
+  sftpConcurrency?: number;
+  chunkSize?: number;
+};
+
 /**
  * SSH Connection Manager class
  */
 export class SSHConnectionManager {
   private static instance: SSHConnectionManager;
+  private static readonly CLOSED_CLIENT_ERROR_SINK = () => {};
   private clients: Map<string, Client> = new Map();
   private configs: SshConnectionConfigMap = {};
   private connected: Map<string, boolean> = new Map();
@@ -145,10 +164,7 @@ export class SSHConnectionManager {
       }
     }
 
-    for (const name of toReset) {
-      this.closeClient(name, true);
-      this.statusCache.delete(name);
-    }
+    this.closeClientSet(toReset, true);
 
     this.setConfig(configs, enabledServers);
     Logger.log(
@@ -226,6 +242,34 @@ export class SSHConnectionManager {
     this.teardownJumpChain(name);
     this.connected.set(name, false);
     this.connecting.delete(name);
+  }
+
+  private closeClientSet(names: Iterable<string>, bumpGeneration = true): void {
+    for (const name of names) {
+      this.closeClient(name, bumpGeneration);
+      this.statusCache.delete(name);
+    }
+  }
+
+  public closeConnection(name?: string): { requested: string; closed: string[] } {
+    const key = this.resolveServer(name);
+    this.getConfig(key);
+
+    const affected = new Set<string>([key]);
+    const changed = new Set<string>([key]);
+    for (const target of Object.keys(this.configs)) {
+      if (target === key) continue;
+      if (this.jumpChainTouchesChanged(target, this.configs, changed)) {
+        affected.add(target);
+      }
+    }
+
+    this.closeClientSet(affected, true);
+
+    return {
+      requested: key,
+      closed: Array.from(affected),
+    };
   }
 
   private bumpConnectionGeneration(name: string): void {
@@ -336,7 +380,7 @@ export class SSHConnectionManager {
    * Concurrent callers for the same server share a single in-flight promise,
    * so we never create two SSH clients and leak the loser.
    */
-  public async connect(name?: string): Promise<void> {
+  public async connect(name?: string, timeout?: number): Promise<void> {
     const key = name || this.defaultName;
     if (this.connected.get(key) && this.clients.get(key)) {
       return;
@@ -345,11 +389,14 @@ export class SSHConnectionManager {
     if (inFlight) {
       return inFlight;
     }
-    const promise = this.doConnect(key).finally(() => {
-      this.connecting.delete(key);
+    let trackedPromise!: Promise<void>;
+    trackedPromise = this.doConnect(key, timeout).finally(() => {
+      if (this.connecting.get(key) === trackedPromise) {
+        this.connecting.delete(key);
+      }
     });
-    this.connecting.set(key, promise);
-    return promise;
+    this.connecting.set(key, trackedPromise);
+    return trackedPromise;
   }
 
   /**
@@ -357,10 +404,11 @@ export class SSHConnectionManager {
    * so concurrent requests are deduped.
    * @private
    */
-  private async doConnect(key: string): Promise<void> {
+  private async doConnect(key: string, timeout?: number): Promise<void> {
     const config = this.getConfig(key);
     const client = new Client();
     const generation = this.connectionGenerations.get(key) ?? 0;
+    const connectTimeout = this.normalizeConnectTimeout(timeout);
     this.pendingClients.set(key, client);
     try {
       await new Promise<void>(async (resolve, reject) => {
@@ -431,6 +479,9 @@ export class SSHConnectionManager {
         port: config.port,
         username: config.username,
       };
+      if (connectTimeout) {
+        sshConfig.readyTimeout = connectTimeout;
+      }
       const agent = config.agent === false
         ? undefined
         : config.agent || (config.identitiesOnly ? undefined : process.env.SSH_AUTH_SOCK);
@@ -441,7 +492,21 @@ export class SSHConnectionManager {
       // (enforced at config load time).
       if (config.jumpHost) {
         try {
-          const sock = await this.openJumpTunnel(key, config);
+          const sock = await this.withConnectionTimeout(
+            this.openJumpTunnel(key, config, undefined, connectTimeout),
+            connectTimeout,
+            `jump tunnel for [${key}] via '${config.jumpHost}'`,
+            undefined,
+            () => this.teardownJumpChain(key),
+            (stream) => {
+              try {
+                (stream as NodeJS.ReadWriteStream & { destroy?: () => void }).destroy?.();
+              } catch {
+                // Ignore late stream cleanup errors.
+              }
+              this.teardownJumpChain(key);
+            },
+          );
           sshConfig.sock = sock;
           Logger.log(
             `Using jump host '${config.jumpHost}' for [${key}]`,
@@ -477,18 +542,32 @@ export class SSHConnectionManager {
           );
 
           // Create SOCKS connection
-          const { socket } = await SocksClient.createConnection({
-            proxy: {
-              host: proxyHost,
-              port: proxyPort,
-              type: 5,
+          const { socket } = await this.withConnectionTimeout(
+            SocksClient.createConnection({
+              proxy: {
+                host: proxyHost,
+                port: proxyPort,
+                type: 5,
+              },
+              command: "connect",
+              destination: {
+                host: config.host,
+                port: config.port,
+              },
+              timeout: connectTimeout,
+            }),
+            connectTimeout,
+            `SOCKS proxy connection for [${key}]`,
+            undefined,
+            undefined,
+            (event) => {
+              try {
+                event.socket.destroy();
+              } catch {
+                // Ignore late socket cleanup errors.
+              }
             },
-            command: "connect",
-            destination: {
-              host: config.host,
-              port: config.port,
-            },
-          });
+          );
 
           // Set the socket as the sock for SSH connection
           sshConfig.sock = socket;
@@ -571,6 +650,378 @@ export class SSHConnectionManager {
     this.clients.set(key, client);
   }
 
+  private async acquireSshClient(
+    key: string,
+    options: SshAcquireOptions = {},
+  ): Promise<AcquiredSshClient> {
+    const reuseConnection = options.reuseConnection !== false;
+    const purpose = options.purpose ?? "command";
+    if (reuseConnection) {
+      const client = await this.ensureConnected(key, options.timeout);
+      options.debug?.(
+        `[mcp] using cached SSH connection for [${key}]; set reuseConnection=false to capture SSH handshake debug`,
+      );
+      return { client, close: () => {} };
+    }
+    if (purpose === "command") {
+      return this.connectCommandClient(key, options.timeout ?? 30000, options.debug);
+    }
+    return this.connectOneShotClient(key, options.timeout ?? 30000, options.debug, purpose);
+  }
+
+  /**
+   * Compatibility wrapper for tests and existing command call sites.
+   */
+  private async connectCommandClient(
+    key: string,
+    timeout: number,
+    debug?: SshDebugSink,
+  ): Promise<AcquiredSshClient> {
+    return this.connectOneShotClient(key, timeout, debug, "command");
+  }
+
+  /**
+   * Open a one-shot SSH client for a single operation. Used when the caller
+   * disables connection reuse after a timeout or when a fresh TCP/SSH
+   * handshake is more important than latency.
+   */
+  private async connectOneShotClient(
+    key: string,
+    timeout: number,
+    debug?: SshDebugSink,
+    purpose: SshClientPurpose = "command",
+  ): Promise<AcquiredSshClient> {
+    const config = this.getConfig(key);
+    const client = new Client();
+    const jumpChainKey = `__${purpose}__:${key}:${Date.now()}:${crypto.randomBytes(4).toString("hex")}`;
+    const connectTimeout = this.normalizeConnectTimeout(timeout) ?? 30000;
+    let settled = false;
+    let closed = false;
+
+    const onLateError = (err: Error) => {
+      if (!settled) {
+        return;
+      }
+      debug?.(`[mcp] one-shot SSH client emitted error after ready/settle: ${err.message}`);
+      Logger.log(
+        `One-shot SSH ${purpose} client [${key}] emitted error after settle: ${err.message}`,
+        "error",
+      );
+    };
+    client.on("error", onLateError);
+
+    const close = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      client.on("error", SSHConnectionManager.CLOSED_CLIENT_ERROR_SINK);
+      client.removeListener("error", onLateError);
+      try {
+        client.end();
+      } catch {
+        // Ignore close errors for per-command clients.
+      }
+      this.connected.delete(jumpChainKey);
+      this.connecting.delete(jumpChainKey);
+      this.teardownJumpChain(jumpChainKey);
+    };
+
+    try {
+      const sshConfig: any = {
+        host: config.host,
+        port: config.port,
+        username: config.username,
+        readyTimeout: connectTimeout,
+      };
+      if (debug) {
+        sshConfig.debug = (line: string) => debug(`[ssh2] ${line}`);
+      }
+      const agent = config.agent === false
+        ? undefined
+        : config.agent || (config.identitiesOnly ? undefined : process.env.SSH_AUTH_SOCK);
+      if (agent) {
+        sshConfig.agent = agent;
+      }
+
+      if (config.jumpHost) {
+        try {
+          sshConfig.sock = await this.withConnectionTimeout(
+            this.openJumpTunnel(jumpChainKey, config, debug, connectTimeout),
+            connectTimeout,
+            `one-shot jump tunnel for [${key}] via '${config.jumpHost}'`,
+            debug,
+            () => this.teardownJumpChain(jumpChainKey),
+            (stream) => {
+              try {
+                (stream as NodeJS.ReadWriteStream & { destroy?: () => void }).destroy?.();
+              } catch {
+                // Ignore late stream cleanup errors.
+              }
+              this.teardownJumpChain(jumpChainKey);
+            },
+          );
+          Logger.log(
+            `Using one-shot jump host '${config.jumpHost}' for ${purpose} on [${key}]`,
+            "info",
+          );
+        } catch (err) {
+          this.teardownJumpChain(jumpChainKey);
+          throw new ToolError(
+            "SSH_CONNECTION_FAILED",
+            `Failed to open one-shot jump tunnel for ${purpose} [${key}] via '${config.jumpHost}': ${(err as Error).message}`,
+            true,
+          );
+        }
+      }
+
+      if (config.socksProxy) {
+        try {
+          const proxyUrl = new URL(config.socksProxy);
+          const { socket } = await this.withConnectionTimeout(
+            SocksClient.createConnection({
+              proxy: {
+                host: proxyUrl.hostname,
+                port: parseInt(proxyUrl.port, 10),
+                type: 5,
+              },
+              command: "connect",
+              destination: {
+                host: config.host,
+                port: config.port,
+              },
+              timeout: connectTimeout,
+            }),
+            connectTimeout,
+            `SOCKS proxy connection for one-shot command [${key}]`,
+            debug,
+            undefined,
+            (event) => {
+              try {
+                event.socket.destroy();
+              } catch {
+                // Ignore late socket cleanup errors.
+              }
+            },
+          );
+          sshConfig.sock = socket;
+        } catch (err) {
+          throw new ToolError(
+            "SSH_CONNECTION_FAILED",
+            `Failed to create SOCKS proxy connection for one-shot command [${key}]: ${(err as Error).message}`,
+            true,
+          );
+        }
+      }
+
+      if (config.privateKey) {
+        try {
+          sshConfig.privateKey = fs.readFileSync(config.privateKey, "utf8");
+          if (config.passphrase) {
+            sshConfig.passphrase = config.passphrase;
+          }
+        } catch (err) {
+          throw new ToolError(
+            "LOCAL_FILE_READ_FAILED",
+            `Failed to read private key file for [${key}]: ${(err as Error).message}`,
+            false,
+          );
+        }
+      } else if (config.password) {
+        sshConfig.password = config.password;
+      } else if (agent || config.authOptional) {
+        Logger.log(
+          `Using SSH agent/default authentication for one-shot ${purpose} [${key}]`,
+          "info",
+        );
+      } else {
+        throw new ToolError(
+          "SSH_AUTHENTICATION_MISSING",
+          `No valid authentication method provided for [${key}] (password or private key)`,
+          false,
+        );
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        const done = (err?: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          client.removeListener("ready", onReady);
+          client.removeListener("error", onError);
+          client.removeListener("close", onClose);
+          if (err) reject(err);
+          else resolve();
+        };
+        const onReady = () => done();
+        const onError = (err: Error) => done(new ToolError(
+          "SSH_CONNECTION_FAILED",
+          `SSH ${purpose} connection [${key}] failed: ${err.message}`,
+          true,
+        ));
+        const onClose = () => done(new ToolError(
+          "SSH_CONNECTION_FAILED",
+          `SSH ${purpose} connection [${key}] closed before ready`,
+          true,
+        ));
+        const timeoutId = setTimeout(() => {
+          done(new ToolError(
+            "SSH_CONNECTION_FAILED",
+            `SSH ${purpose} connection [${key}] timed out after ${connectTimeout}ms`,
+            true,
+          ));
+          close();
+        }, connectTimeout);
+
+        debug?.(`[mcp] opening one-shot SSH ${purpose} connection for [${key}]`);
+        client.once("ready", onReady);
+        client.once("error", onError);
+        client.once("close", onClose);
+        client.connect(sshConfig);
+      });
+
+      Logger.log(`Opened one-shot SSH ${purpose} connection for [${key}]`, "info");
+      return { client, close };
+    } catch (err) {
+      close();
+      throw err;
+    }
+  }
+
+  private withConnectionTimeout<T>(
+    operation: Promise<T>,
+    timeoutMs: number | undefined,
+    description: string,
+    debug?: SshDebugSink,
+    onTimeout?: () => void,
+    onLateResolve?: (value: T) => void,
+  ): Promise<T> {
+    if (!timeoutMs || timeoutMs <= 0) {
+      return operation;
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      let timedOut = false;
+      const timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        timedOut = true;
+        debug?.(`[mcp] ${description} timed out after ${timeoutMs}ms`);
+        try {
+          onTimeout?.();
+        } catch {
+          // Ignore cleanup failures after timeout.
+        }
+        reject(new ToolError(
+          "SSH_CONNECTION_FAILED",
+          `${description} timed out after ${timeoutMs}ms`,
+          true,
+        ));
+      }, timeoutMs);
+
+      operation.then(
+        (value) => {
+          if (timedOut) {
+            try {
+              onLateResolve?.(value);
+            } catch {
+              // Ignore cleanup failures for a late result.
+            }
+            return;
+          }
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          resolve(value);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  private normalizeConnectTimeout(timeout?: number): number | undefined {
+    if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) {
+      return undefined;
+    }
+    return Math.max(1, timeout);
+  }
+
+  /**
+   * Run a transfer that reports progress through a callback, aborting it if no
+   * progress arrives within `timeoutMs` (an INACTIVITY watchdog, not a total
+   * duration cap -- a long but actively-streaming transfer is never killed).
+   * When `timeoutMs` is falsy the operation runs unbounded, preserving the
+   * previous behavior. `onTimeout` is invoked to tear down the stalled session.
+   */
+  private runWithInactivityTimeout<T>(
+    start: (onProgress: () => void) => Promise<T>,
+    timeoutMs: number | undefined,
+    description: string,
+    debug?: SshDebugSink,
+    onTimeout?: () => void,
+  ): Promise<T> {
+    if (!timeoutMs || timeoutMs <= 0) {
+      return start(() => {});
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+
+      const clear = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
+
+      const arm = () => {
+        clear();
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          debug?.(`[mcp] ${description} stalled: no progress for ${timeoutMs}ms`);
+          try {
+            onTimeout?.();
+          } catch {
+            // Ignore cleanup failures after a stall.
+          }
+          reject(new ToolError(
+            "SSH_CONNECTION_FAILED",
+            `${description} stalled: no progress for ${timeoutMs}ms`,
+            true,
+          ));
+        }, timeoutMs);
+      };
+
+      const onProgress = () => {
+        if (!settled) arm();
+      };
+
+      arm();
+      start(onProgress).then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clear();
+          resolve(value);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          clear();
+          reject(err);
+        },
+      );
+    });
+  }
+
   /**
    * Open a TCP tunnel from the target's jump chain to `config.host:config.port`
    * and return the duplex stream to be used as `sock` for the target SSH client.
@@ -589,13 +1040,15 @@ export class SSHConnectionManager {
   private async openJumpTunnel(
     targetKey: string,
     config: SSHConfig,
+    debug?: SshDebugSink,
+    timeout?: number,
   ): Promise<NodeJS.ReadWriteStream> {
     // Tear down any stale jump chain for this target before opening a new one.
     this.teardownJumpChain(targetKey);
     this.jumpClients.set(targetKey, []);
 
-    const jumpClient = await this.connectJumpChain(targetKey, config.jumpHost!);
-    return this.forwardOutStream(jumpClient, config.host, config.port);
+    const jumpClient = await this.connectJumpChain(targetKey, config.jumpHost!, debug, timeout);
+    return this.forwardOutStream(jumpClient, config.host, config.port, timeout);
   }
 
   /**
@@ -607,6 +1060,8 @@ export class SSHConnectionManager {
   private async connectJumpChain(
     targetKey: string,
     jumpName: string,
+    debug?: SshDebugSink,
+    timeout?: number,
   ): Promise<Client> {
     const jumpConfig = this.configs[jumpName];
     if (!jumpConfig) {
@@ -618,11 +1073,11 @@ export class SSHConnectionManager {
     // tunnel first and hand its stream to this hop as `sock`.
     let sock: NodeJS.ReadWriteStream | undefined;
     if (jumpConfig.jumpHost) {
-      const innerClient = await this.connectJumpChain(targetKey, jumpConfig.jumpHost);
-      sock = await this.forwardOutStream(innerClient, jumpConfig.host, jumpConfig.port);
+      const innerClient = await this.connectJumpChain(targetKey, jumpConfig.jumpHost, debug, timeout);
+      sock = await this.forwardOutStream(innerClient, jumpConfig.host, jumpConfig.port, timeout);
     }
 
-    const jumpClient = await this.connectJumpClient(targetKey, jumpName, jumpConfig, sock);
+    const jumpClient = await this.connectJumpClient(targetKey, jumpName, jumpConfig, sock, debug, timeout);
     const chain = this.jumpClients.get(targetKey);
     if (chain) {
       chain.push(jumpClient);
@@ -643,14 +1098,64 @@ export class SSHConnectionManager {
     jumpName: string,
     jumpConfig: SSHConfig,
     sock: NodeJS.ReadWriteStream | undefined,
+    debug?: SshDebugSink,
+    timeout?: number,
   ): Promise<Client> {
     return new Promise<Client>((resolve, reject) => {
       const jumpClient = new Client();
-      jumpClient.on("ready", () => resolve(jumpClient));
-      jumpClient.on("error", (err: Error) => {
-        reject(new Error(`jump SSH connect failed for '${jumpName}': ${err.message}`));
-      });
+      let settled = false;
+      let timeoutId: NodeJS.Timeout | null = null;
+      let closedErrorSinkInstalled = false;
+
+      const installClosedErrorSink = () => {
+        if (!closedErrorSinkInstalled) {
+          closedErrorSinkInstalled = true;
+          jumpClient.on("error", SSHConnectionManager.CLOSED_CLIENT_ERROR_SINK);
+        }
+      };
+      const onLateError = (err: Error) => {
+        Logger.log(
+          `Jump SSH client '${jumpName}' for [${targetKey}] emitted error after ready: ${err.message}`,
+          "error",
+        );
+        this.teardownTargetViaJump(targetKey);
+      };
+
+      const cleanup = () => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        jumpClient.removeListener("ready", onReady);
+        jumpClient.removeListener("error", onError);
+      };
+      const done = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) {
+          installClosedErrorSink();
+          reject(err);
+          return;
+        }
+        jumpClient.on("error", onLateError);
+        resolve(jumpClient);
+      };
+      const onReady = () => done();
+      const onError = (err: Error) => {
+        done(new Error(`jump SSH connect failed for '${jumpName}': ${err.message}`));
+      };
+
+      jumpClient.on("ready", onReady);
+      jumpClient.on("error", onError);
       jumpClient.on("close", () => {
+        if (!settled) {
+          done(new Error(`jump SSH connect closed for '${jumpName}' before ready`));
+          return;
+        }
+        jumpClient.removeListener("error", onError);
+        jumpClient.removeListener("error", onLateError);
+        installClosedErrorSink();
         // If any hop dies, kill the target too so callers get a clear failure on
         // the next op and reconnect through a fresh chain.
         this.teardownTargetViaJump(targetKey);
@@ -662,6 +1167,20 @@ export class SSHConnectionManager {
       };
       if (sock) {
         jumpSsh.sock = sock;
+      }
+      if (timeout) {
+        jumpSsh.readyTimeout = timeout;
+        timeoutId = setTimeout(() => {
+          done(new Error(`jump SSH connect timed out for '${jumpName}' after ${timeout}ms`));
+          try {
+            jumpClient.end();
+          } catch {
+            // Ignore close errors after timeout.
+          }
+        }, timeout);
+      }
+      if (debug) {
+        jumpSsh.debug = (line: string) => debug(`[ssh2:${jumpName}] ${line}`);
       }
       const jumpAgent = jumpConfig.agent === false
         ? undefined
@@ -698,11 +1217,38 @@ export class SSHConnectionManager {
     client: Client,
     host: string,
     port: number,
+    timeout?: number,
   ): Promise<NodeJS.ReadWriteStream> {
     return new Promise<NodeJS.ReadWriteStream>((resolve, reject) => {
+      let settled = false;
+      let timeoutId: NodeJS.Timeout | null = null;
+      const done = (err?: Error | null, stream?: NodeJS.ReadWriteStream) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(stream!);
+      };
+      if (timeout) {
+        timeoutId = setTimeout(() => {
+          done(new Error(`forwardOut to ${host}:${port} timed out after ${timeout}ms`));
+        }, timeout);
+      }
       client.forwardOut("127.0.0.1", 0, host, port, (err, ch) => {
-        if (err) return reject(err);
-        resolve(ch as unknown as NodeJS.ReadWriteStream);
+        if (settled) {
+          try {
+            ch?.close();
+          } catch {
+            // Ignore cleanup failures for a late forwarded channel.
+          }
+          return;
+        }
+        done(err, ch as unknown as NodeJS.ReadWriteStream);
       });
     });
   }
@@ -757,10 +1303,17 @@ export class SSHConnectionManager {
    * Ensure SSH client is connected
    * @private
    */
-  private async ensureConnected(name?: string): Promise<Client> {
+  private async ensureConnected(name?: string, timeout?: number): Promise<Client> {
     const key = name || this.defaultName;
     if (!this.connected.get(key) || !this.clients.get(key)) {
-      await this.connect(key);
+      const connectTimeout = this.normalizeConnectTimeout(timeout);
+      await this.withConnectionTimeout(
+        this.connect(key, timeout),
+        connectTimeout,
+        `cached SSH connection [${key}]`,
+        undefined,
+        () => this.closeClient(key, true),
+      );
     }
     const client = this.clients.get(key);
     if (!client) {
@@ -778,7 +1331,11 @@ export class SSHConnectionManager {
       return error.code === "SSH_CONNECTION_FAILED";
     }
 
-    const msg = error.message.toLowerCase();
+    return this.isConnectionShapedMessage(error.message);
+  }
+
+  private isConnectionShapedMessage(message: string): boolean {
+    const msg = message.toLowerCase();
     return (
       msg.includes("not connected") ||
       msg.includes("connection") ||
@@ -788,8 +1345,51 @@ export class SSHConnectionManager {
       msg.includes("epipe") ||
       msg.includes("closed") ||
       msg.includes("end of stream") ||
-      msg.includes("channel")
+      msg.includes("channel") ||
+      msg.includes("no response from server") ||
+      msg.includes("timed out")
     );
+  }
+
+  private makeSftpError(context: string, error: Error): ToolError {
+    const connectionFailure = this.isConnectionShapedMessage(error.message);
+    return new ToolError(
+      connectionFailure ? "SSH_CONNECTION_FAILED" : "SFTP_ERROR",
+      `${context}: ${error.message}`,
+      connectionFailure,
+    );
+  }
+
+  private createSftpTransferOptions(options?: SftpOptions): TransferOptions {
+    const transferOptions: TransferOptions = {};
+    const concurrency = this.optionalPositiveInteger(
+      options?.sftpConcurrency,
+      "sftpConcurrency",
+    );
+    const chunkSize = this.optionalPositiveInteger(options?.chunkSize, "chunkSize");
+
+    if (concurrency !== undefined) {
+      transferOptions.concurrency = concurrency;
+    }
+    if (chunkSize !== undefined) {
+      transferOptions.chunkSize = chunkSize;
+    }
+
+    return transferOptions;
+  }
+
+  private optionalPositiveInteger(value: number | undefined, name: string): number | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `${name} must be a positive integer`,
+        false,
+      );
+    }
+    return value;
   }
 
   /**
@@ -1089,62 +1689,179 @@ export class SSHConnectionManager {
       stderrCollector?: OutputCollector;
       logWriter?: OutputLogWriter;
       onProgress?: (chunk: string) => void;
+      debug?: SshDebugSink;
     }
   ): Promise<number | null> {
     return new Promise<number | null>((resolve, reject) => {
-      let timeoutId: NodeJS.Timeout;
-      const cleanup = () => {
-        if (timeoutId) clearTimeout(timeoutId);
+      let timeoutId: NodeJS.Timeout | null = null;
+      let settled = false;
+      let channelOpened = false;
+      let activeStream: ClientChannel | null = null;
+      const eventedClient = client as Client & {
+        once?: (event: string, listener: (...args: any[]) => void) => unknown;
+        removeListener?: (event: string, listener: (...args: any[]) => void) => unknown;
+      };
+      const canObserveClientLifecycle =
+        typeof eventedClient.once === "function" &&
+        typeof eventedClient.removeListener === "function";
+
+      const clearCommandTimer = () => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
       };
 
-      client.exec(cmdString, (err: Error | undefined, stream: ClientChannel) => {
-        if (err) {
-          cleanup();
-          reject(new ToolError("COMMAND_EXECUTION_ERROR", `Command execution error: ${err.message}`, false));
+      const removeClientLifecycleListeners = () => {
+        if (!canObserveClientLifecycle) {
           return;
         }
+        eventedClient.removeListener?.("error", onClientError);
+        eventedClient.removeListener?.("end", onClientEnd);
+        eventedClient.removeListener?.("close", onClientClose);
+      };
 
-        stream.on("data", (chunk: Buffer) => {
-          sinks.stdoutCollector?.push(chunk);
-          sinks.logWriter?.appendStdout(chunk);
-          if (sinks.onProgress) sinks.onProgress(chunk.toString());
-        });
+      const cleanup = () => {
+        clearCommandTimer();
+        removeClientLifecycleListeners();
+      };
 
-        stream.stderr.on("data", (chunk: Buffer) => {
-          sinks.stderrCollector?.push(chunk);
-          sinks.logWriter?.appendStderr(chunk);
-          if (sinks.onProgress) sinks.onProgress(`[STDERR] ${chunk.toString()}`);
-        });
+      const settle = (err: Error | null, code?: number | null) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve(code ?? null);
+      };
 
-        stream.on("close", (code: number) => {
-          cleanup();
-          resolve(code ?? null);
-        });
+      const closeLateStream = (stream: ClientChannel) => {
+        try {
+          stream.close();
+        } catch {
+          // Ignore late-stream close errors after the promise has settled.
+        }
+      };
 
-        stream.on("error", (err: Error) => {
-          cleanup();
-          reject(new ToolError("COMMAND_EXECUTION_ERROR", `Stream error: ${err.message}`, false));
-        });
+      const failOnClientEvent = (event: string, message?: string) => {
+        const phase = channelOpened ? "running command" : "opening command channel";
+        const detail = message ? `: ${message}` : "";
+        sinks.debug?.(`[mcp] SSH client ${event} while ${phase}${detail}`);
+        if (activeStream) {
+          closeLateStream(activeStream);
+        }
+        settle(new ToolError(
+          "SSH_CONNECTION_FAILED",
+          `SSH connection ${event} while ${phase}${detail}`,
+          true,
+        ));
+      };
 
+      const onClientError = (err: Error) => {
+        failOnClientEvent("failed", err.message);
+      };
+
+      const onClientEnd = () => {
+        failOnClientEvent("ended");
+      };
+
+      const onClientClose = () => {
+        failOnClientEvent("closed");
+      };
+
+      const armExecOpenTimeout = () => {
+        const execOpenTimeout = Math.max(1, timeout);
         timeoutId = setTimeout(() => {
-          cleanup();
-          try {
-            stream.signal("KILL");
-          } catch (e) {
-            // Ignore errors when sending signal
-          }
-          try {
-            stream.close();
-          } catch (e) {
-            // Ignore errors when closing streams during timeout
-          }
-          reject(new ToolError(
+          sinks.debug?.(`[mcp] exec channel open timed out after ${execOpenTimeout}ms`);
+          settle(new ToolError(
+            "SSH_CONNECTION_FAILED",
+            `SSH exec channel timeout: no response from server within ${execOpenTimeout}ms while opening command channel`,
+            true,
+          ));
+        }, execOpenTimeout);
+      };
+
+      const armCommandTimeout = (stream: ClientChannel) => {
+        timeoutId = setTimeout(() => {
+          sinks.debug?.(`[mcp] remote command timed out after ${timeout}ms; closing command channel`);
+          settle(new ToolError(
             "COMMAND_TIMEOUT",
             `Command timeout: execution exceeded ${timeout}ms limit. Remote process killed.`,
             false,
           ));
+          try {
+            stream.signal("KILL");
+          } catch {
+            // Ignore errors when sending signal.
+          }
+          try {
+            stream.close();
+          } catch {
+            // Ignore errors when closing streams during timeout.
+          }
         }, timeout);
-      });
+      };
+
+      armExecOpenTimeout();
+      if (canObserveClientLifecycle) {
+        eventedClient.once?.("error", onClientError);
+        eventedClient.once?.("end", onClientEnd);
+        eventedClient.once?.("close", onClientClose);
+      }
+      sinks.debug?.(`[mcp] opening exec channel for command: ${cmdString}`);
+
+      try {
+        client.exec(cmdString, (err: Error | undefined, stream: ClientChannel) => {
+          if (settled) {
+            if (stream) closeLateStream(stream);
+            return;
+          }
+
+          if (err) {
+            const isConnectionFailure = this.isConnectionShapedMessage(err.message);
+            const code = isConnectionFailure ? "SSH_CONNECTION_FAILED" : "COMMAND_EXECUTION_ERROR";
+            sinks.debug?.(`[mcp] exec callback failed: ${err.message}`);
+            settle(new ToolError(code, `Command execution error: ${err.message}`, isConnectionFailure));
+            return;
+          }
+
+          clearCommandTimer();
+          channelOpened = true;
+          activeStream = stream;
+          sinks.debug?.("[mcp] exec channel opened");
+
+          stream.on("data", (chunk: Buffer) => {
+            sinks.stdoutCollector?.push(chunk);
+            sinks.logWriter?.appendStdout(chunk);
+            if (sinks.onProgress) sinks.onProgress(chunk.toString());
+          });
+
+          stream.stderr.on("data", (chunk: Buffer) => {
+            sinks.stderrCollector?.push(chunk);
+            sinks.logWriter?.appendStderr(chunk);
+            if (sinks.onProgress) sinks.onProgress(`[STDERR] ${chunk.toString()}`);
+          });
+
+          stream.on("close", (code: number) => {
+            sinks.debug?.(`[mcp] exec channel closed with code ${code ?? "null"}`);
+            settle(null, code ?? null);
+          });
+
+          stream.on("error", (err: Error) => {
+            const isConnectionFailure = this.isConnectionShapedMessage(err.message);
+            const code = isConnectionFailure ? "SSH_CONNECTION_FAILED" : "COMMAND_EXECUTION_ERROR";
+            sinks.debug?.(`[mcp] exec stream error: ${err.message}`);
+            settle(new ToolError(code, `Stream error: ${err.message}`, isConnectionFailure));
+          });
+
+          armCommandTimeout(stream);
+        });
+      } catch (err) {
+        const error = err as Error;
+        const isConnectionFailure = this.isConnectionShapedMessage(error.message);
+        const code = isConnectionFailure ? "SSH_CONNECTION_FAILED" : "COMMAND_EXECUTION_ERROR";
+        sinks.debug?.(`[mcp] client.exec threw before callback: ${error.message}`);
+        settle(new ToolError(code, `Command execution error: ${error.message}`, isConnectionFailure));
+      }
     });
   }
 
@@ -1154,6 +1871,86 @@ export class SSHConnectionManager {
    * full output is always persisted to disk regardless of this cap.
    */
   public static readonly DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
+  private static readonly DEFAULT_DEBUG_BYTES = 64 * 1024;
+
+  private createDebugCollector(enabled: boolean): {
+    collector: OutputCollector | null;
+    debug?: SshDebugSink;
+  } {
+    if (!enabled) {
+      return { collector: null };
+    }
+
+    const collector = new OutputCollector(SSHConnectionManager.DEFAULT_DEBUG_BYTES);
+    return {
+      collector,
+      debug: (line: string) => {
+        collector.push(`${line}\n`);
+      },
+    };
+  }
+
+  private appendDebugOutput(result: string, collector: OutputCollector | null): string {
+    const debugBlock = this.formatDebugBlock(collector);
+    if (!debugBlock) {
+      return result;
+    }
+
+    return `${result}\n\n${debugBlock}`;
+  }
+
+  private appendDebugToError(error: Error, collector: OutputCollector | null): Error {
+    const debugBlock = this.formatDebugBlock(collector);
+    if (!debugBlock) {
+      return error;
+    }
+
+    const message = `${error.message}\n\n${debugBlock}`;
+
+    if (error instanceof ToolError) {
+      return new ToolError(error.code, message, error.retriable);
+    }
+
+    const wrapped = new Error(message);
+    wrapped.name = error.name;
+    return wrapped;
+  }
+
+  private formatDebugBlock(collector: OutputCollector | null): string | null {
+    if (!collector || collector.getTotalBytes() === 0) {
+      return null;
+    }
+
+    const snapshot = collector.getSnapshot();
+    const header = snapshot.truncated
+      ? `[SSH DEBUG TRUNCATED: dropped ${snapshot.droppedBytes} bytes]\n`
+      : "[SSH DEBUG]\n";
+    return `${header}${snapshot.tail.toString("utf8").trimEnd()}`;
+  }
+
+  private unpipeStream(readStream: unknown, writeStream: unknown): void {
+    const candidate = readStream as { unpipe?: (destination?: unknown) => unknown };
+    if (typeof candidate.unpipe !== "function") {
+      return;
+    }
+    try {
+      candidate.unpipe(writeStream);
+    } catch {
+      // Ignore cleanup errors after the original stream failure.
+    }
+  }
+
+  private destroyStream(stream: unknown): void {
+    const candidate = stream as { destroy?: () => void };
+    if (typeof candidate.destroy !== "function") {
+      return;
+    }
+    try {
+      candidate.destroy();
+    } catch {
+      // Ignore cleanup errors after the original stream failure.
+    }
+  }
 
   /**
    * Assemble the final user-visible result string from collected tails.
@@ -1224,7 +2021,13 @@ export class SSHConnectionManager {
   public async executeCommand(
     cmdString: string,
     name?: string,
-    options: { timeout?: number; maxRetries?: number; maxOutputBytes?: number } = {}
+    options: {
+      timeout?: number;
+      maxRetries?: number;
+      maxOutputBytes?: number;
+      reuseConnection?: boolean;
+      vvv?: boolean;
+    } = {}
   ): Promise<string> {
     // Validate command input and security
     const validationResult = this.validateCommand(cmdString, name);
@@ -1239,14 +2042,22 @@ export class SSHConnectionManager {
     const timeout = options.timeout || 30000; // Default 30 seconds timeout
     const maxRetries = options.maxRetries ?? 2; // Default 2 retries
     const maxOutputBytes = options.maxOutputBytes ?? SSHConnectionManager.DEFAULT_MAX_OUTPUT_BYTES;
+    const reuseConnection = options.reuseConnection !== false;
     const key = name || this.defaultName;
+    const { collector: debugCollector, debug } = this.createDebugCollector(options.vvv === true);
 
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        // Ensure SSH connection is established
-        const client = await this.ensureConnected(name);
+        debug?.(`[mcp] command attempt ${attempt + 1}/${maxRetries + 1} on [${key}], reuseConnection=${reuseConnection}`);
+        const commandConnection = await this.acquireSshClient(key, {
+          reuseConnection,
+          timeout,
+          debug,
+          purpose: "command",
+        });
+        const client = commandConnection.client;
 
         // Per-attempt collectors + log writer. We rebuild them on each retry
         // so partial output from a failed attempt is not mixed into the next.
@@ -1260,9 +2071,11 @@ export class SSHConnectionManager {
             stdoutCollector,
             stderrCollector,
             logWriter: logWriter ?? undefined,
+            debug,
           });
         } finally {
           logWriter?.close({ exitCode, durationMs: Date.now() - startedMs });
+          commandConnection.close();
         }
         const result = this.buildExecuteResult({
           stdoutCollector,
@@ -1277,7 +2090,7 @@ export class SSHConnectionManager {
           Logger.log(`Command succeeded on retry attempt ${attempt} for [${key}]`, "info");
         }
 
-        return result;
+        return this.appendDebugOutput(result, debugCollector);
       } catch (error) {
         lastError = error as Error;
         
@@ -1291,16 +2104,16 @@ export class SSHConnectionManager {
           
           // Wait with exponential backoff
           await this.sleep(backoffMs);
-          
-          // Force reconnect before retry
-          try {
-            await this.reconnect(name);
-          } catch (reconnectError) {
-            Logger.log(
-              `Reconnect failed for [${key}]: ${(reconnectError as Error).message}`,
-              "error"
-            );
-            // Continue to next retry attempt anyway
+
+          if (reuseConnection) {
+            try {
+              await this.reconnect(name);
+            } catch (reconnectError) {
+              Logger.log(
+                `Reconnect failed for [${key}]: ${(reconnectError as Error).message}`,
+                "error"
+              );
+            }
           }
           
           continue;
@@ -1312,7 +2125,10 @@ export class SSHConnectionManager {
     }
     
     // All retries exhausted
-    throw lastError || new Error("Command execution failed after all retries");
+    throw this.appendDebugToError(
+      lastError || new Error("Command execution failed after all retries"),
+      debugCollector,
+    );
   }
 
   /**
@@ -1335,6 +2151,8 @@ export class SSHConnectionManager {
       timeout?: number;
       maxRetries?: number;
       maxOutputBytes?: number;
+      reuseConnection?: boolean;
+      vvv?: boolean;
       onProgress?: (chunk: string) => void;
     } = {}
   ): Promise<string> {
@@ -1351,14 +2169,22 @@ export class SSHConnectionManager {
     const timeout = options.timeout || 300000; // Default 5 minutes for streaming
     const maxRetries = options.maxRetries ?? 2; // Default 2 retries
     const maxOutputBytes = options.maxOutputBytes ?? SSHConnectionManager.DEFAULT_MAX_OUTPUT_BYTES;
+    const reuseConnection = options.reuseConnection !== false;
     const key = name || this.defaultName;
+    const { collector: debugCollector, debug } = this.createDebugCollector(options.vvv === true);
 
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        // Ensure SSH connection is established
-        const client = await this.ensureConnected(name);
+        debug?.(`[mcp] streaming command attempt ${attempt + 1}/${maxRetries + 1} on [${key}], reuseConnection=${reuseConnection}`);
+        const commandConnection = await this.acquireSshClient(key, {
+          reuseConnection,
+          timeout,
+          debug,
+          purpose: "command",
+        });
+        const client = commandConnection.client;
 
         // Per-attempt collectors + log writer. onProgress keeps streaming
         // every byte live; only the final returned string is capped.
@@ -1373,9 +2199,11 @@ export class SSHConnectionManager {
             stderrCollector,
             logWriter: logWriter ?? undefined,
             onProgress: options.onProgress,
+            debug,
           });
         } finally {
           logWriter?.close({ exitCode, durationMs: Date.now() - startedMs });
+          commandConnection.close();
         }
         const result = this.buildExecuteResult({
           stdoutCollector,
@@ -1393,7 +2221,7 @@ export class SSHConnectionManager {
           );
         }
 
-        return result;
+        return this.appendDebugOutput(result, debugCollector);
       } catch (error) {
         lastError = error as Error;
 
@@ -1407,13 +2235,15 @@ export class SSHConnectionManager {
 
           await this.sleep(backoffMs);
 
-          try {
-            await this.reconnect(name);
-          } catch (reconnectError) {
-            Logger.log(
-              `Reconnect failed for [${key}]: ${(reconnectError as Error).message}`,
-              "error"
-            );
+          if (reuseConnection) {
+            try {
+              await this.reconnect(name);
+            } catch (reconnectError) {
+              Logger.log(
+                `Reconnect failed for [${key}]: ${(reconnectError as Error).message}`,
+                "error"
+              );
+            }
           }
 
           continue;
@@ -1423,7 +2253,10 @@ export class SSHConnectionManager {
       }
     }
 
-    throw lastError || new Error("Streaming command execution failed after all retries");
+    throw this.appendDebugToError(
+      lastError || new Error("Streaming command execution failed after all retries"),
+      debugCollector,
+    );
   }
 
   /**
@@ -1560,9 +2393,11 @@ export class SSHConnectionManager {
     localPath: string,
     remotePath: string,
     name?: string,
-    options?: { skipIfIdentical?: boolean },
+    options?: SftpOptions & { skipIfIdentical?: boolean },
   ): Promise<string> {
     const resolvedName = name || this.defaultName;
+    const reuseConnection = options?.reuseConnection !== false;
+    const { collector: debugCollector, debug } = this.createDebugCollector(options?.vvv === true);
     const validatedLocalPath = this.validateLocalPath(localPath, resolvedName);
     const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
     const skipIfIdentical = options?.skipIfIdentical !== false; // default true
@@ -1587,52 +2422,99 @@ export class SSHConnectionManager {
       );
     }
 
-    let payload: Buffer;
-    try {
-      payload = fs.readFileSync(validatedLocalPath);
-    } catch (e) {
-      throw new ToolError(
-        "LOCAL_FILE_READ_FAILED",
-        `Failed to read local file '${validatedLocalPath}': ${(e as Error).message}`,
-        false,
+    const isShellScript = SSHConnectionManager.SHELL_SCRIPT_EXTENSIONS.has(
+      path.extname(validatedLocalPath).toLowerCase(),
+    );
+    const fastUpload = options?.fast === true;
+    const mustReadPayload = skipIfIdentical || !fastUpload || isShellScript;
+    let payload: Buffer | null = null;
+    let crlfFixed: { buffer: Buffer; fixed: boolean; replacedCount: number } = {
+      buffer: Buffer.alloc(0),
+      fixed: false,
+      replacedCount: 0,
+    };
+
+    if (mustReadPayload) {
+      try {
+        payload = fs.readFileSync(validatedLocalPath);
+      } catch (e) {
+        throw new ToolError(
+          "LOCAL_FILE_READ_FAILED",
+          `Failed to read local file '${validatedLocalPath}': ${(e as Error).message}`,
+          false,
+        );
+      }
+
+      // ---- CRLF auto-fix for shell scripts ----
+      crlfFixed = SSHConnectionManager.maybeFixShellScriptLineEndings(
+        validatedLocalPath,
+        payload,
       );
+      payload = crlfFixed.buffer;
     }
 
-    // ---- CRLF auto-fix for shell scripts ----
-    const crlfFixed = SSHConnectionManager.maybeFixShellScriptLineEndings(
-      validatedLocalPath,
-      payload,
-    );
-    payload = crlfFixed.buffer;
     const crlfNote = crlfFixed.fixed
       ? ` (CRLF→LF auto-fix: converted ${crlfFixed.replacedCount} line endings to LF before upload because target is a shell script).`
       : "";
 
-    const client = await this.ensureConnected(resolvedName);
+    debug?.(`[mcp] sftp upload on [${resolvedName}], reuseConnection=${reuseConnection}`);
+    let connection: AcquiredSshClient | null = null;
+    try {
+      connection = await this.acquireSshClient(resolvedName, {
+        reuseConnection,
+        timeout: options?.timeout,
+        debug,
+        purpose: "sftp",
+      });
+      const client = connection.client;
 
-    // ---- Skip-if-identical check ----
-    const isShellScript = SSHConnectionManager.SHELL_SCRIPT_EXTENSIONS.has(
-      path.extname(validatedLocalPath).toLowerCase(),
-    );
-    if (skipIfIdentical) {
-      const decision = await this.shouldSkipUpload(
-        client,
-        payload,
-        validatedRemotePath,
-        isShellScript,
-      );
-      if (decision.skip) {
-        return (
-          `Upload skipped: remote file '${validatedRemotePath}' is already identical to local ` +
-          `'${validatedLocalPath}' (${decision.reason}).${crlfNote}`
+      // ---- Skip-if-identical check ----
+      if (skipIfIdentical) {
+        const decision = await this.shouldSkipUpload(
+          client,
+          payload!,
+          validatedRemotePath,
+          isShellScript,
+          options?.timeout,
+          debug,
         );
+        if (decision.skip) {
+          return this.appendDebugOutput(
+            `Upload skipped: remote file '${validatedRemotePath}' is already identical to local ` +
+              `'${validatedLocalPath}' (${decision.reason}).${crlfNote}`,
+            debugCollector,
+          );
+        }
       }
+
+      // ---- Actually upload ----
+      if (fastUpload && !crlfFixed.fixed) {
+        await this.sftpFastPut(
+          client,
+          validatedLocalPath,
+          validatedRemotePath,
+          options,
+          options?.timeout,
+          debug,
+        );
+      } else {
+        await this.sftpWriteBuffer(client, validatedRemotePath, payload!, options?.timeout, debug);
+      }
+
+      const uploadedBytes = payload?.length ?? stat.size;
+      const modeNote = fastUpload && !crlfFixed.fixed ? " via fast SFTP" : "";
+      return this.appendDebugOutput(
+        `File uploaded successfully (${uploadedBytes} bytes${modeNote})${crlfNote}`,
+        debugCollector,
+      );
+    } catch (error) {
+      if (reuseConnection && this.isConnectionError(error as Error)) {
+        this.closeClient(resolvedName, true);
+      }
+      throw this.appendDebugToError(error as Error, debugCollector);
+    } finally {
+      connection?.close();
     }
-
-    // ---- Actually upload ----
-    await this.sftpWriteBuffer(client, validatedRemotePath, payload);
-
-    return `File uploaded successfully (${payload.length} bytes)${crlfNote}`;
   }
 
   /**
@@ -1706,10 +2588,12 @@ export class SSHConnectionManager {
     localPayload: Buffer,
     remotePath: string,
     lineEndingAgnostic: boolean,
+    timeout?: number,
+    debug?: SshDebugSink,
   ): Promise<{ skip: boolean; reason: string }> {
     let remoteSize: number;
     try {
-      const sftp = await this.openSftp(client, "dest");
+      const sftp = await this.openSftp(client, "dest", timeout, debug);
       try {
         const stat = await this.sftpStat(sftp, remotePath, "dest");
         remoteSize = stat.size;
@@ -1729,7 +2613,7 @@ export class SSHConnectionManager {
       }
       let remoteBuf: Buffer;
       try {
-        remoteBuf = await this.sftpReadBuffer(client, remotePath, remoteSize);
+        remoteBuf = await this.sftpReadBuffer(client, remotePath, remoteSize, timeout, debug);
       } catch {
         return { skip: false, reason: "remote-read-failed-during-content-compare" };
       }
@@ -1756,7 +2640,7 @@ export class SSHConnectionManager {
       // Byte-content compare
       let remoteBuf: Buffer;
       try {
-        remoteBuf = await this.sftpReadBuffer(client, remotePath, remoteSize);
+        remoteBuf = await this.sftpReadBuffer(client, remotePath, remoteSize, timeout, debug);
       } catch {
         return { skip: false, reason: "remote-read-failed-during-content-compare" };
       }
@@ -1799,38 +2683,34 @@ export class SSHConnectionManager {
     client: Client,
     remotePath: string,
     expectedSize: number,
+    timeout?: number,
+    debug?: SshDebugSink,
   ): Promise<Buffer> {
+    const sftp = await this.openSftp(client, "read", timeout, debug);
     return new Promise<Buffer>((resolve, reject) => {
-      client.sftp((err, sftp) => {
-        if (err) {
+      const chunks: Buffer[] = [];
+      let received = 0;
+      const stream = sftp.createReadStream(remotePath);
+      stream.on("data", (chunk: Buffer) => {
+        chunks.push(chunk);
+        received += chunk.length;
+      });
+      stream.on("error", (e: Error) => {
+        sftp.end();
+        reject(this.makeSftpError("Remote read failed", e));
+      });
+      stream.on("end", () => {
+        sftp.end();
+        if (received !== expectedSize) {
           return reject(
-            new ToolError("SFTP_ERROR", `SFTP open failed: ${err.message}`, true),
+            new ToolError(
+              "SFTP_ERROR",
+              `Remote read short: expected ${expectedSize} bytes, got ${received}`,
+              false,
+            ),
           );
         }
-        const chunks: Buffer[] = [];
-        let received = 0;
-        const stream = sftp.createReadStream(remotePath);
-        stream.on("data", (chunk: Buffer) => {
-          chunks.push(chunk);
-          received += chunk.length;
-        });
-        stream.on("error", (e: Error) => {
-          sftp.end();
-          reject(new ToolError("SFTP_ERROR", `Remote read failed: ${e.message}`, false));
-        });
-        stream.on("end", () => {
-          sftp.end();
-          if (received !== expectedSize) {
-            return reject(
-              new ToolError(
-                "SFTP_ERROR",
-                `Remote read short: expected ${expectedSize} bytes, got ${received}`,
-                false,
-              ),
-            );
-          }
-          resolve(Buffer.concat(chunks, received));
-        });
+        resolve(Buffer.concat(chunks, received));
       });
     });
   }
@@ -1842,26 +2722,130 @@ export class SSHConnectionManager {
     client: Client,
     remotePath: string,
     payload: Buffer,
+    timeout?: number,
+    debug?: SshDebugSink,
   ): Promise<void> {
+    const sftp = await this.openSftp(client, "write", timeout, debug);
     return new Promise<void>((resolve, reject) => {
-      client.sftp((err, sftp) => {
-        if (err) {
-          return reject(
-            new ToolError("SFTP_ERROR", `SFTP open failed: ${err.message}`, true),
-          );
-        }
-        const writeStream = sftp.createWriteStream(remotePath);
-        writeStream.on("close", () => {
-          sftp.end();
-          resolve();
-        });
-        writeStream.on("error", (e: Error) => {
-          sftp.end();
-          reject(new ToolError("SFTP_ERROR", `File upload failed: ${e.message}`, false));
-        });
-        writeStream.end(payload);
+      const writeStream = sftp.createWriteStream(remotePath);
+      writeStream.on("close", () => {
+        sftp.end();
+        resolve();
       });
+      writeStream.on("error", (e: Error) => {
+        sftp.end();
+        reject(this.makeSftpError("File upload failed", e));
+      });
+      writeStream.end(payload);
     });
+  }
+
+  /**
+   * Upload a local file using ssh2's parallel SFTP fastPut implementation.
+   */
+  private async sftpFastPut(
+    client: Client,
+    localPath: string,
+    remotePath: string,
+    options: SftpOptions | undefined,
+    timeout?: number,
+    debug?: SshDebugSink,
+  ): Promise<void> {
+    // Validate transfer options BEFORE opening the channel so invalid options
+    // can never leak an SFTP channel.
+    const transferOptions = this.createSftpTransferOptions(options);
+    const sftp = await this.openSftp(client, "fastPut", timeout, debug);
+    debug?.(
+      `[mcp] fastPut ${localPath} -> ${remotePath}, concurrency=${transferOptions.concurrency ?? "ssh2-default"}, chunkSize=${transferOptions.chunkSize ?? "ssh2-default"}`,
+    );
+
+    const endSftp = () => {
+      try {
+        sftp.end();
+      } catch {
+        // Ignore late SFTP cleanup errors.
+      }
+    };
+
+    try {
+      await this.runWithInactivityTimeout<void>(
+        (onProgress) =>
+          new Promise<void>((resolve, reject) => {
+            sftp.fastPut(
+              localPath,
+              remotePath,
+              { ...transferOptions, step: () => onProgress() },
+              (err?: Error | null) => {
+                if (err) {
+                  reject(this.makeSftpError("Fast upload failed", err));
+                  return;
+                }
+                resolve();
+              },
+            );
+          }),
+        this.normalizeConnectTimeout(timeout),
+        `fast upload ${localPath} -> ${remotePath}`,
+        debug,
+        endSftp,
+      );
+    } finally {
+      endSftp();
+    }
+  }
+
+  /**
+   * Download a remote file using ssh2's parallel SFTP fastGet implementation.
+   */
+  private async sftpFastGet(
+    client: Client,
+    remotePath: string,
+    localPath: string,
+    options: SftpOptions | undefined,
+    timeout?: number,
+    debug?: SshDebugSink,
+  ): Promise<void> {
+    // Validate transfer options BEFORE opening the channel so invalid options
+    // can never leak an SFTP channel.
+    const transferOptions = this.createSftpTransferOptions(options);
+    const sftp = await this.openSftp(client, "fastGet", timeout, debug);
+    debug?.(
+      `[mcp] fastGet ${remotePath} -> ${localPath}, concurrency=${transferOptions.concurrency ?? "ssh2-default"}, chunkSize=${transferOptions.chunkSize ?? "ssh2-default"}`,
+    );
+
+    const endSftp = () => {
+      try {
+        sftp.end();
+      } catch {
+        // Ignore late SFTP cleanup errors.
+      }
+    };
+
+    try {
+      await this.runWithInactivityTimeout<void>(
+        (onProgress) =>
+          new Promise<void>((resolve, reject) => {
+            sftp.fastGet(
+              remotePath,
+              localPath,
+              { ...transferOptions, step: () => onProgress() },
+              (err?: Error | null) => {
+                if (err) {
+                  reject(this.makeSftpError("Fast download failed", err));
+                  return;
+                }
+                resolve();
+              },
+            );
+          }),
+        this.normalizeConnectTimeout(timeout),
+        `fast download ${remotePath} -> ${localPath}`,
+        debug,
+        endSftp,
+      );
+    } finally {
+      endSftp();
+    }
   }
 
   /**
@@ -1870,44 +2854,78 @@ export class SSHConnectionManager {
   public async download(
     remotePath: string,
     localPath: string,
-    name?: string
+    name?: string,
+    options?: SftpOptions,
   ): Promise<string> {
     const resolvedName = name || this.defaultName;
+    const reuseConnection = options?.reuseConnection !== false;
+    const { collector: debugCollector, debug } = this.createDebugCollector(options?.vvv === true);
     const validatedLocalPath = this.validateLocalPath(localPath, resolvedName);
     const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
-    const client = await this.ensureConnected(resolvedName);
+    debug?.(`[mcp] sftp download on [${resolvedName}], reuseConnection=${reuseConnection}`);
+    let connection: AcquiredSshClient | null = null;
+    try {
+      connection = await this.acquireSshClient(resolvedName, {
+        reuseConnection,
+        timeout: options?.timeout,
+        debug,
+        purpose: "sftp",
+      });
 
-    return new Promise<string>((resolve, reject) => {
-      client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
-        if (err) {
-          return reject(new ToolError("SFTP_ERROR", `SFTP connection failed: ${err.message}`, true));
-        }
+      if (options?.fast === true) {
+        await this.sftpFastGet(
+          connection.client,
+          validatedRemotePath,
+          validatedLocalPath,
+          options,
+          options?.timeout,
+          debug,
+        );
+        return this.appendDebugOutput(
+          "File downloaded successfully via fast SFTP",
+          debugCollector,
+        );
+      }
 
+      const sftp = await this.openSftp(connection.client, "download", options?.timeout, debug);
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
         const readStream = sftp.createReadStream(validatedRemotePath);
         const writeStream = fs.createWriteStream(validatedLocalPath);
 
-        const cleanup = () => {
+        const settle = (err?: Error) => {
+          if (settled) return;
+          settled = true;
+          if (err) {
+            this.unpipeStream(readStream, writeStream);
+            this.destroyStream(readStream);
+            this.destroyStream(writeStream);
+          }
           sftp.end();
+          err ? reject(err) : resolve();
         };
 
-        writeStream.on("finish", () => {
-          cleanup();
-          resolve("File downloaded successfully");
-        });
+        writeStream.on("finish", () => settle());
 
-        writeStream.on("error", (err: Error) => {
-          cleanup();
-          reject(new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to save file: ${err.message}`, false));
-        });
+        writeStream.on("error", (err: Error) =>
+          settle(new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to save file: ${err.message}`, false)),
+        );
 
-        readStream.on("error", (err: Error) => {
-          cleanup();
-          reject(new ToolError("SFTP_ERROR", `File download failed: ${err.message}`, false));
-        });
+        readStream.on("error", (err: Error) =>
+          settle(this.makeSftpError("File download failed", err)),
+        );
 
         readStream.pipe(writeStream);
       });
-    });
+      return this.appendDebugOutput("File downloaded successfully", debugCollector);
+    } catch (error) {
+      if (reuseConnection && this.isConnectionError(error as Error)) {
+        this.closeClient(resolvedName, true);
+      }
+      throw this.appendDebugToError(error as Error, debugCollector);
+    } finally {
+      connection?.close();
+    }
   }
 
   /**
@@ -2026,19 +3044,45 @@ export class SSHConnectionManager {
     sourceRemotePath: string,
     destName: string,
     destRemotePath: string,
-    options?: { skipIfIdentical?: boolean },
+    options?: SftpOptions & { skipIfIdentical?: boolean },
   ): Promise<string> {
     const validatedSourcePath = this.validateRemotePath(sourceRemotePath, sourceName);
     const validatedDestPath = this.validateRemotePath(destRemotePath, destName);
     const skipIfIdentical = options?.skipIfIdentical !== false; // default true
+    const reuseConnection = options?.reuseConnection !== false;
+    const selfRelay = sourceName === destName;
+    const { collector: debugCollector, debug } = this.createDebugCollector(options?.vvv === true);
 
-    const srcClient = await this.ensureConnected(sourceName);
-    const dstClient = await this.ensureConnected(destName);
-
-    const srcSftp = await this.openSftp(srcClient, "source");
-    const dstSftp = await this.openSftp(dstClient, "dest");
+    debug?.(
+      `[mcp] sftp relay ${sourceName} -> ${destName}, reuseConnection=${reuseConnection}`,
+    );
+    let srcConnection: AcquiredSshClient | null = null;
+    let dstConnection: AcquiredSshClient | null = null;
+    let srcSftp: SFTPWrapper | null = null;
+    let dstSftp: SFTPWrapper | null = null;
 
     try {
+      srcConnection = await this.acquireSshClient(sourceName, {
+        reuseConnection,
+        timeout: options?.timeout,
+        debug,
+        purpose: "sftp",
+      });
+      // Same host on both ends: reuse the one SSH client (two SFTP channels are
+      // still opened below) so we never open or close a second connection.
+      dstConnection = selfRelay
+        ? srcConnection
+        : await this.acquireSshClient(destName, {
+            reuseConnection,
+            timeout: options?.timeout,
+            debug,
+            purpose: "sftp",
+          });
+      const srcClient = srcConnection.client;
+      const dstClient = dstConnection.client;
+
+      srcSftp = await this.openSftp(srcClient, "source", options?.timeout, debug);
+      dstSftp = await this.openSftp(dstClient, "dest", options?.timeout, debug);
       // Get source file size before transfer
       const srcStat = await this.sftpStat(srcSftp, validatedSourcePath, "source");
 
@@ -2056,11 +3100,12 @@ export class SSHConnectionManager {
           if (srcMd5 && dstMd5 && srcMd5 === dstMd5) {
             const srcConfig = this.getConfig(sourceName);
             const dstConfig = this.getConfig(destName);
-            return (
+            return this.appendDebugOutput(
               `Transfer skipped: destination already identical ` +
-              `(size=${srcStat.size} bytes, md5=${srcMd5}). ` +
-              `${srcConfig.username}@${srcConfig.host}:${validatedSourcePath}` +
-              ` == ${dstConfig.username}@${dstConfig.host}:${validatedDestPath}`
+                `(size=${srcStat.size} bytes, md5=${srcMd5}). ` +
+                `${srcConfig.username}@${srcConfig.host}:${validatedSourcePath}` +
+                ` == ${dstConfig.username}@${dstConfig.host}:${validatedDestPath}`,
+              debugCollector,
             );
           }
         }
@@ -2078,15 +3123,20 @@ export class SSHConnectionManager {
         const settle = (err?: Error) => {
           if (settled) return;
           settled = true;
+          if (err) {
+            this.unpipeStream(readStream, writeStream);
+            this.destroyStream(readStream);
+            this.destroyStream(writeStream);
+          }
           err ? reject(err) : resolve();
         };
 
         writeStream.on("close", () => settle());
         writeStream.on("error", (err: Error) =>
-          settle(new ToolError("SFTP_ERROR", `Dest write error: ${err.message}`, false)),
+          settle(this.makeSftpError("Dest write error", err)),
         );
         readStream.on("error", (err: Error) =>
-          settle(new ToolError("SFTP_ERROR", `Source read error: ${err.message}`, false)),
+          settle(this.makeSftpError("Source read error", err)),
         );
 
         readStream.pipe(writeStream);
@@ -2125,14 +3175,23 @@ export class SSHConnectionManager {
 
       const srcConfig = this.getConfig(sourceName);
       const dstConfig = this.getConfig(destName);
-      return (
+      return this.appendDebugOutput(
         `Transfer complete (streamed via SFTP, verified: ${verification.join(", ")}): ` +
-        `${srcConfig.username}@${srcConfig.host}:${sourceRemotePath}` +
-        ` → ${dstConfig.username}@${dstConfig.host}:${destRemotePath}`
+          `${srcConfig.username}@${srcConfig.host}:${sourceRemotePath}` +
+          ` → ${dstConfig.username}@${dstConfig.host}:${destRemotePath}`,
+        debugCollector,
       );
+    } catch (error) {
+      if (reuseConnection && this.isConnectionError(error as Error)) {
+        this.closeClient(sourceName, true);
+        if (!selfRelay) this.closeClient(destName, true);
+      }
+      throw this.appendDebugToError(error as Error, debugCollector);
     } finally {
-      srcSftp.end();
-      dstSftp.end();
+      srcSftp?.end();
+      dstSftp?.end();
+      srcConnection?.close();
+      if (!selfRelay) dstConnection?.close();
     }
   }
 
@@ -2148,7 +3207,7 @@ export class SSHConnectionManager {
       sftp.stat(remotePath, (err, stats) => {
         if (err) {
           return reject(
-            new ToolError("SFTP_ERROR", `Failed to stat ${label} file: ${err.message}`, false),
+            this.makeSftpError(`Failed to stat ${label} file`, err),
           );
         }
         resolve({ size: stats.size });
@@ -2187,17 +3246,42 @@ export class SSHConnectionManager {
   /**
    * Open an SFTP session from an existing SSH client.
    */
-  private openSftp(client: Client, label: string): Promise<SFTPWrapper> {
-    return new Promise((resolve, reject) => {
+  private openSftp(
+    client: Client,
+    label: string,
+    timeout?: number,
+    debug?: SshDebugSink,
+  ): Promise<SFTPWrapper> {
+    const open = new Promise<SFTPWrapper>((resolve, reject) => {
       client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
         if (err) {
-          return reject(
-            new ToolError("SFTP_ERROR", `SFTP connection failed (${label}): ${err.message}`, true),
-          );
+          // A client that cannot open an SFTP channel is unusable, so treat the
+          // failure as connection-shaped regardless of wording. This lets the
+          // caller force-drop the stale cached client and self-heal on retry.
+          return reject(new ToolError(
+            "SSH_CONNECTION_FAILED",
+            `SFTP connection failed (${label}): ${err.message}`,
+            true,
+          ));
         }
+        debug?.(`[mcp] sftp channel opened (${label})`);
         resolve(sftp);
       });
     });
+    return this.withConnectionTimeout(
+      open,
+      this.normalizeConnectTimeout(timeout),
+      `SFTP channel open (${label})`,
+      debug,
+      undefined,
+      (sftp) => {
+        try {
+          sftp.end();
+        } catch {
+          // Ignore late SFTP cleanup errors.
+        }
+      },
+    );
   }
 
   /**
@@ -2206,29 +3290,46 @@ export class SSHConnectionManager {
   public async listRemoteDir(
     remotePath: string,
     name?: string,
+    options?: SftpOptions,
   ): Promise<Array<{ filename: string; isDirectory: boolean; size: number }>> {
-    const client = await this.ensureConnected(name);
+    const resolvedName = name || this.defaultName;
+    const reuseConnection = options?.reuseConnection !== false;
+    const { collector: debugCollector, debug } = this.createDebugCollector(options?.vvv === true);
+    debug?.(`[mcp] sftp list on [${resolvedName}], reuseConnection=${reuseConnection}`);
+    let connection: AcquiredSshClient | null = null;
 
-    return new Promise((resolve, reject) => {
-      client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
-        if (err) {
-          return reject(new ToolError("SFTP_ERROR", `SFTP connection failed: ${err.message}`, true));
-        }
-
-        sftp.readdir(remotePath, (err, list) => {
-          sftp.end();
-          if (err) {
-            return reject(new ToolError("SFTP_ERROR", `Failed to list remote directory: ${err.message}`, false));
-          }
-          const entries = list.map((entry) => ({
-            filename: entry.filename,
-            isDirectory: (entry.attrs.mode & 0o40000) !== 0,
-            size: entry.attrs.size,
-          }));
-          resolve(entries);
-        });
+    try {
+      connection = await this.acquireSshClient(resolvedName, {
+        reuseConnection,
+        timeout: options?.timeout,
+        debug,
+        purpose: "sftp",
       });
-    });
+      const entries = await new Promise<Array<{ filename: string; isDirectory: boolean; size: number }>>((resolve, reject) => {
+        this.openSftp(connection!.client, "list", options?.timeout, debug).then((sftp) => {
+          sftp.readdir(remotePath, (err, list) => {
+            sftp.end();
+            if (err) {
+              return reject(this.makeSftpError("Failed to list remote directory", err));
+            }
+            const entries = list.map((entry) => ({
+              filename: entry.filename,
+              isDirectory: (entry.attrs.mode & 0o40000) !== 0,
+              size: entry.attrs.size,
+            }));
+            resolve(entries);
+          });
+        }, reject);
+      });
+      return entries;
+    } catch (error) {
+      if (reuseConnection && this.isConnectionError(error as Error)) {
+        this.closeClient(resolvedName, true);
+      }
+      throw this.appendDebugToError(error as Error, debugCollector);
+    } finally {
+      connection?.close();
+    }
   }
 
   /**
@@ -2238,7 +3339,7 @@ export class SSHConnectionManager {
     localDir: string,
     remoteDir: string,
     name?: string,
-    options?: { skipIfIdentical?: boolean },
+    options?: SftpOptions & { skipIfIdentical?: boolean },
   ): Promise<string[]> {
     const resolvedName = name || this.defaultName;
     const resolvedLocal = this.validateLocalPath(localDir, resolvedName);
@@ -2249,8 +3350,26 @@ export class SSHConnectionManager {
 
     const results: string[] = [];
 
-    const client = await this.ensureConnected(resolvedName);
-    await this.sftpMkdirRecursive(client, validatedRemoteDir);
+    const reuseConnection = options?.reuseConnection !== false;
+    const { collector: debugCollector, debug } = this.createDebugCollector(options?.vvv === true);
+    debug?.(`[mcp] sftp recursive upload mkdir on [${resolvedName}], reuseConnection=${reuseConnection}`);
+    let connection: AcquiredSshClient | null = null;
+    try {
+      connection = await this.acquireSshClient(resolvedName, {
+        reuseConnection,
+        timeout: options?.timeout,
+        debug,
+        purpose: "sftp",
+      });
+      await this.sftpMkdirRecursive(connection.client, validatedRemoteDir, options?.timeout, debug);
+    } catch (error) {
+      if (reuseConnection && this.isConnectionError(error as Error)) {
+        this.closeClient(resolvedName, true);
+      }
+      throw this.appendDebugToError(error as Error, debugCollector);
+    } finally {
+      connection?.close();
+    }
 
     const entries = fs.readdirSync(resolvedLocal, { withFileTypes: true });
     for (const entry of entries) {
@@ -2276,6 +3395,7 @@ export class SSHConnectionManager {
     remoteDir: string,
     localDir: string,
     name?: string,
+    options?: SftpOptions,
   ): Promise<string[]> {
     const resolvedName = name || this.defaultName;
     const resolvedLocal = this.validateLocalPath(localDir, resolvedName);
@@ -2286,7 +3406,7 @@ export class SSHConnectionManager {
     }
 
     const results: string[] = [];
-    const entries = await this.listRemoteDir(validatedRemoteDir, resolvedName);
+    const entries = await this.listRemoteDir(validatedRemoteDir, resolvedName, options);
 
     for (const entry of entries) {
       if (entry.filename === "." || entry.filename === "..") continue;
@@ -2295,10 +3415,10 @@ export class SSHConnectionManager {
       const localPath = path.join(localDir, entry.filename);
 
       if (entry.isDirectory) {
-        const subResults = await this.downloadDirectory(remotePath, localPath, resolvedName);
+        const subResults = await this.downloadDirectory(remotePath, localPath, resolvedName, options);
         results.push(...subResults);
       } else {
-        await this.download(remotePath, localPath, resolvedName);
+        await this.download(remotePath, localPath, resolvedName, options);
         results.push(localPath);
       }
     }
@@ -2309,31 +3429,51 @@ export class SSHConnectionManager {
   /**
    * Create remote directory recursively via SFTP
    */
-  private async sftpMkdirRecursive(client: Client, remotePath: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
-        if (err) {
-          return reject(new ToolError("SFTP_ERROR", `SFTP connection failed: ${err.message}`, true));
+  private async sftpMkdirRecursive(
+    client: Client,
+    remotePath: string,
+    timeout?: number,
+    debug?: SshDebugSink,
+  ): Promise<void> {
+    const sftp = await this.openSftp(client, "mkdir", timeout, debug);
+    const walk = new Promise<void>((resolve, reject) => {
+      const parts = remotePath.split("/").filter(Boolean);
+      let current = "";
+
+      const mkdirNext = (index: number) => {
+        if (index >= parts.length) {
+          return resolve();
         }
 
-        const parts = remotePath.split("/").filter(Boolean);
-        let current = "";
-
-        const mkdirNext = (index: number) => {
-          if (index >= parts.length) {
-            sftp.end();
-            return resolve();
+        current += "/" + parts[index];
+        sftp.mkdir(current, (err?: Error | null) => {
+          // An existing directory (or other non-connection failure) is fine and
+          // just means the path component already exists. A connection-shaped
+          // error means the channel died mid-walk -- surface it instead of
+          // silently marching on (and eventually hanging the per-file uploads).
+          if (err && this.isConnectionShapedMessage(err.message)) {
+            return reject(this.makeSftpError("Remote mkdir failed", err));
           }
+          mkdirNext(index + 1);
+        });
+      };
 
-          current += "/" + parts[index];
-          sftp.mkdir(current, (err) => {
-            // EEXIST is fine
-            mkdirNext(index + 1);
-          });
-        };
-
-        mkdirNext(0);
-      });
+      mkdirNext(0);
     });
+
+    try {
+      await this.withConnectionTimeout(
+        walk,
+        this.normalizeConnectTimeout(timeout),
+        `SFTP mkdir ${remotePath}`,
+        debug,
+      );
+    } finally {
+      try {
+        sftp.end();
+      } catch {
+        // Ignore late SFTP cleanup errors.
+      }
+    }
   }
 }

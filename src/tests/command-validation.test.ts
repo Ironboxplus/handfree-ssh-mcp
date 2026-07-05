@@ -10,6 +10,9 @@ import assert from "node:assert";
 import os from "node:os";
 import path from "node:path";
 import fsForTest from "node:fs";
+import { EventEmitter } from "node:events";
+import { SocksClient } from "socks";
+import { Client } from "ssh2";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { ToolError } from "../utils/tool-error.js";
 
@@ -446,6 +449,10 @@ describe("SSHConnectionManager regressions", () => {
     manager.setConfig({}, undefined);
   });
 
+  it("should not cap caller-provided SSH setup timeouts at 30s", () => {
+    assert.strictEqual(manager.normalizeConnectTimeout(60000), 60000);
+  });
+
   it("should default to blacklist mode and allow commands outside a whitelist", () => {
     manager.setConfig(
       {
@@ -557,7 +564,7 @@ describe("SSHConnectionManager regressions", () => {
     assert.strictEqual(result.isAllowed, true);
   });
 
-  it("should not retry command timeout errors", async () => {
+  it("should not retry command timeout errors and should close the command connection", async () => {
     manager.setConfig(
       {
         dev: baseConfig({
@@ -567,39 +574,42 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalEnsureConnected = manager.ensureConnected;
+    const originalConnectCommandClient = manager.connectCommandClient;
     const originalRunCommandStream = manager.runCommandStream;
-    const originalReconnect = manager.reconnect;
     const originalCreateLogWriter = manager.createLogWriter;
+    let connectCalls = 0;
+    let closeCalls = 0;
     let executeCalls = 0;
-    let reconnectCalls = 0;
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.connectCommandClient = async () => {
+      connectCalls += 1;
+      return {
+        client: {} as any,
+        close: () => { closeCalls += 1; },
+      };
+    };
     manager.createLogWriter = () => null; // skip disk writes in this test
     manager.runCommandStream = async () => {
       executeCalls += 1;
       throw new ToolError("COMMAND_TIMEOUT", "timed out", false);
     };
-    manager.reconnect = async () => {
-      reconnectCalls += 1;
-    };
 
     try {
       await assert.rejects(
-        () => manager.executeCommand("pwd", "dev", { timeout: 1, maxRetries: 2 }),
+        () => manager.executeCommand("pwd", "dev", { timeout: 1, maxRetries: 2, reuseConnection: false }),
         (error: unknown) => error instanceof ToolError && error.code === "COMMAND_TIMEOUT",
       );
+      assert.strictEqual(connectCalls, 1);
       assert.strictEqual(executeCalls, 1);
-      assert.strictEqual(reconnectCalls, 0);
+      assert.strictEqual(closeCalls, 1);
     } finally {
-      manager.ensureConnected = originalEnsureConnected;
+      manager.connectCommandClient = originalConnectCommandClient;
       manager.runCommandStream = originalRunCommandStream;
-      manager.reconnect = originalReconnect;
       manager.createLogWriter = originalCreateLogWriter;
     }
   });
 
-  it("should continue retrying SSH connection failures", async () => {
+  it("should reuse cached connections by default and reconnect on SSH connection failures", async () => {
     manager.setConfig(
       {
         dev: baseConfig({
@@ -610,13 +620,22 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalEnsureConnected = manager.ensureConnected;
+    const originalConnectCommandClient = manager.connectCommandClient;
     const originalRunCommandStream = manager.runCommandStream;
     const originalReconnect = manager.reconnect;
     const originalCreateLogWriter = manager.createLogWriter;
+    const originalSleep = manager.sleep;
+    let ensureCalls = 0;
     let executeCalls = 0;
     let reconnectCalls = 0;
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.ensureConnected = async () => {
+      ensureCalls += 1;
+      return { cached: true } as any;
+    };
+    manager.connectCommandClient = async () => {
+      throw new Error("fresh connection should not be used by default");
+    };
     manager.createLogWriter = () => null;
     manager.runCommandStream = async (
       _cmd: string,
@@ -634,18 +653,1730 @@ describe("SSHConnectionManager regressions", () => {
     manager.reconnect = async () => {
       reconnectCalls += 1;
     };
+    manager.sleep = async () => {};
 
     try {
       const result = await manager.executeCommand("pwd", "dev", { timeout: 1, maxRetries: 1 });
       assert.strictEqual(result, "ok");
+      assert.strictEqual(ensureCalls, 2);
       assert.strictEqual(executeCalls, 2);
       assert.strictEqual(reconnectCalls, 1);
     } finally {
       manager.ensureConnected = originalEnsureConnected;
+      manager.connectCommandClient = originalConnectCommandClient;
       manager.runCommandStream = originalRunCommandStream;
       manager.reconnect = originalReconnect;
       manager.createLogWriter = originalCreateLogWriter;
+      manager.sleep = originalSleep;
     }
+  });
+
+  it("should retry SSH connection failures with a fresh command connection", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalRunCommandStream = manager.runCommandStream;
+    const originalCreateLogWriter = manager.createLogWriter;
+    const originalSleep = manager.sleep;
+    let connectCalls = 0;
+    let closeCalls = 0;
+    let executeCalls = 0;
+
+    manager.connectCommandClient = async () => {
+      connectCalls += 1;
+      return {
+        client: { attempt: connectCalls } as any,
+        close: () => { closeCalls += 1; },
+      };
+    };
+    manager.createLogWriter = () => null;
+    manager.runCommandStream = async (
+      _cmd: string,
+      _client: unknown,
+      _timeout: number,
+      sinks: { stdoutCollector?: { push(c: string): void } },
+    ) => {
+      executeCalls += 1;
+      if (executeCalls === 1) {
+        throw new ToolError("SSH_CONNECTION_FAILED", "socket closed", true);
+      }
+      sinks.stdoutCollector?.push("ok");
+      return 0;
+    };
+    manager.sleep = async () => {};
+
+    try {
+      const result = await manager.executeCommand("pwd", "dev", {
+        timeout: 1,
+        maxRetries: 1,
+        reuseConnection: false,
+      });
+      assert.strictEqual(result, "ok");
+      assert.strictEqual(connectCalls, 2);
+      assert.strictEqual(executeCalls, 2);
+      assert.strictEqual(closeCalls, 2);
+    } finally {
+      manager.connectCommandClient = originalConnectCommandClient;
+      manager.runCommandStream = originalRunCommandStream;
+      manager.createLogWriter = originalCreateLogWriter;
+      manager.sleep = originalSleep;
+    }
+  });
+
+  it("should close a one-shot command connection after a successful command", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalRunCommandStream = manager.runCommandStream;
+    const originalCreateLogWriter = manager.createLogWriter;
+    let closeCalls = 0;
+
+    manager.connectCommandClient = async () => ({
+      client: {} as any,
+      close: () => {
+        closeCalls += 1;
+      },
+    });
+    manager.createLogWriter = () => null;
+    manager.runCommandStream = async (
+      _cmd: string,
+      _client: unknown,
+      _timeout: number,
+      sinks: { stdoutCollector?: { push(c: string): void } },
+    ) => {
+      sinks.stdoutCollector?.push("ok");
+      return 0;
+    };
+
+    try {
+      const result = await manager.executeCommand("pwd", "dev", {
+        timeout: 1,
+        maxRetries: 0,
+        reuseConnection: false,
+      });
+      assert.strictEqual(result, "ok");
+      assert.strictEqual(closeCalls, 1);
+    } finally {
+      manager.connectCommandClient = originalConnectCommandClient;
+      manager.runCommandStream = originalRunCommandStream;
+      manager.createLogWriter = originalCreateLogWriter;
+    }
+  });
+
+  it("should use the shared cached SSH acquisition path for SFTP by default", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalSftpWriteBuffer = manager.sftpWriteBuffer;
+    let acquireCalls = 0;
+    let writeClient: unknown;
+    const tempPath = path.resolve(
+      process.cwd(),
+      `handfree-sftp-reuse-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+    );
+    fsForTest.writeFileSync(tempPath, "payload");
+
+    manager.acquireSshClient = async (_key: string, options: { reuseConnection?: boolean; debug?: (line: string) => void }) => {
+      acquireCalls += 1;
+      assert.strictEqual(options.reuseConnection, true);
+      assert.strictEqual(options.debug, undefined);
+      return {
+        client: { cached: true },
+        close: () => {},
+      };
+    };
+    manager.sftpWriteBuffer = async (client: unknown) => {
+      writeClient = client;
+    };
+
+    try {
+      const result = await manager.upload(tempPath, "/tmp/file.txt", "dev", {
+        skipIfIdentical: false,
+      });
+      assert.match(result, /File uploaded successfully/);
+      assert.strictEqual(acquireCalls, 1);
+      assert.deepStrictEqual(writeClient, { cached: true });
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.sftpWriteBuffer = originalSftpWriteBuffer;
+      fsForTest.unlinkSync(tempPath);
+    }
+  });
+
+  it("should make cached acquired SSH close a no-op", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig(),
+      },
+      ["dev"],
+    );
+
+    const originalEnsureConnected = manager.ensureConnected;
+    let endCalls = 0;
+    manager.ensureConnected = async () => ({
+      end: () => {
+        endCalls += 1;
+      },
+    }) as any;
+
+    try {
+      const connection = await manager.acquireSshClient("dev", { reuseConnection: true });
+      connection.close();
+      assert.strictEqual(endCalls, 0, "cached acquire close must not end the reused SSH client");
+    } finally {
+      manager.ensureConnected = originalEnsureConnected;
+    }
+  });
+
+  it("should close one-shot SFTP SSH clients when reuseConnection=false", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalSftpWriteBuffer = manager.sftpWriteBuffer;
+    let acquireCalls = 0;
+    let closeCalls = 0;
+    let writeClient: unknown;
+    const tempPath = path.resolve(
+      process.cwd(),
+      `handfree-sftp-fresh-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+    );
+    fsForTest.writeFileSync(tempPath, "payload");
+
+    manager.acquireSshClient = async (
+      _key: string,
+      options: { reuseConnection?: boolean; timeout?: number; debug?: (line: string) => void },
+    ) => {
+      acquireCalls += 1;
+      assert.strictEqual(options.reuseConnection, false);
+      assert.strictEqual(options.timeout, 123);
+      assert.strictEqual(typeof options.debug, "function");
+      options.debug?.("[ssh2] sftp fresh handshake");
+      return {
+        client: { fresh: true },
+        close: () => {
+          closeCalls += 1;
+        },
+      };
+    };
+    manager.sftpWriteBuffer = async (client: unknown) => {
+      writeClient = client;
+    };
+
+    try {
+      const result = await manager.upload(tempPath, "/tmp/file.txt", "dev", {
+        skipIfIdentical: false,
+        reuseConnection: false,
+        timeout: 123,
+        vvv: true,
+      });
+      assert.match(result, /File uploaded successfully/);
+      assert.match(result, /\[SSH DEBUG\]/);
+      assert.match(result, /sftp fresh handshake/);
+      assert.strictEqual(acquireCalls, 1);
+      assert.deepStrictEqual(writeClient, { fresh: true });
+      assert.strictEqual(closeCalls, 1, "one-shot SFTP clients must close after use");
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.sftpWriteBuffer = originalSftpWriteBuffer;
+      fsForTest.unlinkSync(tempPath);
+    }
+  });
+
+  it("should use ssh2 fastPut when fast SFTP upload is enabled", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    const originalSftpWriteBuffer = manager.sftpWriteBuffer;
+    let sftpEndCalls = 0;
+    let fastPutArgs: unknown[] | null = null;
+    const tempPath = path.resolve(
+      process.cwd(),
+      `handfree-sftp-fast-put-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+    );
+    fsForTest.writeFileSync(tempPath, "payload");
+
+    manager.acquireSshClient = async () => ({
+      client: { cached: true },
+      close: () => {},
+    });
+    manager.openSftp = async () => ({
+      end: () => {
+        sftpEndCalls += 1;
+      },
+      fastPut: (
+        localPath: string,
+        remotePath: string,
+        options: unknown,
+        callback: (err?: Error) => void,
+      ) => {
+        fastPutArgs = [localPath, remotePath, options];
+        callback();
+      },
+    }) as any;
+    manager.sftpWriteBuffer = async () => {
+      throw new Error("buffer upload should not be used when fast=true");
+    };
+
+    try {
+      const result = await manager.upload(tempPath, "/tmp/file.txt", "dev", {
+        skipIfIdentical: false,
+        fast: true,
+        sftpConcurrency: 8,
+        chunkSize: 65536,
+      });
+      assert.match(result, /File uploaded successfully/);
+      assert.match(result, /fast SFTP/);
+      const [putLocal, putRemote, putOpts] = fastPutArgs as unknown as [
+        string,
+        string,
+        { concurrency?: number; chunkSize?: number; step?: unknown },
+      ];
+      assert.strictEqual(putLocal, tempPath);
+      assert.strictEqual(putRemote, "/tmp/file.txt");
+      assert.strictEqual(putOpts.concurrency, 8);
+      assert.strictEqual(putOpts.chunkSize, 65536);
+      assert.strictEqual(typeof putOpts.step, "function");
+      assert.strictEqual(sftpEndCalls, 1);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      manager.sftpWriteBuffer = originalSftpWriteBuffer;
+      fsForTest.unlinkSync(tempPath);
+    }
+  });
+
+  it("should use ssh2 fastGet when fast SFTP download is enabled", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    let sftpEndCalls = 0;
+    let fastGetArgs: unknown[] | null = null;
+    const tempPath = path.resolve(
+      process.cwd(),
+      `handfree-sftp-fast-get-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+    );
+
+    manager.acquireSshClient = async () => ({
+      client: { cached: true },
+      close: () => {},
+    });
+    manager.openSftp = async () => ({
+      end: () => {
+        sftpEndCalls += 1;
+      },
+      fastGet: (
+        remotePath: string,
+        localPath: string,
+        options: unknown,
+        callback: (err?: Error) => void,
+      ) => {
+        fastGetArgs = [remotePath, localPath, options];
+        callback();
+      },
+    }) as any;
+
+    try {
+      const result = await manager.download("/tmp/file.txt", tempPath, "dev", {
+        fast: true,
+        sftpConcurrency: 4,
+        chunkSize: 131072,
+      });
+      assert.match(result, /File downloaded successfully/);
+      assert.match(result, /fast SFTP/);
+      const [getRemote, getLocal, getOpts] = fastGetArgs as unknown as [
+        string,
+        string,
+        { concurrency?: number; chunkSize?: number; step?: unknown },
+      ];
+      assert.strictEqual(getRemote, "/tmp/file.txt");
+      assert.strictEqual(getLocal, tempPath);
+      assert.strictEqual(getOpts.concurrency, 4);
+      assert.strictEqual(getOpts.chunkSize, 131072);
+      assert.strictEqual(typeof getOpts.step, "function");
+      assert.strictEqual(sftpEndCalls, 1);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      if (fsForTest.existsSync(tempPath)) {
+        fsForTest.unlinkSync(tempPath);
+      }
+    }
+  });
+
+  it("should reject sftpMkdirRecursive on a connection-shaped mkdir error", async () => {
+    const originalOpenSftp = manager.openSftp;
+    let sftpEndCalls = 0;
+    manager.openSftp = async () => ({
+      end: () => {
+        sftpEndCalls += 1;
+      },
+      mkdir: (_p: string, cb: (err?: Error) => void) => {
+        // ssh2 surfaces a dropped channel as a connection-shaped error.
+        cb(new Error("Not connected"));
+      },
+    });
+
+    try {
+      await assert.rejects(
+        () => manager.sftpMkdirRecursive({}, "/tmp/a/b"),
+        (err: Error) =>
+          err instanceof ToolError &&
+          err.code === "SSH_CONNECTION_FAILED" &&
+          /Not connected/i.test(err.message),
+      );
+      assert.strictEqual(
+        sftpEndCalls,
+        1,
+        "sftp channel must be closed after a mkdir failure",
+      );
+    } finally {
+      manager.openSftp = originalOpenSftp;
+    }
+  });
+
+  it("should tolerate existing-directory mkdir errors and walk the full path", async () => {
+    const originalOpenSftp = manager.openSftp;
+    const attempted: string[] = [];
+    let sftpEndCalls = 0;
+    manager.openSftp = async () => ({
+      end: () => {
+        sftpEndCalls += 1;
+      },
+      mkdir: (p: string, cb: (err?: Error) => void) => {
+        attempted.push(p);
+        // A non-connection "Failure" (e.g. dir already exists) must not abort.
+        cb(new Error("Failure"));
+      },
+    });
+
+    try {
+      await manager.sftpMkdirRecursive({}, "/tmp/a/b");
+      assert.deepStrictEqual(attempted, ["/tmp", "/tmp/a", "/tmp/a/b"]);
+      assert.strictEqual(sftpEndCalls, 1);
+    } finally {
+      manager.openSftp = originalOpenSftp;
+    }
+  });
+
+  it("should reject a stalled fast SFTP upload via the inactivity timeout", async () => {
+    const originalOpenSftp = manager.openSftp;
+    let sftpEndCalls = 0;
+    manager.openSftp = async () => ({
+      end: () => {
+        sftpEndCalls += 1;
+      },
+      // Never invokes the callback and never reports progress -> would hang
+      // forever without an inactivity watchdog.
+      fastPut: () => {},
+    });
+
+    try {
+      await assert.rejects(
+        () =>
+          manager.sftpFastPut({}, "/local/file", "/tmp/file", {}, 40),
+        (err: Error) =>
+          err instanceof ToolError &&
+          err.code === "SSH_CONNECTION_FAILED" &&
+          /stall|no progress/i.test(err.message),
+      );
+      assert.ok(
+        sftpEndCalls >= 1,
+        "sftp channel must be closed when a stalled transfer is aborted",
+      );
+    } finally {
+      manager.openSftp = originalOpenSftp;
+    }
+  });
+
+  it("should reset the fast-transfer inactivity timer while progress is reported", async () => {
+    const originalOpenSftp = manager.openSftp;
+    manager.openSftp = async () => ({
+      end: () => {},
+      fastPut: (
+        _localPath: string,
+        _remotePath: string,
+        options: { step?: (t: number, c: number, total: number) => void },
+        cb: (err?: Error) => void,
+      ) => {
+        // Report progress every 20ms for 100ms, then finish. A 40ms
+        // inactivity window must NOT trip because progress keeps arriving.
+        let ticks = 0;
+        const iv = setInterval(() => {
+          ticks += 1;
+          options.step?.(ticks * 10, 10, 50);
+          if (ticks >= 5) {
+            clearInterval(iv);
+            cb();
+          }
+        }, 20);
+      },
+    });
+
+    try {
+      await manager.sftpFastPut({}, "/local/file", "/tmp/file", {}, 40);
+    } finally {
+      manager.openSftp = originalOpenSftp;
+    }
+  });
+
+  it("should not double-acquire or double-close on a self-relay", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    const originalSftpStat = manager.sftpStat;
+    const originalRemoteMd5 = manager.remoteMd5;
+    let acquireCalls = 0;
+    let closeCalls = 0;
+
+    manager.acquireSshClient = async () => {
+      acquireCalls += 1;
+      return {
+        client: { cached: true },
+        close: () => {
+          closeCalls += 1;
+        },
+      };
+    };
+    manager.openSftp = async () => ({ end: () => {} });
+    manager.sftpStat = async () => ({ size: 100 });
+    manager.remoteMd5 = async () => "abc123";
+
+    try {
+      const result = await manager.transferBetweenServers(
+        "dev",
+        "/tmp/a",
+        "dev",
+        "/tmp/b",
+        { skipIfIdentical: true },
+      );
+      assert.match(result, /skipped/i);
+      assert.strictEqual(acquireCalls, 1, "self-relay must acquire one client");
+      assert.strictEqual(closeCalls, 1, "self-relay must close the client once");
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      manager.sftpStat = originalSftpStat;
+      manager.remoteMd5 = originalRemoteMd5;
+    }
+  });
+
+  it("should tear down streams when a normal SFTP download read fails", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    const originalCreateWriteStream = (fsForTest as any).createWriteStream;
+    let sftpEndCalls = 0;
+    let readUnpipeCalls = 0;
+    let readDestroyCalls = 0;
+    let writeDestroyCalls = 0;
+    const tempPath = path.resolve(
+      process.cwd(),
+      `handfree-sftp-download-fail-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+    );
+
+    manager.acquireSshClient = async () => ({
+      client: { cached: true },
+      close: () => {},
+    });
+    manager.openSftp = async () => ({
+      end: () => {
+        sftpEndCalls += 1;
+      },
+      createReadStream: () => {
+        const stream = new EventEmitter() as any;
+        stream.pipe = (dest: unknown) => {
+          setImmediate(() => stream.emit("error", new Error("remote read failed")));
+          return dest;
+        };
+        stream.unpipe = () => {
+          readUnpipeCalls += 1;
+        };
+        stream.destroy = () => {
+          readDestroyCalls += 1;
+        };
+        return stream;
+      },
+    }) as any;
+    (fsForTest as any).createWriteStream = () => {
+      const stream = new EventEmitter() as any;
+      stream.destroy = () => {
+        writeDestroyCalls += 1;
+      };
+      return stream;
+    };
+
+    try {
+      await assert.rejects(
+        () => manager.download("/tmp/file.txt", tempPath, "dev"),
+        (error: unknown) => error instanceof ToolError && error.code === "SFTP_ERROR",
+      );
+      assert.strictEqual(readUnpipeCalls, 1);
+      assert.strictEqual(readDestroyCalls, 1);
+      assert.strictEqual(writeDestroyCalls, 1);
+      assert.strictEqual(sftpEndCalls, 1);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      (fsForTest as any).createWriteStream = originalCreateWriteStream;
+      if (fsForTest.existsSync(tempPath)) {
+        fsForTest.unlinkSync(tempPath);
+      }
+    }
+  });
+
+  it("should drop the stale cached SSH client when an SFTP channel open fails with a non-keyword message", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalCloseClient = manager.closeClient;
+    let closeArgs: unknown[] | null = null;
+    const tempPath = path.resolve(
+      process.cwd(),
+      `handfree-sftp-open-fail-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+    );
+    fsForTest.writeFileSync(tempPath, "payload");
+
+    // The real openSftp runs here: the fake client's sftp() fails with a message
+    // that contains NONE of the connection keywords. An SFTP channel-open failure
+    // means the cached client is unusable, so it must be classified as a
+    // connection error and force-dropped for self-heal — regardless of wording.
+    manager.acquireSshClient = async () => ({
+      client: {
+        sftp: (cb: (err: Error | undefined, sftp?: unknown) => void) =>
+          cb(new Error("administratively prohibited")),
+      },
+      close: () => {},
+    });
+    manager.closeClient = (name: string, force?: boolean) => {
+      closeArgs = [name, force];
+    };
+
+    try {
+      await assert.rejects(
+        () =>
+          manager.upload(tempPath, "/tmp/file.txt", "dev", {
+            skipIfIdentical: false,
+            fast: true,
+          }),
+        (error: unknown) =>
+          error instanceof ToolError && error.code === "SSH_CONNECTION_FAILED",
+      );
+      assert.deepStrictEqual(
+        closeArgs,
+        ["dev", true],
+        "SFTP channel-open failure must force-drop the stale cached client",
+      );
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.closeClient = originalCloseClient;
+      if (fsForTest.existsSync(tempPath)) {
+        fsForTest.unlinkSync(tempPath);
+      }
+    }
+  });
+
+  it("should not leak an SFTP channel when fast upload options are invalid", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    let openSftpCalls = 0;
+    let sftpEndCalls = 0;
+    const tempPath = path.resolve(
+      process.cwd(),
+      `handfree-sftp-fast-badopt-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+    );
+    fsForTest.writeFileSync(tempPath, "payload");
+
+    manager.acquireSshClient = async () => ({
+      client: { cached: true },
+      close: () => {},
+    });
+    manager.openSftp = async () => {
+      openSftpCalls += 1;
+      return {
+        end: () => {
+          sftpEndCalls += 1;
+        },
+        fastPut: (
+          _localPath: string,
+          _remotePath: string,
+          _options: unknown,
+          callback: (err?: Error) => void,
+        ) => callback(),
+      };
+    };
+
+    try {
+      await assert.rejects(
+        () =>
+          manager.upload(tempPath, "/tmp/file.txt", "dev", {
+            skipIfIdentical: false,
+            fast: true,
+            sftpConcurrency: -1,
+          }),
+        (error: unknown) =>
+          error instanceof ToolError && error.code === "INVALID_CONFIGURATION",
+      );
+      // Invariant: every opened SFTP channel must be closed. Invalid transfer
+      // options must not leak a channel (either validate before opening, or
+      // end() the channel on the throw path).
+      assert.strictEqual(
+        openSftpCalls,
+        sftpEndCalls,
+        "fast upload must not leak an SFTP channel when options are invalid",
+      );
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      if (fsForTest.existsSync(tempPath)) {
+        fsForTest.unlinkSync(tempPath);
+      }
+    }
+  });
+
+  it("should close one-shot SSH clients after fast SFTP transfers", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    let closeCalls = 0;
+    let fastPutCalls = 0;
+    const tempPath = path.resolve(
+      process.cwd(),
+      `handfree-sftp-fast-fresh-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
+    );
+    fsForTest.writeFileSync(tempPath, "payload");
+
+    manager.acquireSshClient = async (_key: string, options: { reuseConnection?: boolean }) => {
+      assert.strictEqual(options.reuseConnection, false);
+      return {
+        client: { fresh: true },
+        close: () => {
+          closeCalls += 1;
+        },
+      };
+    };
+    manager.openSftp = async () => ({
+      end: () => {},
+      fastPut: (
+        _localPath: string,
+        _remotePath: string,
+        _options: unknown,
+        callback: (err?: Error) => void,
+      ) => {
+        fastPutCalls += 1;
+        callback();
+      },
+    }) as any;
+
+    try {
+      const result = await manager.upload(tempPath, "/tmp/file.txt", "dev", {
+        skipIfIdentical: false,
+        reuseConnection: false,
+        fast: true,
+      });
+      assert.match(result, /fast SFTP/);
+      assert.strictEqual(fastPutCalls, 1);
+      assert.strictEqual(closeCalls, 1, "one-shot fast SFTP clients must close after use");
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      fsForTest.unlinkSync(tempPath);
+    }
+  });
+
+  it("should close both one-shot relay SSH clients when reuseConnection=false", async () => {
+    manager.setConfig(
+      {
+        src: baseConfig({
+          name: "src",
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+        dst: baseConfig({
+          name: "dst",
+          host: "127.0.0.2",
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["src", "dst"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    const originalSftpStat = manager.sftpStat;
+    let closeCalls = 0;
+    const acquired: string[] = [];
+
+    manager.acquireSshClient = async (
+      key: string,
+      options: { reuseConnection?: boolean; debug?: (line: string) => void },
+    ) => {
+      acquired.push(key);
+      assert.strictEqual(options.reuseConnection, false);
+      assert.strictEqual(typeof options.debug, "function");
+      options.debug?.(`[ssh2] ${key} relay handshake`);
+      return {
+        client: { key },
+        close: () => {
+          closeCalls += 1;
+        },
+      };
+    };
+    manager.openSftp = async () => ({
+      end: () => {},
+      createReadStream: () => {
+        const stream = new EventEmitter() as any;
+        stream.pipe = (dest: EventEmitter) => {
+          setImmediate(() => dest.emit("close"));
+          return dest;
+        };
+        return stream;
+      },
+      createWriteStream: () => new EventEmitter(),
+    }) as any;
+    manager.sftpStat = async () => ({ size: 7 });
+
+    try {
+      const result = await manager.transferBetweenServers(
+        "src",
+        "/tmp/source.txt",
+        "dst",
+        "/tmp/dest.txt",
+        {
+          skipIfIdentical: false,
+          reuseConnection: false,
+          vvv: true,
+        },
+      );
+      assert.match(result, /Transfer complete/);
+      assert.match(result, /\[SSH DEBUG\]/);
+      assert.match(result, /src relay handshake/);
+      assert.match(result, /dst relay handshake/);
+      assert.deepStrictEqual(acquired, ["src", "dst"]);
+      assert.strictEqual(closeCalls, 2);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      manager.sftpStat = originalSftpStat;
+    }
+  });
+
+  it("should tear down both relay streams when the destination write fails", async () => {
+    manager.setConfig(
+      {
+        src: baseConfig({
+          name: "src",
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+        dst: baseConfig({
+          name: "dst",
+          host: "127.0.0.2",
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["src", "dst"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    const originalSftpStat = manager.sftpStat;
+    let readUnpipeCalls = 0;
+    let readDestroyCalls = 0;
+    let writeDestroyCalls = 0;
+
+    manager.acquireSshClient = async (key: string) => ({
+      client: { key },
+      close: () => {},
+    });
+    manager.sftpStat = async () => ({ size: 7 });
+    manager.openSftp = async (_client: unknown, label: string) => {
+      if (label === "source") {
+        return {
+          end: () => {},
+          createReadStream: () => {
+            const stream = new EventEmitter() as any;
+            stream.pipe = (dest: EventEmitter) => {
+              setImmediate(() => dest.emit("error", new Error("dest write failed")));
+              return dest;
+            };
+            stream.unpipe = () => {
+              readUnpipeCalls += 1;
+            };
+            stream.destroy = () => {
+              readDestroyCalls += 1;
+            };
+            return stream;
+          },
+        } as any;
+      }
+
+      return {
+        end: () => {},
+        createWriteStream: () => {
+          const stream = new EventEmitter() as any;
+          stream.destroy = () => {
+            writeDestroyCalls += 1;
+          };
+          return stream;
+        },
+      } as any;
+    };
+
+    try {
+      await assert.rejects(
+        () => manager.transferBetweenServers(
+          "src",
+          "/tmp/source.txt",
+          "dst",
+          "/tmp/dest.txt",
+          { skipIfIdentical: false },
+        ),
+        (error: unknown) => error instanceof ToolError && error.code === "SFTP_ERROR",
+      );
+      assert.strictEqual(readUnpipeCalls, 1);
+      assert.strictEqual(readDestroyCalls, 1);
+      assert.strictEqual(writeDestroyCalls, 1);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      manager.sftpStat = originalSftpStat;
+    }
+  });
+
+  it("should retry cached connections when exec channel opening never returns", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalEnsureConnected = manager.ensureConnected;
+    const originalReconnect = manager.reconnect;
+    const originalCreateLogWriter = manager.createLogWriter;
+    const originalSleep = manager.sleep;
+    let execCalls = 0;
+    let reconnectCalls = 0;
+
+    const fakeClient = {
+      exec: () => {
+        execCalls += 1;
+        // Simulate a stale ssh2 client whose channel-open callback never fires.
+      },
+    };
+
+    manager.ensureConnected = async () => fakeClient;
+    manager.reconnect = async () => {
+      reconnectCalls += 1;
+    };
+    manager.createLogWriter = () => null;
+    manager.sleep = async () => {};
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommand("pwd", "dev", { timeout: 1, maxRetries: 1 }),
+        (error: unknown) => error instanceof ToolError && error.code === "SSH_CONNECTION_FAILED",
+      );
+      assert.strictEqual(execCalls, 2);
+      assert.strictEqual(reconnectCalls, 1);
+    } finally {
+      manager.ensureConnected = originalEnsureConnected;
+      manager.reconnect = originalReconnect;
+      manager.createLogWriter = originalCreateLogWriter;
+      manager.sleep = originalSleep;
+    }
+  });
+
+  it("should close one-shot command connections when exec channel opening times out", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalCreateLogWriter = manager.createLogWriter;
+    let closeCalls = 0;
+    let execCalls = 0;
+
+    manager.connectCommandClient = async () => ({
+      client: {
+        exec: () => {
+          execCalls += 1;
+          // Simulate channel-open callback never firing.
+        },
+      } as any,
+      close: () => {
+        closeCalls += 1;
+      },
+    });
+    manager.createLogWriter = () => null;
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommand("pwd", "dev", {
+          timeout: 1,
+          maxRetries: 0,
+          reuseConnection: false,
+        }),
+        (error: unknown) => error instanceof ToolError && error.code === "SSH_CONNECTION_FAILED",
+      );
+      assert.strictEqual(execCalls, 1);
+      assert.strictEqual(closeCalls, 1);
+    } finally {
+      manager.connectCommandClient = originalConnectCommandClient;
+      manager.createLogWriter = originalCreateLogWriter;
+    }
+  });
+
+  it("should pass caller timeout through to exec channel opening without a 30s cap", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const observedDelays: number[] = [];
+    const fakeClient = {
+      exec: () => {
+        // Simulate channel-open callback never firing.
+      },
+    };
+
+    (globalThis as any).setTimeout = (
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      observedDelays.push(Number(delay));
+      return originalSetTimeout(callback, 0, ...args);
+    };
+
+    try {
+      await assert.rejects(
+        () => manager.runCommandStream("pwd", fakeClient, 60000, {}),
+        (error: unknown) => error instanceof ToolError && error.code === "SSH_CONNECTION_FAILED",
+      );
+      assert.strictEqual(observedDelays[0], 60000);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+  });
+
+  it("should fail immediately when the SSH client closes while opening an exec channel", async () => {
+    const fakeClient = new EventEmitter() as any;
+    let execCalls = 0;
+
+    fakeClient.exec = () => {
+      execCalls += 1;
+      setImmediate(() => fakeClient.emit("close"));
+    };
+
+    await assert.rejects(
+      () => manager.runCommandStream("pwd", fakeClient, 60000, {}),
+      (error: unknown) =>
+        error instanceof ToolError &&
+        error.code === "SSH_CONNECTION_FAILED" &&
+        /closed while opening command channel/.test(error.message),
+    );
+    assert.strictEqual(execCalls, 1);
+  });
+
+  it("should fail immediately when the SSH client closes while a command is running", async () => {
+    const fakeClient = new EventEmitter() as any;
+    const stream = new EventEmitter() as any;
+    stream.stderr = new EventEmitter();
+    stream.close = () => {};
+    let execCalls = 0;
+
+    fakeClient.exec = (_cmd: string, callback: (err: Error | undefined, stream: unknown) => void) => {
+      execCalls += 1;
+      callback(undefined, stream);
+      setImmediate(() => fakeClient.emit("close"));
+    };
+
+    await assert.rejects(
+      () => manager.runCommandStream("pwd", fakeClient, 60000, {}),
+      (error: unknown) =>
+        error instanceof ToolError &&
+        error.code === "SSH_CONNECTION_FAILED" &&
+        /closed while running command/.test(error.message),
+    );
+    assert.strictEqual(execCalls, 1);
+  });
+
+  it("should not reconnect cached clients when an opened remote command times out", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalEnsureConnected = manager.ensureConnected;
+    const originalReconnect = manager.reconnect;
+    const originalCreateLogWriter = manager.createLogWriter;
+    let execCalls = 0;
+    let signalCalls = 0;
+    let closeCalls = 0;
+    let reconnectCalls = 0;
+
+    const stream = new EventEmitter() as any;
+    stream.stderr = new EventEmitter();
+    stream.signal = () => {
+      signalCalls += 1;
+    };
+    stream.close = () => {
+      closeCalls += 1;
+      stream.emit("close", 0);
+    };
+
+    const fakeClient = {
+      exec: (_cmd: string, callback: (err: Error | undefined, stream: unknown) => void) => {
+        execCalls += 1;
+        callback(undefined, stream);
+      },
+    };
+
+    manager.ensureConnected = async () => fakeClient;
+    manager.reconnect = async () => {
+      reconnectCalls += 1;
+    };
+    manager.createLogWriter = () => null;
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommand("pwd", "dev", { timeout: 1, maxRetries: 2 }),
+        (error: unknown) => error instanceof ToolError && error.code === "COMMAND_TIMEOUT",
+      );
+      assert.strictEqual(execCalls, 1);
+      assert.strictEqual(signalCalls, 1);
+      assert.strictEqual(closeCalls, 1);
+      assert.strictEqual(reconnectCalls, 0);
+    } finally {
+      manager.ensureConnected = originalEnsureConnected;
+      manager.reconnect = originalReconnect;
+      manager.createLogWriter = originalCreateLogWriter;
+    }
+  });
+
+  it("should append bounded SSH debug output when vvv is enabled", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalEnsureConnected = manager.ensureConnected;
+    const originalCreateLogWriter = manager.createLogWriter;
+
+    const stream = new EventEmitter() as any;
+    stream.stderr = new EventEmitter();
+    stream.signal = () => {};
+    stream.close = () => {};
+
+    const fakeClient = {
+      exec: (_cmd: string, callback: (err: Error | undefined, stream: unknown) => void) => {
+        callback(undefined, stream);
+        setImmediate(() => stream.emit("close", 0));
+      },
+    };
+
+    manager.ensureConnected = async () => fakeClient;
+    manager.createLogWriter = () => null;
+
+    try {
+      const result = await manager.executeCommand("pwd", "dev", {
+        timeout: 100,
+        maxRetries: 0,
+        vvv: true,
+      });
+      assert.match(result, /\[SSH DEBUG\]/);
+      assert.match(result, /reuseConnection=true/);
+      assert.match(result, /exec channel opened/);
+    } finally {
+      manager.ensureConnected = originalEnsureConnected;
+      manager.createLogWriter = originalCreateLogWriter;
+    }
+  });
+
+  it("should close one-shot streaming command connections and append vvv debug output", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalRunCommandStream = manager.runCommandStream;
+    const originalCreateLogWriter = manager.createLogWriter;
+    let closeCalls = 0;
+    const progressChunks: string[] = [];
+
+    manager.connectCommandClient = async (_key: string, _timeout: number, debug?: (line: string) => void) => {
+      debug?.("[ssh2] fresh handshake");
+      return {
+        client: {} as any,
+        close: () => {
+          closeCalls += 1;
+        },
+      };
+    };
+    manager.createLogWriter = () => null;
+    manager.runCommandStream = async (
+      _cmd: string,
+      _client: unknown,
+      _timeout: number,
+      sinks: {
+        stdoutCollector?: { push(c: string): void };
+        onProgress?: (chunk: string) => void;
+        debug?: (line: string) => void;
+      },
+    ) => {
+      sinks.stdoutCollector?.push("ok");
+      sinks.onProgress?.("ok");
+      sinks.debug?.("[mcp] streaming runner debug");
+      return 0;
+    };
+
+    try {
+      const result = await manager.executeCommandWithProgress("pwd", "dev", {
+        timeout: 1,
+        maxRetries: 0,
+        reuseConnection: false,
+        vvv: true,
+        onProgress: (chunk: string) => progressChunks.push(chunk),
+      });
+      assert.match(result, /^ok/);
+      assert.match(result, /\[SSH DEBUG\]/);
+      assert.match(result, /streaming command attempt 1\/1/);
+      assert.match(result, /fresh handshake/);
+      assert.match(result, /streaming runner debug/);
+      assert.deepStrictEqual(progressChunks, ["ok"]);
+      assert.strictEqual(closeCalls, 1);
+    } finally {
+      manager.connectCommandClient = originalConnectCommandClient;
+      manager.runCommandStream = originalRunCommandStream;
+      manager.createLogWriter = originalCreateLogWriter;
+    }
+  });
+
+  it("should retry cached streaming connections when exec channel opening never returns", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalEnsureConnected = manager.ensureConnected;
+    const originalReconnect = manager.reconnect;
+    const originalCreateLogWriter = manager.createLogWriter;
+    const originalSleep = manager.sleep;
+    let execCalls = 0;
+    let reconnectCalls = 0;
+
+    const fakeClient = {
+      exec: () => {
+        execCalls += 1;
+        // Simulate a stale ssh2 client whose channel-open callback never fires.
+      },
+    };
+
+    manager.ensureConnected = async () => fakeClient;
+    manager.reconnect = async () => {
+      reconnectCalls += 1;
+    };
+    manager.sleep = async () => {};
+    manager.createLogWriter = () => null;
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommandWithProgress("pwd", "dev", { timeout: 1, maxRetries: 1 }),
+        (error: unknown) => error instanceof ToolError && error.code === "SSH_CONNECTION_FAILED",
+      );
+      assert.strictEqual(execCalls, 2);
+      assert.strictEqual(reconnectCalls, 1);
+    } finally {
+      manager.ensureConnected = originalEnsureConnected;
+      manager.reconnect = originalReconnect;
+      manager.createLogWriter = originalCreateLogWriter;
+      manager.sleep = originalSleep;
+    }
+  });
+
+  it("should close one-shot streaming command connections when exec channel opening times out", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalCreateLogWriter = manager.createLogWriter;
+    let closeCalls = 0;
+    let execCalls = 0;
+
+    manager.connectCommandClient = async () => ({
+      client: {
+        exec: () => {
+          execCalls += 1;
+          // Simulate channel-open callback never firing.
+        },
+      } as any,
+      close: () => {
+        closeCalls += 1;
+      },
+    });
+    manager.createLogWriter = () => null;
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommandWithProgress("pwd", "dev", {
+          timeout: 1,
+          maxRetries: 0,
+          reuseConnection: false,
+        }),
+        (error: unknown) => error instanceof ToolError && error.code === "SSH_CONNECTION_FAILED",
+      );
+      assert.strictEqual(execCalls, 1);
+      assert.strictEqual(closeCalls, 1);
+    } finally {
+      manager.connectCommandClient = originalConnectCommandClient;
+      manager.createLogWriter = originalCreateLogWriter;
+    }
+  });
+
+  it("should time out cached jump setup on the buffered default reuse path", async () => {
+    manager.setConfig(
+      {
+        bastion: baseConfig({ name: "bastion" }),
+        dev: baseConfig({
+          name: "dev",
+          jumpHost: "bastion",
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["bastion", "dev"],
+    );
+
+    const originalOpenJumpTunnel = manager.openJumpTunnel;
+    const originalRunCommandStream = manager.runCommandStream;
+    let observedTimeout: number | undefined;
+    let runCalls = 0;
+
+    manager.openJumpTunnel = async (
+      _targetKey: string,
+      _config: unknown,
+      _debug?: unknown,
+      timeout?: number,
+    ) => {
+      observedTimeout = timeout;
+      return new Promise(() => {});
+    };
+    manager.runCommandStream = async () => {
+      runCalls += 1;
+      return 0;
+    };
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommand("pwd", "dev", { timeout: 1, maxRetries: 0 }),
+        (error: unknown) =>
+          error instanceof ToolError &&
+          error.code === "SSH_CONNECTION_FAILED" &&
+          /jump tunnel.*timed out/.test(error.message),
+      );
+      assert.strictEqual(observedTimeout, 1);
+      assert.strictEqual(runCalls, 0);
+      assert.notStrictEqual(manager.connected.get("dev"), true);
+      assert.strictEqual(manager.clients.has("dev"), false);
+    } finally {
+      manager.openJumpTunnel = originalOpenJumpTunnel;
+      manager.runCommandStream = originalRunCommandStream;
+    }
+  });
+
+  it("should time out cached jump setup on the streaming default reuse path", async () => {
+    manager.setConfig(
+      {
+        bastion: baseConfig({ name: "bastion" }),
+        dev: baseConfig({
+          name: "dev",
+          jumpHost: "bastion",
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["bastion", "dev"],
+    );
+
+    const originalOpenJumpTunnel = manager.openJumpTunnel;
+    const originalRunCommandStream = manager.runCommandStream;
+    let observedTimeout: number | undefined;
+    let runCalls = 0;
+
+    manager.openJumpTunnel = async (
+      _targetKey: string,
+      _config: unknown,
+      _debug?: unknown,
+      timeout?: number,
+    ) => {
+      observedTimeout = timeout;
+      return new Promise(() => {});
+    };
+    manager.runCommandStream = async () => {
+      runCalls += 1;
+      return 0;
+    };
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommandWithProgress("pwd", "dev", { timeout: 1, maxRetries: 0 }),
+        (error: unknown) =>
+          error instanceof ToolError &&
+          error.code === "SSH_CONNECTION_FAILED" &&
+          /jump tunnel.*timed out/.test(error.message),
+      );
+      assert.strictEqual(observedTimeout, 1);
+      assert.strictEqual(runCalls, 0);
+      assert.notStrictEqual(manager.connected.get("dev"), true);
+      assert.strictEqual(manager.clients.has("dev"), false);
+    } finally {
+      manager.openJumpTunnel = originalOpenJumpTunnel;
+      manager.runCommandStream = originalRunCommandStream;
+    }
+  });
+
+  it("should time out cached SOCKS setup on the buffered default reuse path", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          socksProxy: "socks5://127.0.0.1:1080",
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalCreateConnection = SocksClient.createConnection;
+    const originalRunCommandStream = manager.runCommandStream;
+    let observedTimeout: number | undefined;
+    let runCalls = 0;
+
+    (SocksClient as any).createConnection = (options: { timeout?: number }) => {
+      observedTimeout = options.timeout;
+      return new Promise(() => {});
+    };
+    manager.runCommandStream = async () => {
+      runCalls += 1;
+      return 0;
+    };
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommand("pwd", "dev", { timeout: 1, maxRetries: 0 }),
+        (error: unknown) =>
+          error instanceof ToolError &&
+          error.code === "SSH_CONNECTION_FAILED" &&
+          /SOCKS proxy connection.*timed out/.test(error.message),
+      );
+      assert.strictEqual(observedTimeout, 1);
+      assert.strictEqual(runCalls, 0);
+      assert.notStrictEqual(manager.connected.get("dev"), true);
+      assert.strictEqual(manager.clients.has("dev"), false);
+    } finally {
+      (SocksClient as any).createConnection = originalCreateConnection;
+      manager.runCommandStream = originalRunCommandStream;
+    }
+  });
+
+  it("should time out cached SOCKS setup on the streaming default reuse path", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          socksProxy: "socks5://127.0.0.1:1080",
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalCreateConnection = SocksClient.createConnection;
+    const originalRunCommandStream = manager.runCommandStream;
+    let observedTimeout: number | undefined;
+    let runCalls = 0;
+
+    (SocksClient as any).createConnection = (options: { timeout?: number }) => {
+      observedTimeout = options.timeout;
+      return new Promise(() => {});
+    };
+    manager.runCommandStream = async () => {
+      runCalls += 1;
+      return 0;
+    };
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommandWithProgress("pwd", "dev", { timeout: 1, maxRetries: 0 }),
+        (error: unknown) =>
+          error instanceof ToolError &&
+          error.code === "SSH_CONNECTION_FAILED" &&
+          /SOCKS proxy connection.*timed out/.test(error.message),
+      );
+      assert.strictEqual(observedTimeout, 1);
+      assert.strictEqual(runCalls, 0);
+      assert.notStrictEqual(manager.connected.get("dev"), true);
+      assert.strictEqual(manager.clients.has("dev"), false);
+    } finally {
+      (SocksClient as any).createConnection = originalCreateConnection;
+      manager.runCommandStream = originalRunCommandStream;
+    }
+  });
+
+  it("should time out one-shot jump setup with the caller timeout", async () => {
+    manager.setConfig(
+      {
+        bastion: baseConfig({ name: "bastion" }),
+        dev: baseConfig({
+          name: "dev",
+          jumpHost: "bastion",
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["bastion", "dev"],
+    );
+
+    const originalOpenJumpTunnel = manager.openJumpTunnel;
+    const debugLines: string[] = [];
+    let observedTimeout: number | undefined;
+    let observedDebug = false;
+
+    manager.openJumpTunnel = async (
+      _targetKey: string,
+      _config: unknown,
+      debug?: (line: string) => void,
+      timeout?: number,
+    ) => {
+      observedTimeout = timeout;
+      observedDebug = Boolean(debug);
+      return new Promise(() => {});
+    };
+
+    try {
+      await assert.rejects(
+        () => manager.connectCommandClient("dev", 1, (line: string) => debugLines.push(line)),
+        (error: unknown) =>
+          error instanceof ToolError &&
+          error.code === "SSH_CONNECTION_FAILED" &&
+          /jump tunnel.*timed out/.test(error.message),
+      );
+      assert.strictEqual(observedTimeout, 1);
+      assert.strictEqual(observedDebug, true);
+      assert.ok(debugLines.some((line) => /jump tunnel.*timed out/.test(line)));
+    } finally {
+      manager.openJumpTunnel = originalOpenJumpTunnel;
+    }
+  });
+
+  it("should time out one-shot SOCKS setup with the caller timeout", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          socksProxy: "socks5://127.0.0.1:1080",
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalCreateConnection = SocksClient.createConnection;
+    const debugLines: string[] = [];
+    let observedTimeout: number | undefined;
+
+    (SocksClient as any).createConnection = (options: { timeout?: number }) => {
+      observedTimeout = options.timeout;
+      return new Promise(() => {});
+    };
+
+    try {
+      await assert.rejects(
+        () => manager.connectCommandClient("dev", 1, (line: string) => debugLines.push(line)),
+        (error: unknown) =>
+          error instanceof ToolError &&
+          error.code === "SSH_CONNECTION_FAILED" &&
+          /SOCKS proxy connection.*timed out/.test(error.message),
+      );
+      assert.strictEqual(observedTimeout, 1);
+      assert.ok(debugLines.some((line) => /SOCKS proxy connection.*timed out/.test(line)));
+    } finally {
+      (SocksClient as any).createConnection = originalCreateConnection;
+    }
+  });
+
+  it("should pass readyTimeout and vvv debug through jump-host clients", async () => {
+    const originalConnect = (Client.prototype as any).connect;
+    const debugLines: string[] = [];
+    let capturedReadyTimeout: number | undefined;
+
+    (Client.prototype as any).connect = function connect(config: {
+      readyTimeout?: number;
+      debug?: (line: string) => void;
+    }) {
+      capturedReadyTimeout = config.readyTimeout;
+      config.debug?.("jump handshake");
+      setImmediate(() => this.emit("ready"));
+      return this;
+    };
+
+    try {
+      const jumpClient = await manager.connectJumpClient(
+        "dev",
+        "bastion",
+        baseConfig({ name: "bastion" }),
+        undefined,
+        (line: string) => debugLines.push(line),
+        123,
+      );
+      assert.ok(jumpClient);
+      assert.strictEqual(capturedReadyTimeout, 123);
+      assert.deepStrictEqual(debugLines, ["[ssh2:bastion] jump handshake"]);
+    } finally {
+      (Client.prototype as any).connect = originalConnect;
+    }
+  });
+
+  it("should close cached targets that depend on a closed jump host", () => {
+    manager.setConfig(
+      {
+        scnet: baseConfig({ name: "scnet", host: "zzeshell.scnet.cn" }),
+        dcu: baseConfig({ name: "dcu", host: "e03r1n03", jumpHost: "scnet" }),
+        other: baseConfig({ name: "other", host: "127.0.0.2" }),
+      },
+      ["scnet", "dcu", "other"],
+    );
+
+    let scnetClosed = 0;
+    let dcuClosed = 0;
+    let jumpClosed = 0;
+    let otherClosed = 0;
+
+    manager.clients.set("scnet", { end: () => { scnetClosed += 1; } });
+    manager.clients.set("dcu", { end: () => { dcuClosed += 1; } });
+    manager.clients.set("other", { end: () => { otherClosed += 1; } });
+    manager.jumpClients.set("dcu", [{ end: () => { jumpClosed += 1; } }]);
+    manager.connected.set("scnet", true);
+    manager.connected.set("dcu", true);
+    manager.connected.set("other", true);
+
+    const result = manager.closeConnection("scnet");
+
+    assert.strictEqual(result.requested, "scnet");
+    assert.deepStrictEqual(new Set(result.closed), new Set(["scnet", "dcu"]));
+    assert.strictEqual(scnetClosed, 1);
+    assert.strictEqual(dcuClosed, 1);
+    assert.strictEqual(jumpClosed, 1);
+    assert.strictEqual(otherClosed, 0);
+    assert.strictEqual(manager.clients.has("scnet"), false);
+    assert.strictEqual(manager.clients.has("dcu"), false);
+    assert.strictEqual(manager.clients.has("other"), true);
+    assert.strictEqual(manager.connected.get("scnet"), false);
+    assert.strictEqual(manager.connected.get("dcu"), false);
+    assert.strictEqual(manager.connected.get("other"), true);
   });
 
   it("should pre-connect only enabled servers", async () => {

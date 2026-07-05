@@ -63,13 +63,31 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
           "Relay: size match + md5sum match on both servers (when available); falls back to transferring if md5sum is missing on either side. " +
           "Download is never skipped. Set to false to force the transfer.",
       ),
+      reuseConnection: z.boolean().optional().describe(
+        "Default true. Reuse cached SSH connection(s) for SFTP. Set false after a timeout or suspected stale cached connection to force fresh TCP/SSH connection(s) for this transfer; fresh connections close afterwards.",
+      ),
+      timeout: z.number().positive().optional().describe(
+        "Timeout in ms for SSH setup and SFTP channel opening. Transfer stream duration itself is not forcibly interrupted by this option.",
+      ),
+      vvv: z.boolean().optional().describe(
+        "Default false. Append bounded SSH/SFTP debug output for single-file and relay results, and for recursive errors. For fresh ssh2 handshake logs, also set reuseConnection=false.",
+      ),
+      fast: z.boolean().optional().describe(
+        "Default false. Upload/download only: use ssh2 fastPut/fastGet for single files, with parallel SFTP chunks for better throughput. Relay mode keeps the streaming pipe path.",
+      ),
+      sftpConcurrency: z.number().int().positive().optional().describe(
+        "Only used when fast=true for upload/download. Number of concurrent SFTP chunks; omitted uses ssh2's default.",
+      ),
+      chunkSize: z.number().int().positive().optional().describe(
+        "Only used when fast=true for upload/download. Chunk size in bytes; omitted uses ssh2's default.",
+      ),
     },
     async (params) => {
       try {
         const { mode } = params;
 
         if (mode === "relay") {
-          const { sourceServer, sourceRemotePath, destServer, destRemotePath, skipIfIdentical } = params;
+          const { sourceServer, sourceRemotePath, destServer, destRemotePath, skipIfIdentical, reuseConnection, timeout, vvv } = params;
           if (!sourceServer || !sourceRemotePath || !destServer || !destRemotePath) {
             return {
               content: [{ type: "text", text: "relay mode requires: sourceServer, sourceRemotePath, destServer, destRemotePath" }],
@@ -78,13 +96,13 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
           }
           const result = await sshManager.transferBetweenServers(
             sourceServer, sourceRemotePath, destServer, destRemotePath,
-            { skipIfIdentical: skipIfIdentical !== false },
+            { skipIfIdentical: skipIfIdentical !== false, reuseConnection, timeout, vvv },
           );
           return { content: [{ type: "text", text: result }] };
         }
 
         // upload or download
-        const { localPath, remotePath, connectionName, recursive, skipIfIdentical } = params;
+        const { localPath, remotePath, connectionName, recursive, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize } = params;
         if (!localPath || !remotePath) {
           return {
             content: [{ type: "text", text: `${mode} mode requires: localPath, remotePath` }],
@@ -93,14 +111,15 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         }
 
         const resolvedName = sshManager.resolveServer(connectionName);
-        const uploadOptions = { skipIfIdentical: skipIfIdentical !== false };
+        const sftpOptions = { reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize };
+        const uploadOptions = { skipIfIdentical: skipIfIdentical !== false, ...sftpOptions };
 
         if (recursive) {
           let files: string[];
           if (mode === "upload") {
             files = await sshManager.uploadDirectory(localPath, remotePath, resolvedName, uploadOptions);
           } else {
-            files = await sshManager.downloadDirectory(remotePath, localPath, resolvedName);
+            files = await sshManager.downloadDirectory(remotePath, localPath, resolvedName, sftpOptions);
           }
           const summary = `Recursive ${mode} complete. ${files.length} file(s) transferred.`;
           return {
@@ -113,7 +132,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
           const result = await sshManager.upload(localPath, remotePath, resolvedName, uploadOptions);
           return { content: [{ type: "text", text: result }] };
         } else {
-          const result = await sshManager.download(remotePath, localPath, resolvedName);
+          const result = await sshManager.download(remotePath, localPath, resolvedName, sftpOptions);
           return { content: [{ type: "text", text: result }] };
         }
       } catch (error: unknown) {

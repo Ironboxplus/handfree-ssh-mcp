@@ -23,7 +23,16 @@ Parameters:
   connectionName  (string, see below)  Target server name from list-servers.
   stream          (boolean, optional)  Default true. Set false for short
                   commands when you only need the final output.
-  timeout         (number, optional)   Max runtime in ms.
+  reuseConnection (boolean, optional)  Default true. Set false after a timeout
+                  or suspected stale cached SSH connection to force a fresh
+                  TCP/SSH connection for this command.
+  vvv             (boolean, optional)  Default false. Append bounded
+                  SSH/channel debug output. Use with reuseConnection=false
+                  when you need fresh handshake logs.
+  timeout         (number, optional)   Per-attempt phase timeout in ms:
+                                      SSH setup, exec-channel open, and
+                                      remote command execution each use this
+                                      cap.
                   Defaults: 300000 (stream) / 30000 (non-stream).
 
 connectionName rule:
@@ -33,7 +42,9 @@ connectionName rule:
 Examples:
   execute-command { cmdString: "pwd" }
   execute-command { cmdString: "docker ps -a", connectionName: "prod", stream: false }
-  execute-command { cmdString: "tail -f /var/log/syslog", stream: true, timeout: 600000 }`,
+  execute-command { cmdString: "tail -f /var/log/syslog", stream: true, timeout: 600000 }
+  execute-command { cmdString: "hostname", connectionName: "scnet", stream: false, reuseConnection: false }
+  execute-command { cmdString: "hostname", connectionName: "scnet", stream: false, reuseConnection: false, vvv: true }`,
 
   "show-whitelist": `show-whitelist — Show the active command policy for a server.
 
@@ -46,6 +57,25 @@ connectionName rule:
 
 Returns: Command mode, built-in blacklist, configured whitelist/blacklist patterns, and example commands when whitelist mode is active.`,
 
+  "close-connection": `close-connection — Close a cached SSH connection.
+
+Parameters:
+  connectionName  (string, see below)  Target server name from list-servers.
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Behavior:
+  • Closes the cached/reused SSH client for the target server.
+  • Closing a jump host also closes cached targets whose jump chain uses it.
+  • Does not affect reuseConnection=false commands, because those one-shot
+    connections already close after each command.
+
+Examples:
+  close-connection { connectionName: "scnet" }
+  close-connection { connectionName: "dcu" }`,
+
   "upload": `upload — Upload a single local file to a remote server over SFTP.
 
 Parameters:
@@ -53,13 +83,26 @@ Parameters:
                   Must be inside the MCP working directory.
   remotePath      (string, required)   Destination path on the remote server.
   connectionName  (string, see below)  Target server name from list-servers.
+  skipIfIdentical (boolean, optional)  Default true. Skip when remote matches.
+  reuseConnection (boolean, optional)  Default true. Set false after timeout
+                  or suspected stale cached SSH connection.
+  timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
+  vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
+                  Recursive success returns structured JSON; debug is surfaced
+                  for single-file results, relay results, and recursive errors.
+  fast            (boolean, optional)  Default false. Use ssh2 fastPut for
+                  single-file upload throughput. Not multi-file concurrency.
+  sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
+  chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
   • If multiple servers are enabled → REQUIRED.
 
 Example:
-  upload { localPath: "data.csv", remotePath: "/tmp/data.csv" }`,
+  upload { localPath: "data.csv", remotePath: "/tmp/data.csv" }
+  upload { localPath: "big.bin", remotePath: "/tmp/big.bin", fast: true,
+           sftpConcurrency: 32, chunkSize: 131072 }`,
 
   "download": `download — Download a single file from a remote server over SFTP.
 
@@ -68,13 +111,23 @@ Parameters:
   localPath       (string, required)   Destination on the MCP host.
                   Must be inside the MCP working directory.
   connectionName  (string, see below)  Target server name from list-servers.
+  reuseConnection (boolean, optional)  Default true. Set false after timeout
+                  or suspected stale cached SSH connection.
+  timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
+  vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
+  fast            (boolean, optional)  Default false. Use ssh2 fastGet for
+                  single-file download throughput. Not multi-file concurrency.
+  sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
+  chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
   • If multiple servers are enabled → REQUIRED.
 
 Example:
-  download { remotePath: "/var/log/app.log", localPath: "app.log" }`,
+  download { remotePath: "/var/log/app.log", localPath: "app.log" }
+  download { remotePath: "/tmp/big.bin", localPath: "big.bin", fast: true,
+             sftpConcurrency: 32, chunkSize: 131072 }`,
 
   "transfer": `transfer — Move files between hosts (single/recursive/cross-server).
 
@@ -92,6 +145,14 @@ Parameters for upload / download:
   remotePath      (string, required)   Path on the remote server.
   connectionName  (string, see below)  Target server name.
   recursive       (boolean, optional)  True to transfer a whole directory tree.
+  reuseConnection (boolean, optional)  Default true. Set false after timeout.
+  timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
+  vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
+  fast            (boolean, optional)  Default false. upload/download only:
+                  use ssh2 fastPut/fastGet for each single file. Directory
+                  recursion stays sequential; no multi-file concurrency.
+  sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
+  chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
 
 Parameters for relay:
   mode              (string, required)   "relay"
@@ -99,6 +160,11 @@ Parameters for relay:
   sourceRemotePath  (string, required)   File path on source server.
   destServer        (string, required)   Server name to write to.
   destRemotePath    (string, required)   File path on dest server.
+  reuseConnection   (boolean, optional)  Default true. Set false after timeout.
+  timeout           (number, optional)   SSH setup and SFTP channel-open timeout.
+  vvv               (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
+  fast              (boolean, optional)  Accepted but relay keeps the streaming
+                    SFTP pipe path; fastGet/fastPut apply to host<->remote only.
 
 connectionName rule (upload/download):
   • If only one server is enabled → optional.
@@ -125,6 +191,7 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   list-servers      Discover available SSH servers and their status.
   execute-command   Run a shell command on a remote server.
   show-whitelist    Show the active command policy.
+  close-connection  Close a cached SSH connection for a server.
   upload            Upload a single file to a remote server.
   download          Download a single file from a remote server.
   transfer          Move files: single, recursive, or cross-server relay.
@@ -133,7 +200,8 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
 Quick start:
   1. list-servers → discover server names
   2. show-whitelist { connectionName: "<name>" } → inspect command policy
-  3. execute-command { cmdString: "pwd", connectionName: "<name>" }`;
+  3. execute-command { cmdString: "pwd", connectionName: "<name>" }
+  4. close-connection { connectionName: "<name>" } → drop a stale cached SSH client`;
 
 /**
  * Register help tool

@@ -7,11 +7,19 @@
 
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert";
+import { z } from "zod";
 import {
   BUILT_IN_COMMAND_BLACKLIST,
   BUILT_IN_DESTRUCTIVE_GUARDS,
+  SSHConnectionManager,
 } from "../services/ssh-connection-manager.js";
+import { registerCloseConnectionTool } from "../tools/close-connection.js";
+import { registerDownloadTool } from "../tools/download.js";
+import { registerExecuteCommandTool } from "../tools/execute-command.js";
+import { registerTransferTool } from "../tools/transfer.js";
+import { registerUploadTool } from "../tools/upload.js";
 import { formatCommandPolicy } from "../tools/show-whitelist.js";
+import { ToolError } from "../utils/tool-error.js";
 
 /**
  * Mock SSHConnectionManager for testing tools without real SSH connections
@@ -104,6 +112,25 @@ class MockSSHConnectionManager {
   disconnect(): void {
     // No-op for mock
   }
+}
+
+function captureRegisteredTools(): {
+  server: { tool: (...args: any[]) => void };
+  handlers: Map<string, (args: any, extra?: any) => Promise<any>>;
+  schemas: Map<string, Record<string, unknown>>;
+} {
+  const handlers = new Map<string, (args: any, extra?: any) => Promise<any>>();
+  const schemas = new Map<string, Record<string, unknown>>();
+  return {
+    handlers,
+    schemas,
+    server: {
+      tool(name: string, _description: string, schema: Record<string, unknown>, handler: (args: any, extra?: any) => Promise<any>) {
+        handlers.set(name, handler);
+        schemas.set(name, schema);
+      },
+    },
+  };
 }
 
 // ============================================
@@ -406,6 +433,411 @@ describe("execute-command Streaming Mode", () => {
       () => mockManager.executeCommandWithProgress("pwd", "prod"),
       /not enabled/
     );
+  });
+});
+
+describe("MCP tool handlers", () => {
+  const manager = SSHConnectionManager.getInstance() as any;
+
+  afterEach(() => {
+    manager.disconnect();
+    manager.setConfig({}, undefined);
+  });
+
+  it("should forward reuseConnection and vvv on the default streaming execute-command path", async () => {
+    const originalResolveServer = manager.resolveServer;
+    const originalExecuteCommandWithProgress = manager.executeCommandWithProgress;
+    const { server, handlers } = captureRegisteredTools();
+    let captured: any;
+
+    manager.resolveServer = (name?: string) => name ?? "dev";
+    manager.executeCommandWithProgress = async (cmdString: string, connectionName: string, options: any) => {
+      captured = { cmdString, connectionName, options };
+      return "ok";
+    };
+
+    try {
+      registerExecuteCommandTool(server as any);
+      const handler = handlers.get("execute-command");
+      assert.ok(handler, "execute-command handler should be registered");
+
+      const result = await handler(
+        {
+          cmdString: "pwd",
+          connectionName: "dev",
+          timeout: 123,
+          reuseConnection: false,
+          vvv: true,
+          maxOutputBytes: 456,
+        },
+        { _meta: {}, sendNotification: () => {} },
+      );
+
+      assert.deepStrictEqual(result, { content: [{ type: "text", text: "ok" }] });
+      assert.strictEqual(captured.cmdString, "pwd");
+      assert.strictEqual(captured.connectionName, "dev");
+      assert.strictEqual(captured.options.timeout, 123);
+      assert.strictEqual(captured.options.reuseConnection, false);
+      assert.strictEqual(captured.options.vvv, true);
+      assert.strictEqual(captured.options.maxOutputBytes, 456);
+      assert.strictEqual(captured.options.onProgress, undefined);
+    } finally {
+      manager.resolveServer = originalResolveServer;
+      manager.executeCommandWithProgress = originalExecuteCommandWithProgress;
+    }
+  });
+
+  it("should forward reuseConnection and vvv on the non-streaming execute-command path", async () => {
+    const originalResolveServer = manager.resolveServer;
+    const originalExecuteCommand = manager.executeCommand;
+    const { server, handlers } = captureRegisteredTools();
+    let captured: any;
+
+    manager.resolveServer = (name?: string) => name ?? "dev";
+    manager.executeCommand = async (cmdString: string, connectionName: string, options: any) => {
+      captured = { cmdString, connectionName, options };
+      return "ok";
+    };
+
+    try {
+      registerExecuteCommandTool(server as any);
+      const handler = handlers.get("execute-command");
+      assert.ok(handler, "execute-command handler should be registered");
+
+      const result = await handler(
+        {
+          cmdString: "pwd",
+          connectionName: "dev",
+          stream: false,
+          timeout: 123,
+          reuseConnection: false,
+          vvv: true,
+          maxOutputBytes: 456,
+        },
+        { _meta: {}, sendNotification: () => {} },
+      );
+
+      assert.deepStrictEqual(result, { content: [{ type: "text", text: "ok" }] });
+      assert.strictEqual(captured.cmdString, "pwd");
+      assert.strictEqual(captured.connectionName, "dev");
+      assert.strictEqual(captured.options.timeout, 123);
+      assert.strictEqual(captured.options.reuseConnection, false);
+      assert.strictEqual(captured.options.vvv, true);
+      assert.strictEqual(captured.options.maxOutputBytes, 456);
+    } finally {
+      manager.resolveServer = originalResolveServer;
+      manager.executeCommand = originalExecuteCommand;
+    }
+  });
+
+  it("should reject a non-positive timeout in the execute-command schema", () => {
+    const { server, schemas } = captureRegisteredTools();
+    registerExecuteCommandTool(server as any);
+    const schema = schemas.get("execute-command");
+    assert.ok(schema, "execute-command schema should be captured");
+
+    const shape = z.object(schema as z.ZodRawShape);
+    // A negative timeout must be rejected at the schema boundary, matching
+    // upload/download/transfer which already use z.number().positive().
+    assert.strictEqual(
+      shape.safeParse({ cmdString: "pwd", timeout: -1 }).success,
+      false,
+      "negative timeout must be rejected by the execute-command schema",
+    );
+    assert.strictEqual(
+      shape.safeParse({ cmdString: "pwd", timeout: 0 }).success,
+      false,
+      "zero timeout must be rejected by the execute-command schema",
+    );
+    // A valid positive timeout must still pass.
+    assert.strictEqual(
+      shape.safeParse({ cmdString: "pwd", timeout: 5000 }).success,
+      true,
+      "positive timeout must still be accepted",
+    );
+  });
+
+  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on upload", async () => {
+    const originalResolveServer = manager.resolveServer;
+    const originalUpload = manager.upload;
+    const { server, handlers } = captureRegisteredTools();
+    let captured: any;
+
+    manager.resolveServer = (name?: string) => name ?? "dev";
+    manager.upload = async (localPath: string, remotePath: string, connectionName: string, options: any) => {
+      captured = { localPath, remotePath, connectionName, options };
+      return "uploaded";
+    };
+
+    try {
+      registerUploadTool(server as any);
+      const handler = handlers.get("upload");
+      assert.ok(handler, "upload handler should be registered");
+
+      const result = await handler({
+        localPath: "local.txt",
+        remotePath: "/tmp/local.txt",
+        connectionName: "dev",
+        skipIfIdentical: false,
+        reuseConnection: false,
+        timeout: 123,
+        vvv: true,
+        fast: true,
+        sftpConcurrency: 8,
+        chunkSize: 65536,
+      });
+
+      assert.deepStrictEqual(result, { content: [{ type: "text", text: "uploaded" }] });
+      assert.strictEqual(captured.localPath, "local.txt");
+      assert.strictEqual(captured.remotePath, "/tmp/local.txt");
+      assert.strictEqual(captured.connectionName, "dev");
+      assert.deepStrictEqual(captured.options, {
+        skipIfIdentical: false,
+        reuseConnection: false,
+        timeout: 123,
+        vvv: true,
+        fast: true,
+        sftpConcurrency: 8,
+        chunkSize: 65536,
+      });
+    } finally {
+      manager.resolveServer = originalResolveServer;
+      manager.upload = originalUpload;
+    }
+  });
+
+  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on download", async () => {
+    const originalResolveServer = manager.resolveServer;
+    const originalDownload = manager.download;
+    const { server, handlers } = captureRegisteredTools();
+    let captured: any;
+
+    manager.resolveServer = (name?: string) => name ?? "dev";
+    manager.download = async (remotePath: string, localPath: string, connectionName: string, options: any) => {
+      captured = { remotePath, localPath, connectionName, options };
+      return "downloaded";
+    };
+
+    try {
+      registerDownloadTool(server as any);
+      const handler = handlers.get("download");
+      assert.ok(handler, "download handler should be registered");
+
+      const result = await handler({
+        remotePath: "/tmp/remote.txt",
+        localPath: "remote.txt",
+        connectionName: "dev",
+        reuseConnection: false,
+        timeout: 123,
+        vvv: true,
+        fast: true,
+        sftpConcurrency: 4,
+        chunkSize: 131072,
+      });
+
+      assert.deepStrictEqual(result, { content: [{ type: "text", text: "downloaded" }] });
+      assert.strictEqual(captured.remotePath, "/tmp/remote.txt");
+      assert.strictEqual(captured.localPath, "remote.txt");
+      assert.strictEqual(captured.connectionName, "dev");
+      assert.deepStrictEqual(captured.options, {
+        reuseConnection: false,
+        timeout: 123,
+        vvv: true,
+        fast: true,
+        sftpConcurrency: 4,
+        chunkSize: 131072,
+      });
+    } finally {
+      manager.resolveServer = originalResolveServer;
+      manager.download = originalDownload;
+    }
+  });
+
+  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on transfer upload/download modes", async () => {
+    const originalResolveServer = manager.resolveServer;
+    const originalUpload = manager.upload;
+    const originalDownload = manager.download;
+    const { server, handlers } = captureRegisteredTools();
+    const captured: any[] = [];
+
+    manager.resolveServer = (name?: string) => name ?? "dev";
+    manager.upload = async (localPath: string, remotePath: string, connectionName: string, options: any) => {
+      captured.push({ kind: "upload", localPath, remotePath, connectionName, options });
+      return "uploaded";
+    };
+    manager.download = async (remotePath: string, localPath: string, connectionName: string, options: any) => {
+      captured.push({ kind: "download", remotePath, localPath, connectionName, options });
+      return "downloaded";
+    };
+
+    try {
+      registerTransferTool(server as any);
+      const handler = handlers.get("transfer");
+      assert.ok(handler, "transfer handler should be registered");
+
+      await handler({
+        mode: "upload",
+        localPath: "local.txt",
+        remotePath: "/tmp/local.txt",
+        connectionName: "dev",
+        skipIfIdentical: false,
+        reuseConnection: false,
+        timeout: 123,
+        vvv: true,
+        fast: true,
+        sftpConcurrency: 8,
+        chunkSize: 65536,
+      });
+      await handler({
+        mode: "download",
+        localPath: "remote.txt",
+        remotePath: "/tmp/remote.txt",
+        connectionName: "dev",
+        reuseConnection: false,
+        timeout: 456,
+        vvv: true,
+        fast: true,
+        sftpConcurrency: 4,
+        chunkSize: 131072,
+      });
+
+      assert.deepStrictEqual(captured, [
+        {
+          kind: "upload",
+          localPath: "local.txt",
+          remotePath: "/tmp/local.txt",
+          connectionName: "dev",
+          options: {
+            skipIfIdentical: false,
+            reuseConnection: false,
+            timeout: 123,
+            vvv: true,
+            fast: true,
+            sftpConcurrency: 8,
+            chunkSize: 65536,
+          },
+        },
+        {
+          kind: "download",
+          remotePath: "/tmp/remote.txt",
+          localPath: "remote.txt",
+          connectionName: "dev",
+          options: {
+            reuseConnection: false,
+            timeout: 456,
+            vvv: true,
+            fast: true,
+            sftpConcurrency: 4,
+            chunkSize: 131072,
+          },
+        },
+      ]);
+    } finally {
+      manager.resolveServer = originalResolveServer;
+      manager.upload = originalUpload;
+      manager.download = originalDownload;
+    }
+  });
+
+  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on transfer relay mode", async () => {
+    const originalTransferBetweenServers = manager.transferBetweenServers;
+    const { server, handlers } = captureRegisteredTools();
+    let captured: any;
+
+    manager.transferBetweenServers = async (
+      sourceServer: string,
+      sourceRemotePath: string,
+      destServer: string,
+      destRemotePath: string,
+      options: any,
+    ) => {
+      captured = { sourceServer, sourceRemotePath, destServer, destRemotePath, options };
+      return "relayed";
+    };
+
+    try {
+      registerTransferTool(server as any);
+      const handler = handlers.get("transfer");
+      assert.ok(handler, "transfer handler should be registered");
+
+      const result = await handler({
+        mode: "relay",
+        sourceServer: "src",
+        sourceRemotePath: "/tmp/source.txt",
+        destServer: "dst",
+        destRemotePath: "/tmp/dest.txt",
+        skipIfIdentical: false,
+        reuseConnection: false,
+        timeout: 123,
+        vvv: true,
+        fast: true,
+        sftpConcurrency: 2,
+        chunkSize: 32768,
+      });
+
+      assert.deepStrictEqual(result, { content: [{ type: "text", text: "relayed" }] });
+      assert.deepStrictEqual(captured, {
+        sourceServer: "src",
+        sourceRemotePath: "/tmp/source.txt",
+        destServer: "dst",
+        destRemotePath: "/tmp/dest.txt",
+        options: {
+          skipIfIdentical: false,
+          reuseConnection: false,
+          timeout: 123,
+          vvv: true,
+        },
+      });
+    } finally {
+      manager.transferBetweenServers = originalTransferBetweenServers;
+    }
+  });
+
+  it("should return a JSON success envelope from close-connection", async () => {
+    const originalCloseConnection = manager.closeConnection;
+    const { server, handlers } = captureRegisteredTools();
+
+    manager.closeConnection = (connectionName?: string) => ({
+      requested: connectionName ?? "dev",
+      closed: [connectionName ?? "dev"],
+    });
+
+    try {
+      registerCloseConnectionTool(server as any);
+      const handler = handlers.get("close-connection");
+      assert.ok(handler, "close-connection handler should be registered");
+
+      const result = await handler({ connectionName: "dev" });
+      assert.strictEqual(result.isError, undefined);
+      assert.deepStrictEqual(
+        JSON.parse(result.content[0].text),
+        { requested: "dev", closed: ["dev"] },
+      );
+    } finally {
+      manager.closeConnection = originalCloseConnection;
+    }
+  });
+
+  it("should return a structured error envelope from close-connection failures", async () => {
+    const originalCloseConnection = manager.closeConnection;
+    const { server, handlers } = captureRegisteredTools();
+
+    manager.closeConnection = () => {
+      throw new ToolError("INVALID_CONFIGURATION", "missing server", false);
+    };
+
+    try {
+      registerCloseConnectionTool(server as any);
+      const handler = handlers.get("close-connection");
+      assert.ok(handler, "close-connection handler should be registered");
+
+      const result = await handler({ connectionName: "missing" });
+      assert.strictEqual(result.isError, true);
+      assert.match(result.content[0].text, /INVALID_CONFIGURATION/);
+      assert.match(result.content[0].text, /missing server/);
+    } finally {
+      manager.closeConnection = originalCloseConnection;
+    }
   });
 });
 
