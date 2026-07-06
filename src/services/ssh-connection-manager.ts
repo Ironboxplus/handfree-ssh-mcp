@@ -482,6 +482,11 @@ export class SSHConnectionManager {
       if (connectTimeout) {
         sshConfig.readyTimeout = connectTimeout;
       }
+      // Keepalive on the long-lived cached connection: ssh2 probes the peer so a
+      // silently-dead connection surfaces as a close/error event (flipping the
+      // connected flag) and self-heals on the next reuse, instead of only being
+      // discovered when a later command hangs opening a channel.
+      Object.assign(sshConfig, this.resolveKeepalive(config));
       const agent = config.agent === false
         ? undefined
         : config.agent || (config.identitiesOnly ? undefined : process.env.SSH_AUTH_SOCK);
@@ -945,6 +950,50 @@ export class SSHConnectionManager {
     });
   }
 
+  /** Default ssh2 keepalive probe interval (ms) when a server doesn't set one. */
+  private static readonly DEFAULT_KEEPALIVE_INTERVAL_MS = 15_000;
+  /** Default max unanswered keepalive probes before ssh2 declares death. */
+  private static readonly DEFAULT_KEEPALIVE_COUNT_MAX = 3;
+  /** Default short timeout (ms) for the exec-channel-OPEN phase. */
+  private static readonly DEFAULT_CHANNEL_OPEN_TIMEOUT_MS = 10_000;
+
+  /**
+   * Resolve ssh2 keepalive options for a server. Keepalive is ON by default so a
+   * silently-dead cached connection is detected proactively; a server can tune
+   * the interval/count or disable it entirely with keepaliveInterval <= 0.
+   * Returns an empty object when disabled (no keepalive keys on the ssh config).
+   */
+  private resolveKeepalive(config: SSHConfig): {
+    keepaliveInterval?: number;
+    keepaliveCountMax?: number;
+  } {
+    const interval =
+      typeof config.keepaliveInterval === "number" && Number.isFinite(config.keepaliveInterval)
+        ? config.keepaliveInterval
+        : SSHConnectionManager.DEFAULT_KEEPALIVE_INTERVAL_MS;
+    if (interval <= 0) {
+      return {}; // Explicitly disabled.
+    }
+    const countMax =
+      typeof config.keepaliveCountMax === "number" &&
+      Number.isFinite(config.keepaliveCountMax) &&
+      config.keepaliveCountMax > 0
+        ? config.keepaliveCountMax
+        : SSHConnectionManager.DEFAULT_KEEPALIVE_COUNT_MAX;
+    return { keepaliveInterval: interval, keepaliveCountMax: countMax };
+  }
+
+  /**
+   * Resolve the short exec-channel-open timeout (ms) for a server. Kept separate
+   * from the command run timeout so a dead reused connection fails fast on open.
+   */
+  private resolveChannelOpenTimeout(config: SSHConfig): number {
+    const t = config.channelOpenTimeout;
+    return typeof t === "number" && Number.isFinite(t) && t > 0
+      ? t
+      : SSHConnectionManager.DEFAULT_CHANNEL_OPEN_TIMEOUT_MS;
+  }
+
   private normalizeConnectTimeout(timeout?: number): number | undefined {
     if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) {
       return undefined;
@@ -1020,6 +1069,81 @@ export class SSHConnectionManager {
         },
       );
     });
+  }
+
+  /**
+   * Default inactivity window (ms) for SFTP data transfers when the caller does
+   * not pass an explicit timeout. Deliberately generous: a healthy transfer
+   * moves bytes far more often than this, so tripping it means the connection
+   * is effectively dead, not merely slow.
+   */
+  private static readonly DEFAULT_TRANSFER_STALL_TIMEOUT_MS = 60_000;
+
+  /** Chunk size for buffered SFTP writes, sized to yield per-ack progress. */
+  private static readonly SFTP_WRITE_CHUNK_BYTES = 256 * 1024;
+
+  /**
+   * Resolve the inactivity window for a data transfer: the caller's timeout if
+   * valid, otherwise the generous default so a dead connection never hangs.
+   */
+  private transferStallTimeout(timeout?: number): number {
+    return (
+      this.normalizeConnectTimeout(timeout) ??
+      SSHConnectionManager.DEFAULT_TRANSFER_STALL_TIMEOUT_MS
+    );
+  }
+
+  /**
+   * Pipe a readable into a writable under the inactivity watchdog, aborting if
+   * no bytes flow for the stall window. Used by the non-fast download and relay
+   * paths, which otherwise settle only on close/finish/error and so hang on a
+   * dead reused connection. Read-side `data` events drive progress; the caller
+   * supplies error mappers so each path keeps its own error code/message.
+   */
+  private pipeWithInactivityTimeout(
+    readStream: NodeJS.ReadableStream,
+    writeStream: NodeJS.WritableStream,
+    timeoutMs: number | undefined,
+    description: string,
+    debug: SshDebugSink | undefined,
+    mapReadError: (e: Error) => Error,
+    mapWriteError: (e: Error) => Error,
+  ): Promise<void> {
+    const teardown = () => {
+      this.unpipeStream(readStream, writeStream);
+      this.destroyStream(readStream);
+      this.destroyStream(writeStream);
+    };
+    return this.runWithInactivityTimeout<void>(
+      (onProgress) =>
+        new Promise<void>((resolve, reject) => {
+          let settled = false;
+          const settle = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+            if (err) {
+              teardown();
+              reject(err);
+            } else {
+              resolve();
+            }
+          };
+
+          readStream.on("data", () => onProgress());
+          // Resolve on whichever completion event the write side emits: local fs
+          // writables emit "finish", SFTP writables emit "close".
+          writeStream.on("finish", () => settle());
+          writeStream.on("close", () => settle());
+          writeStream.on("error", (err: Error) => settle(mapWriteError(err)));
+          readStream.on("error", (err: Error) => settle(mapReadError(err)));
+
+          readStream.pipe(writeStream);
+        }),
+      timeoutMs,
+      description,
+      debug,
+      teardown,
+    );
   }
 
   /**
@@ -1165,6 +1289,9 @@ export class SSHConnectionManager {
         port: jumpConfig.port,
         username: jumpConfig.username,
       };
+      // Keepalive on the long-lived jump hop too, so a dead bastion is detected
+      // proactively and tears down the target chain instead of hanging later.
+      Object.assign(jumpSsh, this.resolveKeepalive(jumpConfig));
       if (sock) {
         jumpSsh.sock = sock;
       }
@@ -1690,6 +1817,12 @@ export class SSHConnectionManager {
       logWriter?: OutputLogWriter;
       onProgress?: (chunk: string) => void;
       debug?: SshDebugSink;
+      // Short timeout (ms) for the exec-channel-OPEN phase only. Falls back to
+      // the command timeout when unset. A dead reused connection can accept but
+      // never open a channel; this bounds that hang so the caller can drop the
+      // stale client and retry with a fresh one instead of waiting the full
+      // command timeout.
+      channelOpenTimeout?: number;
     }
   ): Promise<number | null> {
     return new Promise<number | null>((resolve, reject) => {
@@ -1769,7 +1902,15 @@ export class SSHConnectionManager {
       };
 
       const armExecOpenTimeout = () => {
-        const execOpenTimeout = Math.max(1, timeout);
+        // Bound the channel-OPEN phase by the short channel-open timeout (not the
+        // full command timeout): a reused-but-dead connection can accept yet never
+        // open a channel, and waiting the whole command timeout is the 300s hang.
+        const execOpenTimeout = Math.max(
+          1,
+          sinks.channelOpenTimeout && sinks.channelOpenTimeout > 0
+            ? Math.min(sinks.channelOpenTimeout, timeout)
+            : timeout,
+        );
         timeoutId = setTimeout(() => {
           sinks.debug?.(`[mcp] exec channel open timed out after ${execOpenTimeout}ms`);
           settle(new ToolError(
@@ -2072,6 +2213,7 @@ export class SSHConnectionManager {
             stderrCollector,
             logWriter: logWriter ?? undefined,
             debug,
+            channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
           });
         } finally {
           logWriter?.close({ exitCode, durationMs: Date.now() - startedMs });
@@ -2200,6 +2342,7 @@ export class SSHConnectionManager {
             logWriter: logWriter ?? undefined,
             onProgress: options.onProgress,
             debug,
+            channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
           });
         } finally {
           logWriter?.close({ exitCode, durationMs: Date.now() - startedMs });
@@ -2678,6 +2821,11 @@ export class SSHConnectionManager {
 
   /**
    * Read an SFTP file fully into a Buffer.
+   *
+   * Guarded by an inactivity watchdog: if no bytes arrive for the stall window
+   * (a dead reused connection can open the channel but never stream) the read
+   * aborts with a retriable error instead of hanging. An actively-streaming
+   * read is never killed because each chunk resets the watchdog.
    */
   private async sftpReadBuffer(
     client: Client,
@@ -2687,36 +2835,58 @@ export class SSHConnectionManager {
     debug?: SshDebugSink,
   ): Promise<Buffer> {
     const sftp = await this.openSftp(client, "read", timeout, debug);
-    return new Promise<Buffer>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      let received = 0;
-      const stream = sftp.createReadStream(remotePath);
-      stream.on("data", (chunk: Buffer) => {
-        chunks.push(chunk);
-        received += chunk.length;
-      });
-      stream.on("error", (e: Error) => {
+    const endSftp = () => {
+      try {
         sftp.end();
-        reject(this.makeSftpError("Remote read failed", e));
-      });
-      stream.on("end", () => {
-        sftp.end();
-        if (received !== expectedSize) {
-          return reject(
-            new ToolError(
-              "SFTP_ERROR",
-              `Remote read short: expected ${expectedSize} bytes, got ${received}`,
-              false,
-            ),
-          );
-        }
-        resolve(Buffer.concat(chunks, received));
-      });
-    });
+      } catch {
+        // Ignore late SFTP cleanup errors.
+      }
+    };
+    try {
+      return await this.runWithInactivityTimeout<Buffer>(
+        (onProgress) =>
+          new Promise<Buffer>((resolve, reject) => {
+            const chunks: Buffer[] = [];
+            let received = 0;
+            const stream = sftp.createReadStream(remotePath);
+            stream.on("data", (chunk: Buffer) => {
+              chunks.push(chunk);
+              received += chunk.length;
+              onProgress();
+            });
+            stream.on("error", (e: Error) => {
+              reject(this.makeSftpError("Remote read failed", e));
+            });
+            stream.on("end", () => {
+              if (received !== expectedSize) {
+                return reject(
+                  new ToolError(
+                    "SFTP_ERROR",
+                    `Remote read short: expected ${expectedSize} bytes, got ${received}`,
+                    false,
+                  ),
+                );
+              }
+              resolve(Buffer.concat(chunks, received));
+            });
+          }),
+        this.transferStallTimeout(timeout),
+        `remote read ${remotePath}`,
+        debug,
+        endSftp,
+      );
+    } finally {
+      endSftp();
+    }
   }
 
   /**
    * Write a Buffer to an SFTP path (overwrites if exists).
+   *
+   * The payload is written in chunks so the inactivity watchdog gets a real
+   * progress signal per acknowledged chunk: a dead reused connection that opens
+   * the channel but never acks a write aborts with a retriable error instead of
+   * hanging, while an actively-flushing write is never killed.
    */
   private async sftpWriteBuffer(
     client: Client,
@@ -2726,18 +2896,57 @@ export class SSHConnectionManager {
     debug?: SshDebugSink,
   ): Promise<void> {
     const sftp = await this.openSftp(client, "write", timeout, debug);
-    return new Promise<void>((resolve, reject) => {
-      const writeStream = sftp.createWriteStream(remotePath);
-      writeStream.on("close", () => {
+    const endSftp = () => {
+      try {
         sftp.end();
-        resolve();
-      });
-      writeStream.on("error", (e: Error) => {
-        sftp.end();
-        reject(this.makeSftpError("File upload failed", e));
-      });
-      writeStream.end(payload);
-    });
+      } catch {
+        // Ignore late SFTP cleanup errors.
+      }
+    };
+    try {
+      await this.runWithInactivityTimeout<void>(
+        (onProgress) =>
+          new Promise<void>((resolve, reject) => {
+            const writeStream = sftp.createWriteStream(remotePath);
+            let offset = 0;
+            let ended = false;
+
+            writeStream.on("close", () => resolve());
+            writeStream.on("error", (e: Error) => {
+              reject(this.makeSftpError("File upload failed", e));
+            });
+
+            const writeNext = () => {
+              if (offset >= payload.length) {
+                if (!ended) {
+                  ended = true;
+                  writeStream.end();
+                }
+                return;
+              }
+              const end = Math.min(offset + SSHConnectionManager.SFTP_WRITE_CHUNK_BYTES, payload.length);
+              const chunk = payload.subarray(offset, end);
+              offset = end;
+              writeStream.write(chunk, (err?: Error | null) => {
+                if (err) {
+                  // The "error" event will reject; nothing else to do here.
+                  return;
+                }
+                onProgress();
+                writeNext();
+              });
+            };
+
+            writeNext();
+          }),
+        this.transferStallTimeout(timeout),
+        `upload ${remotePath}`,
+        debug,
+        endSftp,
+      );
+    } finally {
+      endSftp();
+    }
   }
 
   /**
@@ -2784,7 +2993,7 @@ export class SSHConnectionManager {
               },
             );
           }),
-        this.normalizeConnectTimeout(timeout),
+        this.transferStallTimeout(timeout),
         `fast upload ${localPath} -> ${remotePath}`,
         debug,
         endSftp,
@@ -2838,7 +3047,7 @@ export class SSHConnectionManager {
               },
             );
           }),
-        this.normalizeConnectTimeout(timeout),
+        this.transferStallTimeout(timeout),
         `fast download ${remotePath} -> ${localPath}`,
         debug,
         endSftp,
@@ -2888,35 +3097,23 @@ export class SSHConnectionManager {
       }
 
       const sftp = await this.openSftp(connection.client, "download", options?.timeout, debug);
-      await new Promise<void>((resolve, reject) => {
-        let settled = false;
-        const readStream = sftp.createReadStream(validatedRemotePath);
-        const writeStream = fs.createWriteStream(validatedLocalPath);
-
-        const settle = (err?: Error) => {
-          if (settled) return;
-          settled = true;
-          if (err) {
-            this.unpipeStream(readStream, writeStream);
-            this.destroyStream(readStream);
-            this.destroyStream(writeStream);
-          }
+      try {
+        await this.pipeWithInactivityTimeout(
+          sftp.createReadStream(validatedRemotePath),
+          fs.createWriteStream(validatedLocalPath),
+          this.transferStallTimeout(options?.timeout),
+          `download ${validatedRemotePath} -> ${validatedLocalPath}`,
+          debug,
+          (err) => this.makeSftpError("File download failed", err),
+          (err) => new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to save file: ${err.message}`, false),
+        );
+      } finally {
+        try {
           sftp.end();
-          err ? reject(err) : resolve();
-        };
-
-        writeStream.on("finish", () => settle());
-
-        writeStream.on("error", (err: Error) =>
-          settle(new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to save file: ${err.message}`, false)),
-        );
-
-        readStream.on("error", (err: Error) =>
-          settle(this.makeSftpError("File download failed", err)),
-        );
-
-        readStream.pipe(writeStream);
-      });
+        } catch {
+          // Ignore late SFTP cleanup errors.
+        }
+      }
       return this.appendDebugOutput("File downloaded successfully", debugCollector);
     } catch (error) {
       if (reuseConnection && this.isConnectionError(error as Error)) {
@@ -3111,36 +3308,20 @@ export class SSHConnectionManager {
         }
       }
 
-      const readStream = srcSftp.createReadStream(validatedSourcePath);
-      const writeStream = dstSftp.createWriteStream(validatedDestPath);
       // Bind the validated paths into the rest of the verification flow so
       // we never accidentally fall back to the un-validated originals.
       sourceRemotePath = validatedSourcePath;
       destRemotePath = validatedDestPath;
 
-      await new Promise<void>((resolve, reject) => {
-        let settled = false;
-        const settle = (err?: Error) => {
-          if (settled) return;
-          settled = true;
-          if (err) {
-            this.unpipeStream(readStream, writeStream);
-            this.destroyStream(readStream);
-            this.destroyStream(writeStream);
-          }
-          err ? reject(err) : resolve();
-        };
-
-        writeStream.on("close", () => settle());
-        writeStream.on("error", (err: Error) =>
-          settle(this.makeSftpError("Dest write error", err)),
-        );
-        readStream.on("error", (err: Error) =>
-          settle(this.makeSftpError("Source read error", err)),
-        );
-
-        readStream.pipe(writeStream);
-      });
+      await this.pipeWithInactivityTimeout(
+        srcSftp.createReadStream(validatedSourcePath),
+        dstSftp.createWriteStream(validatedDestPath),
+        this.transferStallTimeout(options?.timeout),
+        `relay ${sourceName}:${validatedSourcePath} -> ${destName}:${validatedDestPath}`,
+        debug,
+        (err) => this.makeSftpError("Source read error", err),
+        (err) => this.makeSftpError("Dest write error", err),
+      );
 
       // --- Verification ---
       const dstStat = await this.sftpStat(dstSftp, destRemotePath, "dest");

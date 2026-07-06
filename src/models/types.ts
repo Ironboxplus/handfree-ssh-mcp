@@ -30,6 +30,18 @@ export interface SSHConfig {
   allowedRemoteDirectories?: string[]; // Absolute POSIX dirs that SFTP remotePath may live under. If unset/empty, SFTP is rejected unless disableSftpPathPolicy is set.
   allowedLocalDirectories?: string[]; // Absolute host dirs (in addition to process.cwd()) that SFTP localPath may live under.
   disableSftpPathPolicy?: boolean; // When true, skip allowedRemoteDirectories/allowedLocalDirectories containment checks entirely (any absolute remote path, any local path allowed).
+  // ssh2 keepalive on the cached connection so a silently-dead peer is detected
+  // proactively (ssh2 emits close/error → the connection self-heals on the next
+  // reuse) instead of only being discovered when a later command hangs.
+  // Defaults ON. Set keepaliveInterval to 0 to disable.
+  keepaliveInterval?: number; // ms between keepalive probes. Default 15000. 0 disables keepalive.
+  keepaliveCountMax?: number; // max unanswered probes before ssh2 declares the connection dead. Default 3.
+  // Timeout (ms) for the exec-channel-OPEN phase only, kept separate from the
+  // command run timeout. A reused-but-dead connection can accept but never open
+  // a channel; a short open timeout fails fast (retriable) and drops the stale
+  // connection so the next call reconnects, instead of hanging until the full
+  // command timeout. Default 10000.
+  channelOpenTimeout?: number;
 }
 
 /**
