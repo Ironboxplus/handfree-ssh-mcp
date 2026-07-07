@@ -60,6 +60,28 @@ describe("resolveChannelOpenTimeout", () => {
   });
 });
 
+describe("resolveCircuitOpenTimeout (jump-circuit fast-fail bound)", () => {
+  const manager = SSHConnectionManager.getInstance() as any;
+
+  it("defaults to the 10000ms channel-open timeout when no connect cap", () => {
+    assert.strictEqual(manager.resolveCircuitOpenTimeout({}), 10000);
+  });
+
+  it("caps the circuit-open timeout at the connect timeout (never longer)", () => {
+    // The whole point: a dead bastion must not be waited on for the full command
+    // timeout. With a 5000ms connect cap the short bound stays 5000, and with a
+    // huge cap it stays the 10000ms default — always the smaller of the two.
+    assert.strictEqual(manager.resolveCircuitOpenTimeout({}, 5000), 5000);
+    assert.strictEqual(manager.resolveCircuitOpenTimeout({}, 150000), 10000);
+  });
+
+  it("honors a per-server channelOpenTimeout for the circuit too", () => {
+    // A slow-but-live bastion can be accommodated by bumping channelOpenTimeout.
+    assert.strictEqual(manager.resolveCircuitOpenTimeout({ channelOpenTimeout: 30000 }, 150000), 30000);
+    assert.strictEqual(manager.resolveCircuitOpenTimeout({ channelOpenTimeout: 30000 }, 20000), 20000);
+  });
+});
+
 /** A fake ssh2 Client whose exec() never invokes its callback (dead channel). */
 class DeadChannelClient extends EventEmitter {
   exec(_cmd: string, _cb: (err: Error | undefined, stream: unknown) => void): void {

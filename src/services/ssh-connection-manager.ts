@@ -482,7 +482,16 @@ export class SSHConnectionManager {
         port: config.port,
         username: config.username,
       };
-      if (connectTimeout) {
+      // For a jump target the SSH handshake runs over the tunnel and should be
+      // fast; bound it by the short circuit-open timeout so a dead target behind a
+      // live bastion fails fast instead of hanging the whole command timeout. Jump
+      // targets always get the short bound (even when no explicit command timeout
+      // was passed, e.g. a status refresh) so a dead peer never stalls on ssh2's
+      // implicit default. Direct connections keep the full connect timeout.
+      const circuitOpenTimeout = this.resolveCircuitOpenTimeout(config, connectTimeout);
+      if (config.jumpHost) {
+        sshConfig.readyTimeout = circuitOpenTimeout;
+      } else if (connectTimeout) {
         sshConfig.readyTimeout = connectTimeout;
       }
       // Keepalive on the long-lived cached connection: ssh2 probes the peer so a
@@ -501,7 +510,7 @@ export class SSHConnectionManager {
       if (config.jumpHost) {
         try {
           const sock = await this.withConnectionTimeout(
-            this.openJumpTunnel(key, config, undefined, connectTimeout),
+            this.openJumpTunnel(key, config, undefined, circuitOpenTimeout),
             connectTimeout,
             `jump tunnel for [${key}] via '${config.jumpHost}'`,
             undefined,
@@ -736,11 +745,15 @@ export class SSHConnectionManager {
     };
 
     try {
+      // Bound a jump target's handshake-over-tunnel and the tunnel establishment
+      // by the short circuit-open timeout so a dead reused bastion fails fast
+      // instead of hanging up to the full command timeout. See doConnect.
+      const circuitOpenTimeout = this.resolveCircuitOpenTimeout(config, connectTimeout);
       const sshConfig: any = {
         host: config.host,
         port: config.port,
         username: config.username,
-        readyTimeout: connectTimeout,
+        readyTimeout: config.jumpHost ? circuitOpenTimeout : connectTimeout,
       };
       if (debug) {
         sshConfig.debug = (line: string) => debug(`[ssh2] ${line}`);
@@ -755,7 +768,7 @@ export class SSHConnectionManager {
       if (config.jumpHost) {
         try {
           sshConfig.sock = await this.withConnectionTimeout(
-            this.openJumpTunnel(jumpChainKey, config, debug, connectTimeout),
+            this.openJumpTunnel(jumpChainKey, config, debug, circuitOpenTimeout),
             connectTimeout,
             `one-shot jump tunnel for [${key}] via '${config.jumpHost}'`,
             debug,
@@ -995,6 +1008,25 @@ export class SSHConnectionManager {
     return typeof t === "number" && Number.isFinite(t) && t > 0
       ? t
       : SSHConnectionManager.DEFAULT_CHANNEL_OPEN_TIMEOUT_MS;
+  }
+
+  /**
+   * Resolve the short timeout (ms) that bounds establishing a jump CIRCUIT — each
+   * bastion hop's SSH handshake, the forwardOut between hops, and the target's
+   * handshake over the tunnel. Kept separate from (and capped by) the full command
+   * timeout: a reused-but-dead bastion can accept TCP yet never complete the
+   * handshake/forward, and bounding that by the whole command timeout is exactly
+   * the multi-second-to-300s hang. Derived from the TARGET server's
+   * channelOpenTimeout (the same knob as the exec-channel-open timeout) and used
+   * for every hop of that target's circuit, so a target whose bastion is legitimately
+   * slow is tuned by bumping the target's channelOpenTimeout.
+   */
+  private resolveCircuitOpenTimeout(config: SSHConfig, connectTimeout?: number): number {
+    const short = this.resolveChannelOpenTimeout(config);
+    if (typeof connectTimeout === "number" && Number.isFinite(connectTimeout) && connectTimeout > 0) {
+      return Math.max(1, Math.min(short, connectTimeout));
+    }
+    return Math.max(1, short);
   }
 
   private normalizeConnectTimeout(timeout?: number): number | undefined {
