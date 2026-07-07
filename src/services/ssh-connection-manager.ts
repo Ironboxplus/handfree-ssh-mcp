@@ -37,10 +37,13 @@ export const BUILT_IN_COMMAND_BLACKLIST: Array<{ regex: RegExp; reason: string }
   { regex: /^\s*(?:sudo\s+)?chown\s+-R\s+\S+\s+\/(?:\s|$)/i, reason: "recursive chown on root" },
 ];
 
-export const BUILT_IN_DESTRUCTIVE_GUARDS: Array<{ regex: RegExp; reason: string }> = [
-  { regex: /(?<![0-9])>\s*\/(?!dev\/null)/, reason: "output redirection to absolute path" },
-  { regex: />\s*~/, reason: "output redirection to home path" },
-];
+// Output redirection (`> /path`, `> ~/path`) is normal, non-destructive usage
+// (logging, nohup, saving results) and blocking it broke legitimate workflows.
+// Real destructive-operation protection lives in BUILT_IN_COMMAND_BLACKLIST
+// (power/recursive-force-rm) and the SFTP path policy, so this guard list is
+// intentionally empty. Servers can still add their own patterns via
+// commandBlacklist. Kept as an extension point rather than removed outright.
+export const BUILT_IN_DESTRUCTIVE_GUARDS: Array<{ regex: RegExp; reason: string }> = [];
 
 type SshDebugSink = (line: string) => void;
 type AcquiredSshClient = { client: Client; close: () => void };
