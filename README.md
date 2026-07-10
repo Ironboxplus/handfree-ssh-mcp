@@ -201,6 +201,11 @@ preConnect: false
 outputLogDir: ~/handfree-logs
 
 servers:
+  # NOTE: there is NO per-server `enabled` field. Which servers are active is
+  # controlled ONLY by the `--enable-servers` launch flag; omit it to enable
+  # every loaded server. Adding `enabled: true` under a server does nothing —
+  # it is silently ignored. (The `enabled:` above lives under `sshConfig:` and
+  # only toggles loading ~/.ssh/config; it is not a per-server switch.)
   server_name:
     # Required only for YAML-only servers. If a same-named Host exists in
     # ~/.ssh/config, these fields are optional overrides.
@@ -249,7 +254,7 @@ servers:
 
 ### Security note: command policy
 
-`execute-command` defaults to `commandMode: blacklist`. In that mode commands are allowed unless they match built-in destructive guards, the built-in dangerous-command blacklist, or a server's configured `blacklist:` patterns. Built-in blocked operations include hidden/chained destructive file operations, risky absolute-path output redirection, system power commands (`reboot`, `shutdown`, `halt`, `poweroff`), recursive force delete (`rm -rf`), destructive disk writes (`dd ... of=`), and filesystem formatting commands. Set `commandMode: whitelist` to require every command to match `whitelist:` after blacklist checks. For compatibility, a YAML server that contains `whitelist:` without `commandMode:` is treated as whitelist mode. Set `disableBuiltinGuards: true` and/or `disableBuiltinBlacklist: true` to turn off the built-in guards/blacklist for a server (your own `blacklist:`/`whitelist:` still apply).
+`execute-command` defaults to `commandMode: blacklist`. In that mode commands are allowed unless they match built-in destructive guards, the built-in dangerous-command blacklist, or a server's configured `blacklist:` patterns. Built-in blocked operations include system power commands (`reboot`, `shutdown`, `halt`, `poweroff`, `init 0/6`, `Restart-Computer`/`Stop-Computer`), recursive force delete (`rm -rf`, recursive-force `Remove-Item`, recursive Windows `del`/`rd`), dangerous `rmdir` targets, recursive world-writable `chmod -R 777`, and recursive `chown -R` on `/`. (Output redirection to absolute/home paths is NOT blocked — it's normal logging/`nohup` usage.) Set `commandMode: whitelist` to require every command to match `whitelist:` after blacklist checks. For compatibility, a YAML server that contains `whitelist:` without `commandMode:` is treated as whitelist mode. Set `disableBuiltinGuards: true` and/or `disableBuiltinBlacklist: true` to turn off the built-in guards/blacklist for a server (your own `blacklist:`/`whitelist:` still apply).
 
 ### SFTP path policy
 
