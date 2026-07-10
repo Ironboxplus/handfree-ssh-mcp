@@ -1,0 +1,37 @@
+name: Publish to npm
+
+# Auto-publish when a version tag is pushed, e.g. `git tag v1.0.14 && git push --tags`.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      # Runs the build then the full node --test suite (see package.json "test").
+      - run: npm test
+
+      # Fail fast if the tag doesn't match package.json version (tag v1.0.14 -> 1.0.14).
+      - name: Verify tag matches package.json version
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          TAG=${GITHUB_REF_NAME#v}
+          echo "package.json=$PKG tag=$TAG"
+          test "$PKG" = "$TAG"
+
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
