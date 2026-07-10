@@ -2358,7 +2358,10 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     await assert.rejects(
-      () => manager.upload("..\\outside-file.txt", "/tmp/outside-file.txt", "dev"),
+      // Forward-slash parent traversal escapes the allowed dir (cwd) on BOTH
+      // Windows and POSIX; a backslash is only a separator on Windows and would
+      // be a literal filename char on Linux CI (leaving the path inside cwd).
+      () => manager.upload("../outside-file.txt", "/tmp/outside-file.txt", "dev"),
       (error: unknown) => error instanceof ToolError && error.code === "LOCAL_PATH_NOT_ALLOWED",
     );
   });
