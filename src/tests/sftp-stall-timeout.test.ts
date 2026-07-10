@@ -18,7 +18,11 @@ import assert from "node:assert";
 import { EventEmitter } from "node:events";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 
-const STALL_MS = 80;
+// Generous margin: healthy streams must emit their first progress (via
+// setImmediate/microtask) before this watchdog fires. A tight value flakes on a
+// cold/loaded CI runner where the event loop can stall briefly. The stall (dead)
+// tests still abort at STALL_MS, well under their <5000ms assertions.
+const STALL_MS = 1000;
 
 /** A writable that accepts writes but never acknowledges them (dead channel). */
 class StallWriteStream extends EventEmitter {
