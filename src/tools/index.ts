@@ -5,6 +5,7 @@ import { registerDownloadTool } from "./download.js";
 import { registerListServersTool } from "./list-servers.js";
 import { registerShowWhitelistTool } from "./show-whitelist.js";
 import { registerCloseConnectionTool } from "./close-connection.js";
+import { registerCommandStatusTool } from "./command-status.js";
 import { registerTransferTool } from "./transfer.js";
 import { registerHelpTool } from "./help.js";
 
@@ -19,6 +20,7 @@ export function registerAllTools(server: McpServer): void {
   registerListServersTool(server);
   registerShowWhitelistTool(server);
   registerCloseConnectionTool(server);
+  registerCommandStatusTool(server);
   registerTransferTool(server);
   registerHelpTool(server);
 }

@@ -1599,6 +1599,48 @@ describe("SSHConnectionManager regressions", () => {
     }
   });
 
+  it("should drop a cached connection after final exec channel opening failure", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalCreateLogWriter = manager.createLogWriter;
+    let execCalls = 0;
+    let endCalls = 0;
+    const fakeClient = {
+      exec: () => {
+        execCalls += 1;
+        // Simulate a stale ssh2 client whose channel-open callback never fires.
+      },
+      end: () => {
+        endCalls += 1;
+      },
+    };
+
+    manager.clients.set("dev", fakeClient);
+    manager.connected.set("dev", true);
+    manager.createLogWriter = () => null;
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommand("pwd", "dev", { timeout: 1, maxRetries: 0 }),
+        (error: unknown) => error instanceof ToolError && error.code === "SSH_CONNECTION_FAILED",
+      );
+      assert.strictEqual(execCalls, 1);
+      assert.strictEqual(endCalls, 1);
+      assert.strictEqual(manager.clients.has("dev"), false);
+      assert.strictEqual(manager.connected.get("dev"), false);
+    } finally {
+      manager.createLogWriter = originalCreateLogWriter;
+      manager.closeConnection("dev");
+    }
+  });
+
   it("should close one-shot command connections when exec channel opening times out", async () => {
     manager.setConfig(
       {
@@ -1696,7 +1738,9 @@ describe("SSHConnectionManager regressions", () => {
     const fakeClient = new EventEmitter() as any;
     const stream = new EventEmitter() as any;
     stream.stderr = new EventEmitter();
-    stream.close = () => {};
+    stream.close = () => {
+      stream.emit("close", 0);
+    };
     let execCalls = 0;
 
     fakeClient.exec = (_cmd: string, callback: (err: Error | undefined, stream: unknown) => void) => {
@@ -1713,6 +1757,111 @@ describe("SSHConnectionManager regressions", () => {
         /closed while running command/.test(error.message),
     );
     assert.strictEqual(execCalls, 1);
+  });
+
+  it("should not retry a connection failure after the remote command is running", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalRunCommandStream = manager.runCommandStream;
+    const originalReconnect = manager.reconnect;
+    const originalCreateLogWriter = manager.createLogWriter;
+    let runCalls = 0;
+    let reconnectCalls = 0;
+
+    manager.acquireSshClient = async () => ({
+      client: {},
+      close: () => {},
+    });
+    manager.runCommandStream = async () => {
+      runCalls += 1;
+      throw new ToolError(
+        "SSH_CONNECTION_FAILED",
+        "SSH connection closed while running command",
+        true,
+      );
+    };
+    manager.reconnect = async () => {
+      reconnectCalls += 1;
+    };
+    manager.createLogWriter = () => null;
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommandWithProgress("pwd", "dev", { maxRetries: 2 }),
+        (error: unknown) =>
+          error instanceof ToolError &&
+          error.code === "SSH_CONNECTION_FAILED" &&
+          /running command/.test(error.message),
+      );
+      assert.strictEqual(runCalls, 1);
+      assert.strictEqual(reconnectCalls, 0);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.runCommandStream = originalRunCommandStream;
+      manager.reconnect = originalReconnect;
+      manager.createLogWriter = originalCreateLogWriter;
+    }
+  });
+
+  it("should not close a replacement cached client after an older acquired client fails", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalRunCommandStream = manager.runCommandStream;
+    const originalCreateLogWriter = manager.createLogWriter;
+    let replacementEndCalls = 0;
+    const failedClient = {};
+    const replacementClient = {
+      end: () => {
+        replacementEndCalls += 1;
+      },
+    };
+
+    manager.acquireSshClient = async () => {
+      manager.clients.set("dev", replacementClient);
+      manager.connected.set("dev", true);
+      return {
+        client: failedClient,
+        close: () => {},
+      };
+    };
+    manager.runCommandStream = async () => {
+      throw new ToolError(
+        "SSH_CONNECTION_FAILED",
+        "SSH exec channel timeout: no response from server within 1ms while opening command channel",
+        true,
+      );
+    };
+    manager.createLogWriter = () => null;
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommand("pwd", "dev", { timeout: 1, maxRetries: 0 }),
+        (error: unknown) => error instanceof ToolError && error.code === "SSH_CONNECTION_FAILED",
+      );
+      assert.strictEqual(manager.clients.get("dev"), replacementClient);
+      assert.strictEqual(manager.connected.get("dev"), true);
+      assert.strictEqual(replacementEndCalls, 0);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.runCommandStream = originalRunCommandStream;
+      manager.createLogWriter = originalCreateLogWriter;
+    }
   });
 
   it("should not reconnect cached clients when an opened remote command times out", async () => {
@@ -1879,6 +2028,142 @@ describe("SSHConnectionManager regressions", () => {
     }
   });
 
+  it("should start background commands immediately and expose live log status", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalRunCommandStream = manager.runCommandStream;
+    const tempRoot = path.resolve(
+      process.cwd(),
+      `handfree-background-log-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    let finishCommand!: () => void;
+    let commandStarted = false;
+
+    manager.setOutputLogRoot(tempRoot);
+    manager.acquireSshClient = async () => ({
+      client: {},
+      close: () => {},
+    });
+    manager.runCommandStream = async (
+      _cmd: string,
+      _client: unknown,
+      _timeout: number,
+      sinks: { logWriter?: { appendStdout?: (chunk: string) => void } },
+    ) => {
+      commandStarted = true;
+      sinks.logWriter?.appendStdout?.("hello\n");
+      await new Promise<void>((resolve) => {
+        finishCommand = resolve;
+      });
+      sinks.logWriter?.appendStdout?.("world\n");
+      return 0;
+    };
+
+    try {
+      const started = manager.startCommandBackground("pwd", "dev", {
+        timeout: 100,
+        maxRetries: 0,
+      });
+      assert.strictEqual(started.status, "running");
+      assert.strictEqual(started.serverName, "dev");
+      assert.ok(started.runId);
+      assert.ok(started.logPath.startsWith(tempRoot));
+
+      for (let i = 0; i < 20 && !commandStarted; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.strictEqual(commandStarted, true);
+
+      let running = manager.getBackgroundCommandStatus(started.runId, 4096);
+      assert.strictEqual(running.status, "running");
+      assert.match(running.outputTail ?? "", /hello/);
+
+      finishCommand();
+      for (let i = 0; i < 20; i++) {
+        const status = manager.getBackgroundCommandStatus(started.runId, 4096);
+        if (status.status === "completed") {
+          running = status;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      assert.strictEqual(running.status, "completed");
+      assert.match(running.outputTail ?? "", /world/);
+      assert.match(running.outputTail ?? "", /=== END ===/);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.runCommandStream = originalRunCommandStream;
+      manager.setOutputLogRoot(null);
+      fsForTest.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should fail background commands when the background promise exceeds its timeout", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalRunCommandStream = manager.runCommandStream;
+    const tempRoot = path.resolve(
+      process.cwd(),
+      `handfree-background-timeout-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    let closeCalls = 0;
+
+    manager.setOutputLogRoot(tempRoot);
+    manager.acquireSshClient = async () => ({
+      client: {},
+      close: () => {
+        closeCalls += 1;
+      },
+    });
+    manager.runCommandStream = async () => {
+      await new Promise<void>(() => {
+        // Simulate an internal path that never settles.
+      });
+      return 0;
+    };
+
+    try {
+      const started = manager.startCommandBackground("pwd", "dev", {
+        timeout: 10,
+        maxRetries: 0,
+      });
+
+      let status = manager.getBackgroundCommandStatus(started.runId, 4096);
+      for (let i = 0; i < 40 && status.status === "running"; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        status = manager.getBackgroundCommandStatus(started.runId, 4096);
+      }
+
+      assert.strictEqual(status.status, "failed");
+      assert.match(status.error ?? "", /watchdog fired/);
+      assert.match(status.outputTail ?? "", /COMMAND_TIMEOUT/);
+      assert.match(status.outputTail ?? "", /=== END ===/);
+      assert.ok(closeCalls >= 1);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.runCommandStream = originalRunCommandStream;
+      manager.setOutputLogRoot(null);
+      fsForTest.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("should retry cached streaming connections when exec channel opening never returns", async () => {
     manager.setConfig(
       {
@@ -1922,6 +2207,48 @@ describe("SSHConnectionManager regressions", () => {
       manager.reconnect = originalReconnect;
       manager.createLogWriter = originalCreateLogWriter;
       manager.sleep = originalSleep;
+    }
+  });
+
+  it("should drop a cached streaming connection after final exec channel opening failure", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          commandWhitelist: ["^pwd$"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalCreateLogWriter = manager.createLogWriter;
+    let execCalls = 0;
+    let endCalls = 0;
+    const fakeClient = {
+      exec: () => {
+        execCalls += 1;
+        // Simulate a stale ssh2 client whose channel-open callback never fires.
+      },
+      end: () => {
+        endCalls += 1;
+      },
+    };
+
+    manager.clients.set("dev", fakeClient);
+    manager.connected.set("dev", true);
+    manager.createLogWriter = () => null;
+
+    try {
+      await assert.rejects(
+        () => manager.executeCommandWithProgress("pwd", "dev", { timeout: 1, maxRetries: 0 }),
+        (error: unknown) => error instanceof ToolError && error.code === "SSH_CONNECTION_FAILED",
+      );
+      assert.strictEqual(execCalls, 1);
+      assert.strictEqual(endCalls, 1);
+      assert.strictEqual(manager.clients.has("dev"), false);
+      assert.strictEqual(manager.connected.get("dev"), false);
+    } finally {
+      manager.createLogWriter = originalCreateLogWriter;
+      manager.closeConnection("dev");
     }
   });
 

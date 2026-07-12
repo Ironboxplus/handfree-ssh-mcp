@@ -21,8 +21,10 @@ Example:
 Parameters:
   cmdString       (string, required)   The shell command to execute.
   connectionName  (string, see below)  Target server name from list-servers.
-  stream          (boolean, optional)  Default true. Set false for short
-                  commands when you only need the final output.
+  stream          (boolean, optional)  Default true. Starts the command in
+                  the background and returns runId/logPath immediately.
+                  Poll with command-status. Set false for short commands
+                  when you need the final output in the same tool call.
   reuseConnection (boolean, optional)  Default true. Set false after a timeout
                   or suspected stale cached SSH connection to force a fresh
                   TCP/SSH connection for this command.
@@ -43,8 +45,24 @@ Examples:
   execute-command { cmdString: "pwd" }
   execute-command { cmdString: "docker ps -a", connectionName: "prod", stream: false }
   execute-command { cmdString: "tail -f /var/log/syslog", stream: true, timeout: 600000 }
+  command-status { runId: "cmd_20260712T120000Z_ab12cd34" }
   execute-command { cmdString: "hostname", connectionName: "scnet", stream: false, reuseConnection: false }
   execute-command { cmdString: "hostname", connectionName: "scnet", stream: false, reuseConnection: false, vvv: true }`,
+
+  "command-status": `command-status — Poll a background command.
+
+Parameters:
+  runId           (string, required)   runId returned by execute-command
+                                      when stream=true.
+  maxOutputBytes  (number, optional)   Live log tail bytes to return.
+                                      Defaults to 65536.
+
+Returns: JSON with runId, status (running/completed/failed), logPath,
+         timestamps, error when failed, and outputTail. Status is process-local;
+         after MCP server restart, read the returned logPath directly.
+
+Example:
+  command-status { runId: "cmd_20260712T120000Z_ab12cd34", maxOutputBytes: 50000 }`,
 
   "show-whitelist": `show-whitelist — Show the active command policy for a server.
 
@@ -192,6 +210,7 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   execute-command   Run a shell command on a remote server.
   show-whitelist    Show the active command policy.
   close-connection  Close a cached SSH connection for a server.
+  command-status    Poll background command status and live log tail.
   upload            Upload a single file to a remote server.
   download          Download a single file from a remote server.
   transfer          Move files: single, recursive, or cross-server relay.
@@ -201,7 +220,8 @@ Quick start:
   1. list-servers → discover server names
   2. show-whitelist { connectionName: "<name>" } → inspect command policy
   3. execute-command { cmdString: "pwd", connectionName: "<name>" }
-  4. close-connection { connectionName: "<name>" } → drop a stale cached SSH client`;
+  4. command-status { runId: "<runId>" } → poll stream=true background commands
+  5. close-connection { connectionName: "<name>" } → drop a stale cached SSH client`;
 
 /**
  * Register help tool

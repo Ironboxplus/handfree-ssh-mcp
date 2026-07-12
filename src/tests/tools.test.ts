@@ -14,6 +14,7 @@ import {
   SSHConnectionManager,
 } from "../services/ssh-connection-manager.js";
 import { registerCloseConnectionTool } from "../tools/close-connection.js";
+import { registerCommandStatusTool } from "../tools/command-status.js";
 import { registerDownloadTool } from "../tools/download.js";
 import { registerExecuteCommandTool } from "../tools/execute-command.js";
 import { registerTransferTool } from "../tools/transfer.js";
@@ -444,16 +445,27 @@ describe("MCP tool handlers", () => {
     manager.setConfig({}, undefined);
   });
 
-  it("should forward reuseConnection and vvv on the default streaming execute-command path", async () => {
+  it("should start stream=true commands in the background and return immediately", async () => {
     const originalResolveServer = manager.resolveServer;
+    const originalStartCommandBackground = manager.startCommandBackground;
     const originalExecuteCommandWithProgress = manager.executeCommandWithProgress;
     const { server, handlers } = captureRegisteredTools();
     let captured: any;
 
     manager.resolveServer = (name?: string) => name ?? "dev";
-    manager.executeCommandWithProgress = async (cmdString: string, connectionName: string, options: any) => {
+    manager.startCommandBackground = (cmdString: string, connectionName: string, options: any) => {
       captured = { cmdString, connectionName, options };
-      return "ok";
+      return {
+        runId: "run-1",
+        status: "running",
+        serverName: connectionName,
+        command: cmdString,
+        startedAt: "2026-07-12T00:00:00.000Z",
+        logPath: "E:\\logs\\run-1.log",
+      };
+    };
+    manager.executeCommandWithProgress = async () => {
+      throw new Error("stream=true should not block waiting for command completion");
     };
 
     try {
@@ -473,16 +485,21 @@ describe("MCP tool handlers", () => {
         { _meta: {}, sendNotification: () => {} },
       );
 
-      assert.deepStrictEqual(result, { content: [{ type: "text", text: "ok" }] });
+      assert.strictEqual(result.isError, undefined);
+      const body = JSON.parse(result.content[0].text);
+      assert.strictEqual(body.runId, "run-1");
+      assert.strictEqual(body.status, "running");
+      assert.strictEqual(body.logPath, "E:\\logs\\run-1.log");
+      assert.match(body.next, /command-status/);
       assert.strictEqual(captured.cmdString, "pwd");
       assert.strictEqual(captured.connectionName, "dev");
       assert.strictEqual(captured.options.timeout, 123);
       assert.strictEqual(captured.options.reuseConnection, false);
       assert.strictEqual(captured.options.vvv, true);
       assert.strictEqual(captured.options.maxOutputBytes, 456);
-      assert.strictEqual(captured.options.onProgress, undefined);
     } finally {
       manager.resolveServer = originalResolveServer;
+      manager.startCommandBackground = originalStartCommandBackground;
       manager.executeCommandWithProgress = originalExecuteCommandWithProgress;
     }
   });
@@ -837,6 +854,48 @@ describe("MCP tool handlers", () => {
       assert.match(result.content[0].text, /missing server/);
     } finally {
       manager.closeConnection = originalCloseConnection;
+    }
+  });
+
+  it("should return a background command status envelope", async () => {
+    const originalGetBackgroundCommandStatus = manager.getBackgroundCommandStatus;
+    const { server, handlers } = captureRegisteredTools();
+    let captured: any;
+
+    manager.getBackgroundCommandStatus = (runId?: string, maxOutputBytes?: number) => {
+      captured = { runId, maxOutputBytes };
+      return {
+        runId,
+        status: "running",
+        serverName: "dev",
+        command: "sleep 10",
+        startedAt: "2026-07-12T00:00:00.000Z",
+        logPath: "E:\\logs\\run-1.log",
+        outputTail: "partial output",
+      };
+    };
+
+    try {
+      registerCommandStatusTool(server as any);
+      const handler = handlers.get("command-status");
+      assert.ok(handler, "command-status handler should be registered");
+
+      const result = await handler(
+        {
+          runId: "run-1",
+          maxOutputBytes: 123,
+        },
+        { _meta: {}, sendNotification: () => {} },
+      );
+
+      assert.strictEqual(result.isError, undefined);
+      const body = JSON.parse(result.content[0].text);
+      assert.strictEqual(body.runId, "run-1");
+      assert.strictEqual(body.status, "running");
+      assert.strictEqual(body.outputTail, "partial output");
+      assert.deepStrictEqual(captured, { runId: "run-1", maxOutputBytes: 123 });
+    } finally {
+      manager.getBackgroundCommandStatus = originalGetBackgroundCommandStatus;
     }
   });
 });

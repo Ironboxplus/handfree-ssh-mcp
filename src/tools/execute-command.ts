@@ -7,16 +7,16 @@ import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
 /**
  * Register execute command tool
  * 
- * Unified command execution tool with streaming by default.
- * - stream=true (default): Real-time output with 5 min timeout
- * - stream=false: Wait for completion, 30s timeout
+ * Unified command execution tool.
+ * - stream=true (default): start in background and return run metadata
+ * - stream=false: wait for completion, 30s timeout
  */
 export function registerExecuteCommandTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
 
   server.tool(
     "execute-command",
-    "Execute a shell command on a remote server over SSH. Use this for command-line actions on the selected host. Streaming mode is enabled by default so long-running commands can emit progress; set stream=false for short commands where you only want the final output. SSH connections are reused by default for speed; if an execute-command call times out or you suspect a stale cached SSH connection, retry with reuseConnection=false to force a fresh TCP/SSH connection for that command. Set vvv=true only when debugging SSH/channel issues; with reuseConnection=false it includes ssh2 handshake/debug lines in the result or error. The returned text is tail-only-capped at maxOutputBytes PER STREAM (default 65536 bytes for stdout and 65536 bytes for stderr, so the response can be up to ~2x that); the FULL stdout/stderr is always persisted to a local log file under <cwd>/.handfree-output/<server>/<user>/, and the response includes that path whenever output was truncated. For long-running tasks that may exceed the command timeout, do NOT block on a single call: launch the task detached and redirect its output on the remote (e.g. 'nohup <cmd> > ~/task.log 2>&1 &'), then poll periodically with short follow-up calls (e.g. 'tail -n 50 ~/task.log' or checking the process/exit status). This avoids tying up the connection and losing output if the call times out.",
+    "Execute a shell command on a remote server over SSH. By default stream=true starts the command in the background and returns immediately with runId/logPath; use command-status to poll status and live log tail. Set stream=false for short commands where you want to wait for the final output in the same tool call. SSH connections are reused by default for speed; if an execute-command call times out or you suspect a stale cached SSH connection, retry with reuseConnection=false to force a fresh TCP/SSH connection for that command. Set vvv=true only when debugging SSH/channel issues; with reuseConnection=false it includes ssh2 handshake/debug lines in the result or error. For stream=false, returned text is tail-only-capped at maxOutputBytes per stream and full stdout/stderr is persisted under <cwd>/.handfree-output/<server>/<user>/.",
     {
       cmdString: z.string().describe("Exact remote shell command to run. Prefer a single command per call, for example 'pwd', 'ls -la', 'cat /etc/hostname', or 'git status'. Compound commands may be blocked by command policy even if each subcommand is safe."),
       connectionName: z
@@ -34,7 +34,7 @@ export function registerExecuteCommandTool(server: McpServer): void {
         .boolean()
         .optional()
         .describe(
-          "Whether to stream progress output. Default is true. Use false for short commands like pwd, ls, cat, head, tail, or git status when you only need the final result."
+          "Default true. When true, start the command in the background and return runId/logPath immediately; poll with command-status. Use false for short commands like pwd, ls, cat, head, tail, or git status when you need the final result now."
         ),
       reuseConnection: z
         .boolean()
@@ -63,24 +63,7 @@ export function registerExecuteCommandTool(server: McpServer): void {
         const useStream = stream !== false;
 
         if (useStream) {
-          const progressToken = extra._meta?.progressToken;
-          let progressCounter = 0;
-
-          const onProgress = progressToken
-            ? (chunk: string) => {
-                progressCounter++;
-                extra.sendNotification({
-                  method: "notifications/progress",
-                  params: {
-                    progressToken,
-                    progress: progressCounter,
-                    message: chunk,
-                  },
-                });
-              }
-            : undefined;
-
-          const result = await sshManager.executeCommandWithProgress(
+          const started = sshManager.startCommandBackground(
             cmdString,
             resolvedName,
             {
@@ -88,12 +71,27 @@ export function registerExecuteCommandTool(server: McpServer): void {
               maxOutputBytes,
               reuseConnection,
               vvv,
-              onProgress,
             }
           );
 
+          const progressToken = extra._meta?.progressToken;
+          if (progressToken) {
+            extra.sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress: 1,
+                message: `Background command started: ${started.runId}`,
+              },
+            });
+          }
+
+          const result = {
+            ...started,
+            next: `Poll with command-status { "runId": "${started.runId}", "maxOutputBytes": ${maxOutputBytes ?? 65536} }`,
+          };
           return {
-            content: [{ type: "text", text: result }],
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
           };
         }
 

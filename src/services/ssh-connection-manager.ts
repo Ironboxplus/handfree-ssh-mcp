@@ -7,6 +7,7 @@ import { collectSystemStatus } from "../utils/status-collector.js";
 import { ToolError } from "../utils/tool-error.js";
 import { OutputCollector } from "../utils/output-collector.js";
 import { OutputLogWriter } from "../utils/output-log-writer.js";
+import { BackgroundCommandLogWriter } from "../utils/background-command-log-writer.js";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
@@ -62,6 +63,34 @@ type SftpOptions = {
   sftpConcurrency?: number;
   chunkSize?: number;
 };
+type BackgroundCommandState = {
+  runId: string;
+  status: "running" | "completed" | "failed";
+  serverName: string;
+  command: string;
+  startedAt: string;
+  finishedAt?: string;
+  logPath: string;
+  error?: string;
+};
+type BackgroundCommandStartOptions = {
+  timeout?: number;
+  maxRetries?: number;
+  maxOutputBytes?: number;
+  reuseConnection?: boolean;
+  vvv?: boolean;
+};
+type ExecuteCommandWithProgressOptions = BackgroundCommandStartOptions & {
+  onProgress?: (chunk: string) => void;
+};
+type BackgroundCommandStatus = BackgroundCommandState & {
+  outputTail?: string;
+  outputTruncated?: boolean;
+};
+type CommandLogSink = {
+  appendStdout(chunk: Buffer | string): void;
+  appendStderr(chunk: Buffer | string): void;
+};
 
 /**
  * SSH Connection Manager class
@@ -74,6 +103,7 @@ export class SSHConnectionManager {
   private connected: Map<string, boolean> = new Map();
   private statusCache: Map<string, ServerStatus> = new Map();
   private connectionGenerations: Map<string, number> = new Map();
+  private static readonly MAX_BACKGROUND_COMMANDS = 100;
   private pendingClients: Map<string, Client> = new Map();
   // In-flight connect() promises, keyed by server name. Used to dedupe
   // concurrent connect attempts so we never create two SSH clients for the
@@ -84,6 +114,7 @@ export class SSHConnectionManager {
   // same bastion still gets its own jump client. This keeps tunnel lifetimes
   // tied 1:1 to the target connection and avoids cross-target interference.
   private jumpClients: Map<string, Client[]> = new Map();
+  private backgroundCommands: Map<string, BackgroundCommandState> = new Map();
   private defaultName: string = "default";
   private enabledServers: string[] | null = null; // null = all servers enabled
   private outputLogRoot: string | null = null; // null = use <cwd>/.handfree-output at write time
@@ -245,6 +276,13 @@ export class SSHConnectionManager {
     this.teardownJumpChain(name);
     this.connected.set(name, false);
     this.connecting.delete(name);
+  }
+
+  private closeClientIfCurrent(name: string, client: Client, bumpGeneration = false): void {
+    if (this.clients.get(name) !== client) {
+      return;
+    }
+    this.closeClient(name, bumpGeneration);
   }
 
   private closeClientSet(names: Iterable<string>, bumpGeneration = true): void {
@@ -1496,6 +1534,14 @@ export class SSHConnectionManager {
     return this.isConnectionShapedMessage(error.message);
   }
 
+  private canRetryCommandConnectionError(error: Error): boolean {
+    const msg = error.message.toLowerCase();
+    return !(
+      msg.includes("while running command") ||
+      msg.startsWith("stream error:")
+    );
+  }
+
   private isConnectionShapedMessage(message: string): boolean {
     const msg = message.toLowerCase();
     return (
@@ -1849,7 +1895,7 @@ export class SSHConnectionManager {
     sinks: {
       stdoutCollector?: OutputCollector;
       stderrCollector?: OutputCollector;
-      logWriter?: OutputLogWriter;
+      logWriter?: CommandLogSink;
       onProgress?: (chunk: string) => void;
       debug?: SshDebugSink;
       // Short timeout (ms) for the exec-channel-OPEN phase only. Falls back to
@@ -1914,14 +1960,14 @@ export class SSHConnectionManager {
         const phase = channelOpened ? "running command" : "opening command channel";
         const detail = message ? `: ${message}` : "";
         sinks.debug?.(`[mcp] SSH client ${event} while ${phase}${detail}`);
-        if (activeStream) {
-          closeLateStream(activeStream);
-        }
         settle(new ToolError(
           "SSH_CONNECTION_FAILED",
           `SSH connection ${event} while ${phase}${detail}`,
           true,
         ));
+        if (activeStream) {
+          closeLateStream(activeStream);
+        }
       };
 
       const onClientError = (err: Error) => {
@@ -2225,6 +2271,7 @@ export class SSHConnectionManager {
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      let acquiredClient: Client | null = null;
       try {
         debug?.(`[mcp] command attempt ${attempt + 1}/${maxRetries + 1} on [${key}], reuseConnection=${reuseConnection}`);
         const commandConnection = await this.acquireSshClient(key, {
@@ -2234,6 +2281,7 @@ export class SSHConnectionManager {
           purpose: "command",
         });
         const client = commandConnection.client;
+        acquiredClient = client;
 
         // Per-attempt collectors + log writer. We rebuild them on each retry
         // so partial output from a failed attempt is not mixed into the next.
@@ -2270,9 +2318,10 @@ export class SSHConnectionManager {
         return this.appendDebugOutput(result, debugCollector);
       } catch (error) {
         lastError = error as Error;
+        const connectionError = this.isConnectionError(lastError);
         
         // Check if this is a connection error that can be retried
-        if (this.isConnectionError(lastError) && attempt < maxRetries) {
+        if (connectionError && this.canRetryCommandConnectionError(lastError) && attempt < maxRetries) {
           const backoffMs = 500 * Math.pow(2, attempt); // 500ms, 1000ms, 2000ms
           Logger.log(
             `Connection error on attempt ${attempt + 1}/${maxRetries + 1} for [${key}]: ${lastError.message}. Retrying in ${backoffMs}ms...`,
@@ -2294,6 +2343,12 @@ export class SSHConnectionManager {
           }
           
           continue;
+        }
+
+        if (connectionError && reuseConnection) {
+          if (acquiredClient) {
+            this.closeClientIfCurrent(key, acquiredClient, true);
+          }
         }
         
         // Non-retryable error or max retries reached
@@ -2324,14 +2379,7 @@ export class SSHConnectionManager {
   public async executeCommandWithProgress(
     cmdString: string,
     name?: string,
-    options: {
-      timeout?: number;
-      maxRetries?: number;
-      maxOutputBytes?: number;
-      reuseConnection?: boolean;
-      vvv?: boolean;
-      onProgress?: (chunk: string) => void;
-    } = {}
+    options: ExecuteCommandWithProgressOptions = {}
   ): Promise<string> {
     // Validate command input and security
     const validationResult = this.validateCommand(cmdString, name);
@@ -2343,6 +2391,14 @@ export class SSHConnectionManager {
       );
     }
 
+    return this.executeCommandWithProgressValidated(cmdString, name, options);
+  }
+
+  private async executeCommandWithProgressValidated(
+    cmdString: string,
+    name?: string,
+    options: ExecuteCommandWithProgressOptions = {},
+  ): Promise<string> {
     const timeout = options.timeout || 300000; // Default 5 minutes for streaming
     const maxRetries = options.maxRetries ?? 2; // Default 2 retries
     const maxOutputBytes = options.maxOutputBytes ?? SSHConnectionManager.DEFAULT_MAX_OUTPUT_BYTES;
@@ -2353,6 +2409,7 @@ export class SSHConnectionManager {
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      let acquiredClient: Client | null = null;
       try {
         debug?.(`[mcp] streaming command attempt ${attempt + 1}/${maxRetries + 1} on [${key}], reuseConnection=${reuseConnection}`);
         const commandConnection = await this.acquireSshClient(key, {
@@ -2362,6 +2419,7 @@ export class SSHConnectionManager {
           purpose: "command",
         });
         const client = commandConnection.client;
+        acquiredClient = client;
 
         // Per-attempt collectors + log writer. onProgress keeps streaming
         // every byte live; only the final returned string is capped.
@@ -2402,9 +2460,10 @@ export class SSHConnectionManager {
         return this.appendDebugOutput(result, debugCollector);
       } catch (error) {
         lastError = error as Error;
+        const connectionError = this.isConnectionError(lastError);
 
         // Check if this is a connection error that can be retried
-        if (this.isConnectionError(lastError) && attempt < maxRetries) {
+        if (connectionError && this.canRetryCommandConnectionError(lastError) && attempt < maxRetries) {
           const backoffMs = 500 * Math.pow(2, attempt);
           Logger.log(
             `Connection error on streaming attempt ${attempt + 1}/${maxRetries + 1} for [${key}]: ${lastError.message}. Retrying in ${backoffMs}ms...`,
@@ -2427,6 +2486,12 @@ export class SSHConnectionManager {
           continue;
         }
 
+        if (connectionError && reuseConnection) {
+          if (acquiredClient) {
+            this.closeClientIfCurrent(key, acquiredClient, true);
+          }
+        }
+
         break;
       }
     }
@@ -2435,6 +2500,332 @@ export class SSHConnectionManager {
       lastError || new Error("Streaming command execution failed after all retries"),
       debugCollector,
     );
+  }
+
+  public startCommandBackground(
+    cmdString: string,
+    name?: string,
+    options: BackgroundCommandStartOptions = {},
+  ): BackgroundCommandState {
+    const validationResult = this.validateCommand(cmdString, name);
+    if (!validationResult.isAllowed) {
+      throw new ToolError(
+        "COMMAND_VALIDATION_FAILED",
+        `Command validation failed: ${validationResult.reason}`,
+        false,
+      );
+    }
+
+    const key = name || this.defaultName;
+    const config = this.getConfig(key);
+    this.pruneBackgroundCommands();
+    if (this.countRunningBackgroundCommands() >= SSHConnectionManager.MAX_BACKGROUND_COMMANDS) {
+      throw new ToolError(
+        "COMMAND_EXECUTION_ERROR",
+        `Too many background commands are still running (limit ${SSHConnectionManager.MAX_BACKGROUND_COMMANDS})`,
+        false,
+      );
+    }
+
+    const startedAt = new Date();
+    const runId = this.createBackgroundRunId(startedAt);
+    const writer = new BackgroundCommandLogWriter({
+      rootDir: this.getOutputLogRoot(),
+      serverName: key,
+      username: config.username,
+      command: cmdString,
+      runId,
+      startedAt,
+    });
+    const state: BackgroundCommandState = {
+      runId,
+      status: "running",
+      serverName: key,
+      command: cmdString,
+      startedAt: startedAt.toISOString(),
+      logPath: writer.getPath(),
+    };
+
+    this.backgroundCommands.set(runId, state);
+
+    void this.runBackgroundCommand(runId, cmdString, key, options, writer, startedAt);
+    return { ...state };
+  }
+
+  public getBackgroundCommandStatus(
+    runId: string,
+    maxOutputBytes = SSHConnectionManager.DEFAULT_MAX_OUTPUT_BYTES,
+  ): BackgroundCommandStatus {
+    const state = this.backgroundCommands.get(runId);
+    if (!state) {
+      throw new ToolError(
+        "BACKGROUND_COMMAND_NOT_FOUND",
+        `Background command runId '${runId}' was not found in this MCP server process`,
+        false,
+      );
+    }
+    const tail = this.readFileTail(state.logPath, maxOutputBytes);
+    return {
+      ...state,
+      outputTail: tail.text,
+      outputTruncated: tail.truncated,
+    };
+  }
+
+  private async runBackgroundCommand(
+    runId: string,
+    cmdString: string,
+    key: string,
+    options: BackgroundCommandStartOptions,
+    writer: BackgroundCommandLogWriter,
+    startedAt: Date,
+  ): Promise<void> {
+    const timeoutMs = this.resolveBackgroundCommandTimeout(options.timeout);
+    writer.appendLine(`[mcp] background command started: ${runId}`);
+    try {
+      await this.executeBackgroundCommandValidated(cmdString, key, options, writer, timeoutMs);
+
+      const finishedAt = new Date();
+      writer.close({
+        status: "completed",
+        durationMs: finishedAt.getTime() - startedAt.getTime(),
+        finishedAt,
+      });
+      this.updateBackgroundCommand(runId, {
+        status: "completed",
+        finishedAt: finishedAt.toISOString(),
+      });
+    } catch (error) {
+      const err = error as Error;
+      const finishedAt = new Date();
+      const message = err.message || String(err);
+      const errorText = err instanceof ToolError ? `${err.code}: ${message}` : message;
+      writer.appendLine(`\n[ERROR] ${errorText}`);
+      writer.close({
+        status: "failed",
+        durationMs: finishedAt.getTime() - startedAt.getTime(),
+        finishedAt,
+        error: errorText,
+      });
+      this.updateBackgroundCommand(runId, {
+        status: "failed",
+        finishedAt: finishedAt.toISOString(),
+        error: errorText,
+      });
+      Logger.log(`Background command ${runId} failed on [${key}]: ${errorText}`, "error");
+    }
+  }
+
+  private async executeBackgroundCommandValidated(
+    cmdString: string,
+    key: string,
+    options: BackgroundCommandStartOptions,
+    writer: CommandLogSink,
+    timeoutMs: number,
+  ): Promise<void> {
+    const maxRetries = options.maxRetries ?? 2;
+    const reuseConnection = options.reuseConnection !== false;
+    const { collector: debugCollector, debug } = this.createDebugCollector(options.vvv === true);
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      let commandConnection: AcquiredSshClient | null = null;
+      let closeCommandConnection: (() => void) | null = null;
+      let acquiredClient: Client | null = null;
+      let timedOut = false;
+      try {
+        debug?.(`[mcp] background command attempt ${attempt + 1}/${maxRetries + 1} on [${key}], reuseConnection=${reuseConnection}`);
+        const runAttempt = (async () => {
+          commandConnection = await this.acquireSshClient(key, {
+            reuseConnection,
+            timeout: timeoutMs,
+            debug,
+            purpose: "command",
+          });
+          closeCommandConnection = commandConnection.close;
+          acquiredClient = commandConnection.client;
+          if (timedOut) {
+            closeCommandConnection();
+            if (reuseConnection) {
+              this.closeClientIfCurrent(key, acquiredClient, true);
+            }
+            return;
+          }
+          await this.runCommandStream(cmdString, commandConnection.client, timeoutMs, {
+            logWriter: writer,
+            debug,
+            channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
+          });
+        })();
+
+        await this.withBackgroundCommandTimeout(
+          runAttempt,
+          timeoutMs,
+          () => {
+            timedOut = true;
+            if (closeCommandConnection) {
+              closeCommandConnection();
+              if (reuseConnection && acquiredClient) {
+                this.closeClientIfCurrent(key, acquiredClient, true);
+              }
+            }
+          },
+        );
+
+        if (attempt > 0) {
+          Logger.log(`Background command succeeded on retry attempt ${attempt} for [${key}]`, "info");
+        }
+        return;
+      } catch (error) {
+        lastError = error as Error;
+        const connectionError = this.isConnectionError(lastError);
+
+        if (connectionError && this.canRetryCommandConnectionError(lastError) && attempt < maxRetries) {
+          const backoffMs = 500 * Math.pow(2, attempt);
+          Logger.log(
+            `Connection error on background attempt ${attempt + 1}/${maxRetries + 1} for [${key}]: ${lastError.message}. Retrying in ${backoffMs}ms...`,
+            "info",
+          );
+          await this.sleep(backoffMs);
+
+          if (reuseConnection) {
+            try {
+              await this.reconnect(key);
+            } catch (reconnectError) {
+              Logger.log(
+                `Reconnect failed for [${key}]: ${(reconnectError as Error).message}`,
+                "error",
+              );
+            }
+          }
+          continue;
+        }
+
+        if (connectionError && reuseConnection) {
+          if (acquiredClient) {
+            this.closeClientIfCurrent(key, acquiredClient, true);
+          }
+        }
+        break;
+      } finally {
+        const close = closeCommandConnection as (() => void) | null;
+        close?.();
+      }
+    }
+
+    throw this.appendDebugToError(
+      lastError || new Error("Background command execution failed after all retries"),
+      debugCollector,
+    );
+  }
+
+  private resolveBackgroundCommandTimeout(timeout?: number): number {
+    if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) {
+      return 300000;
+    }
+    return Math.floor(timeout);
+  }
+
+  private resolveBackgroundWatchdogTimeout(timeoutMs: number): number {
+    const graceMs = Math.min(1000, Math.max(10, Math.ceil(timeoutMs * 0.1)));
+    return timeoutMs + graceMs;
+  }
+
+  private withBackgroundCommandTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    onTimeout?: () => void,
+  ): Promise<T> {
+    const watchdogMs = this.resolveBackgroundWatchdogTimeout(timeoutMs);
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try {
+          onTimeout?.();
+        } catch {
+          // Ignore watchdog cleanup errors; the timeout is the primary failure.
+        }
+        reject(new ToolError(
+          "COMMAND_TIMEOUT",
+          `Background command watchdog fired after ${watchdogMs}ms (command timeout ${timeoutMs}ms)`,
+          false,
+        ));
+      }, watchdogMs);
+      timer.unref?.();
+
+      promise.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private updateBackgroundCommand(runId: string, patch: Partial<BackgroundCommandState>): void {
+    const current = this.backgroundCommands.get(runId);
+    if (!current) return;
+    this.backgroundCommands.set(runId, { ...current, ...patch });
+  }
+
+  private createBackgroundRunId(date: Date): string {
+    const ts = date.toISOString()
+      .replace(/[-:.]/g, "")
+      .replace(/(\d{8}T\d{6})\d*Z$/, "$1Z");
+    return `cmd_${ts}_${crypto.randomBytes(4).toString("hex")}`;
+  }
+
+  private pruneBackgroundCommands(maxEntries = 100): void {
+    if (this.backgroundCommands.size <= maxEntries) return;
+    for (const [runId, state] of this.backgroundCommands) {
+      if (this.backgroundCommands.size <= maxEntries) return;
+      if (state.status !== "running") {
+        this.backgroundCommands.delete(runId);
+      }
+    }
+  }
+
+  private countRunningBackgroundCommands(): number {
+    let count = 0;
+    for (const state of this.backgroundCommands.values()) {
+      if (state.status === "running") count++;
+    }
+    return count;
+  }
+
+  private readFileTail(filePath: string, maxBytes: number): { text: string; truncated: boolean } {
+    const cap = Math.max(0, Math.floor(maxBytes));
+    if (cap === 0) {
+      return { text: "", truncated: false };
+    }
+    try {
+      const stat = fs.statSync(filePath);
+      const start = Math.max(0, stat.size - cap);
+      const length = stat.size - start;
+      const fd = fs.openSync(filePath, "r");
+      try {
+        const buffer = Buffer.alloc(length);
+        fs.readSync(fd, buffer, 0, length, start);
+        return {
+          text: buffer.toString("utf8"),
+          truncated: start > 0,
+        };
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return { text: "", truncated: false };
+    }
   }
 
   /**
