@@ -84,8 +84,16 @@ type ExecuteCommandWithProgressOptions = BackgroundCommandStartOptions & {
   onProgress?: (chunk: string) => void;
 };
 type BackgroundCommandStatus = BackgroundCommandState & {
+  incremental: boolean;
   outputTail?: string;
+  outputChunk?: string;
+  outputUnavailable?: boolean;
   outputTruncated?: boolean;
+  outputStartOffset: number;
+  nextOffset: number;
+  fileSize: number;
+  hasMore: boolean;
+  cursorReset?: boolean;
 };
 type CommandLogSink = {
   appendStdout(chunk: Buffer | string): void;
@@ -115,6 +123,7 @@ export class SSHConnectionManager {
   // tied 1:1 to the target connection and avoids cross-target interference.
   private jumpClients: Map<string, Client[]> = new Map();
   private backgroundCommands: Map<string, BackgroundCommandState> = new Map();
+  private backgroundCommandOffsets: Map<string, number> = new Map();
   private defaultName: string = "default";
   private enabledServers: string[] | null = null; // null = all servers enabled
   private outputLogRoot: string | null = null; // null = use <cwd>/.handfree-output at write time
@@ -793,6 +802,7 @@ export class SSHConnectionManager {
         username: config.username,
         readyTimeout: config.jumpHost ? circuitOpenTimeout : connectTimeout,
       };
+      Object.assign(sshConfig, this.resolveKeepalive(config));
       if (debug) {
         sshConfig.debug = (line: string) => debug(`[ssh2] ${line}`);
       }
@@ -1005,9 +1015,9 @@ export class SSHConnectionManager {
   }
 
   /** Default ssh2 keepalive probe interval (ms) when a server doesn't set one. */
-  private static readonly DEFAULT_KEEPALIVE_INTERVAL_MS = 15_000;
+  private static readonly DEFAULT_KEEPALIVE_INTERVAL_MS = 5_000;
   /** Default max unanswered keepalive probes before ssh2 declares death. */
-  private static readonly DEFAULT_KEEPALIVE_COUNT_MAX = 3;
+  private static readonly DEFAULT_KEEPALIVE_COUNT_MAX = 2;
   /** Default short timeout (ms) for the exec-channel-OPEN phase. */
   private static readonly DEFAULT_CHANNEL_OPEN_TIMEOUT_MS = 10_000;
 
@@ -2547,6 +2557,7 @@ export class SSHConnectionManager {
     };
 
     this.backgroundCommands.set(runId, state);
+    this.backgroundCommandOffsets.set(runId, 0);
 
     void this.runBackgroundCommand(runId, cmdString, key, options, writer, startedAt);
     return { ...state };
@@ -2555,6 +2566,8 @@ export class SSHConnectionManager {
   public getBackgroundCommandStatus(
     runId: string,
     maxOutputBytes = SSHConnectionManager.DEFAULT_MAX_OUTPUT_BYTES,
+    offset?: number,
+    incremental = true,
   ): BackgroundCommandStatus {
     const state = this.backgroundCommands.get(runId);
     if (!state) {
@@ -2564,12 +2577,37 @@ export class SSHConnectionManager {
         false,
       );
     }
-    const tail = this.readFileTail(state.logPath, maxOutputBytes);
-    return {
+    const useIncremental = incremental !== false;
+    const storedOffset = this.backgroundCommandOffsets.get(runId) ?? 0;
+    const effectiveOffset = useIncremental
+      ? offset ?? storedOffset
+      : undefined;
+    const output = this.readBackgroundOutput(state.logPath, maxOutputBytes, effectiveOffset);
+    const committedOffset = output.readSucceeded ? output.nextOffset : storedOffset;
+    if (output.readSucceeded) {
+      this.backgroundCommandOffsets.set(runId, committedOffset);
+    }
+    const status: BackgroundCommandStatus = {
       ...state,
-      outputTail: tail.text,
-      outputTruncated: tail.truncated,
+      incremental: useIncremental,
+      outputTruncated: output.truncated,
+      outputStartOffset: output.readSucceeded ? output.startOffset : storedOffset,
+      nextOffset: committedOffset,
+      fileSize: output.fileSize,
+      hasMore: output.hasMore,
     };
+    if (!output.readSucceeded) {
+      status.outputUnavailable = true;
+    }
+    if (output.cursorReset) {
+      status.cursorReset = true;
+    }
+    if (useIncremental) {
+      status.outputChunk = output.text;
+    } else {
+      status.outputTail = output.text;
+    }
+    return status;
   }
 
   private async runBackgroundCommand(
@@ -2791,6 +2829,7 @@ export class SSHConnectionManager {
       if (this.backgroundCommands.size <= maxEntries) return;
       if (state.status !== "running") {
         this.backgroundCommands.delete(runId);
+        this.backgroundCommandOffsets.delete(runId);
       }
     }
   }
@@ -2803,28 +2842,124 @@ export class SSHConnectionManager {
     return count;
   }
 
-  private readFileTail(filePath: string, maxBytes: number): { text: string; truncated: boolean } {
-    const cap = Math.max(0, Math.floor(maxBytes));
-    if (cap === 0) {
-      return { text: "", truncated: false };
+  private completeUtf8End(data: Buffer, start: number, end: number): number {
+    if (end <= start || end < data.length) {
+      return end;
     }
+
+    let leadIndex = end - 1;
+    while (leadIndex >= start && (data[leadIndex] & 0xc0) === 0x80) {
+      leadIndex -= 1;
+    }
+    if (leadIndex < start) {
+      return end;
+    }
+
+    const lead = data[leadIndex];
+    const expectedLength = lead >= 0xc2 && lead <= 0xdf
+      ? 2
+      : lead >= 0xe0 && lead <= 0xef
+        ? 3
+        : lead >= 0xf0 && lead <= 0xf4
+          ? 4
+          : 1;
+    return end - leadIndex < expectedLength ? leadIndex : end;
+  }
+
+  private readBackgroundOutput(
+    filePath: string,
+    maxBytes: number,
+    offset?: number,
+  ): {
+    text: string;
+    truncated: boolean;
+    startOffset: number;
+    nextOffset: number;
+    fileSize: number;
+    hasMore: boolean;
+    cursorReset: boolean;
+    readSucceeded: boolean;
+  } {
+    const cap = Number.isFinite(maxBytes)
+      ? Math.max(0, Math.floor(maxBytes))
+      : SSHConnectionManager.DEFAULT_MAX_OUTPUT_BYTES;
+    const requestedOffset = typeof offset === "number" && Number.isFinite(offset)
+      ? Math.max(0, Math.floor(offset))
+      : undefined;
     try {
       const stat = fs.statSync(filePath);
-      const start = Math.max(0, stat.size - cap);
-      const length = stat.size - start;
+      const fileSize = stat.size;
+      const cursorReset = requestedOffset !== undefined && requestedOffset > fileSize;
+      const start = requestedOffset === undefined
+        ? Math.max(0, fileSize - cap)
+        : cursorReset
+          ? 0
+          : requestedOffset;
+
+      if (cap === 0) {
+        const incrementalRead = requestedOffset !== undefined;
+        return {
+          text: "",
+          truncated: !incrementalRead && fileSize > start,
+          startOffset: start,
+          nextOffset: incrementalRead ? start : fileSize,
+          fileSize,
+          hasMore: incrementalRead && start < fileSize,
+          cursorReset,
+          readSucceeded: true,
+        };
+      }
+
+      const cappedEnd = Math.min(fileSize, start + cap);
+      // Read up to three extra bytes so a chunk ending inside a UTF-8 code point
+      // can include the complete character without losing or corrupting output.
+      const readEnd = Math.min(fileSize, cappedEnd + 3);
+      const length = readEnd - start;
       const fd = fs.openSync(filePath, "r");
       try {
         const buffer = Buffer.alloc(length);
-        fs.readSync(fd, buffer, 0, length, start);
+        const bytesRead = fs.readSync(fd, buffer, 0, length, start);
+        const data = buffer.subarray(0, bytesRead);
+        const cappedLength = Math.min(cappedEnd - start, bytesRead);
+
+        let sliceStart = 0;
+        while (sliceStart < data.length && (data[sliceStart] & 0xc0) === 0x80) {
+          sliceStart += 1;
+        }
+
+        let sliceEnd = cappedLength;
+        while (sliceEnd < data.length && (data[sliceEnd] & 0xc0) === 0x80) {
+          sliceEnd += 1;
+        }
+        sliceEnd = this.completeUtf8End(data, sliceStart, sliceEnd);
+
+        const startOffset = start + sliceStart;
+        const nextOffset = start + sliceEnd;
         return {
-          text: buffer.toString("utf8"),
-          truncated: start > 0,
+          text: data.subarray(sliceStart, sliceEnd).toString("utf8"),
+          truncated: requestedOffset === undefined && startOffset > 0,
+          startOffset,
+          nextOffset,
+          fileSize,
+          hasMore: nextOffset < fileSize,
+          cursorReset,
+          readSucceeded: true,
         };
       } finally {
         fs.closeSync(fd);
       }
     } catch {
-      return { text: "", truncated: false };
+      const startOffset = requestedOffset ?? 0;
+      return {
+        text: "",
+        truncated: false,
+        startOffset,
+        nextOffset: startOffset,
+        fileSize: 0,
+        hasMore: false,
+        cursorReset: false,
+        readSucceeded: false,
+      };
     }
   }
 

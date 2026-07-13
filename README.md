@@ -386,7 +386,7 @@ Example with selective servers:
 - [x] **SFTP connection reuse controls**: `upload` / `download` / `transfer` support `reuseConnection`, `vvv`, and explicit fresh one-shot SSH clients
 - [x] **Fast single-file SFTP**: optional ssh2 `fastPut` / `fastGet` via `fast`, `sftpConcurrency`, and `chunkSize`
 - [ ] **SFTP retry parity**: extend the retry-with-reconnect loop to `upload` / `download` / `transfer`
-- [ ] **TCP keepalive**: pass `keepaliveInterval` / `keepaliveCountMax` to `ssh2.Client` so half-open connections are detected without waiting for the next command
+- [x] **SSH keepalive**: cached and jump SSH clients use `keepaliveInterval` / `keepaliveCountMax` (defaults: 5000 ms / 2 unanswered probes) to detect half-open connections
 - [ ] **Server health check**: optional periodic ping to detect drops proactively
 
 ## 📄 License

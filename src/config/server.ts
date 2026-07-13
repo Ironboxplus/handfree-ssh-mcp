@@ -1,6 +1,6 @@
 export const SERVER_CONFIG = {
   name: "ssh-mcp-server",
-  version: "1.0.15",
+  version: "1.0.16",
 };
 
 export const SERVER_INSTRUCTIONS = `This server provides SSH access to servers loaded from OpenSSH config (~/.ssh/config by default) and optional YAML config/policy overlays.
@@ -10,7 +10,7 @@ Recommended workflow:
 2. Use show-whitelist before execute-command when you are unsure which command policy is active.
 3. Use execute-command for remote shell commands. Prefer a single command per call. Compound commands may be rejected by command policy even if each subcommand is individually safe.
 4. Use stream=false for short commands that should finish quickly, such as pwd, ls, cat, head, tail, git status, or docker ps.
-5. Use stream=true (the default) for long-running commands. It starts the command in the background and returns runId/logPath immediately; poll with command-status instead of holding one tools/call open.
+5. Use stream=true (the default) for long-running commands. It starts the command in the background and returns runId/logPath immediately; poll with command-status instead of holding one tools/call open. command-status uses incremental output by default and advances its per-run cursor automatically.
 6. execute-command reuses SSH connections by default. If an execute-command call times out, retry the next command with reuseConnection=false to bypass a potentially stale cached SSH connection.
 7. SFTP tools also reuse SSH connections by default. If upload/download/transfer times out or reports a connection-shaped SFTP/channel error, retry with reuseConnection=false; the fresh SSH connection closes after that transfer.
 8. Use close-connection to close a cached SSH connection for a server before retrying with a clean reused connection. Closing a jump host also closes cached targets that jump through it.

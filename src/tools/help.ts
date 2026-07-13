@@ -54,15 +54,26 @@ Examples:
 Parameters:
   runId           (string, required)   runId returned by execute-command
                                       when stream=true.
-  maxOutputBytes  (number, optional)   Live log tail bytes to return.
+  maxOutputBytes  (number, optional)   Live output bytes per chunk or tail.
                                       Defaults to 65536.
+  incremental     (boolean, optional)  Default true. Repeated calls return only
+                                      new outputChunk data and advance a stored
+                                      cursor. False returns outputTail and still
+                                      advances the cursor to the current file end.
+  offset          (number, optional)   Override the stored byte cursor. The
+                                      returned nextOffset becomes the new cursor.
 
 Returns: JSON with runId, status (running/completed/failed), logPath,
-         timestamps, error when failed, and outputTail. Status is process-local;
+         timestamps, error when failed, outputChunk in incremental mode or
+         outputTail when incremental=false, nextOffset, fileSize, and hasMore.
+         Poll again while hasMore=true to drain backlog. Status and cursor are
+         process-local;
          after MCP server restart, read the returned logPath directly.
 
 Example:
-  command-status { runId: "cmd_20260712T120000Z_ab12cd34", maxOutputBytes: 50000 }`,
+  command-status { runId: "cmd_20260712T120000Z_ab12cd34", maxOutputBytes: 50000 }
+  command-status { runId: "cmd_20260712T120000Z_ab12cd34", incremental: false }
+  command-status { runId: "cmd_20260712T120000Z_ab12cd34", offset: 12345 }`,
 
   "show-whitelist": `show-whitelist — Show the active command policy for a server.
 
@@ -210,7 +221,7 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   execute-command   Run a shell command on a remote server.
   show-whitelist    Show the active command policy.
   close-connection  Close a cached SSH connection for a server.
-  command-status    Poll background command status and live log tail.
+  command-status    Poll background status and incremental live output.
   upload            Upload a single file to a remote server.
   download          Download a single file from a remote server.
   transfer          Move files: single, recursive, or cross-server relay.

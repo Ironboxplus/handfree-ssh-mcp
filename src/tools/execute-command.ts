@@ -16,7 +16,7 @@ export function registerExecuteCommandTool(server: McpServer): void {
 
   server.tool(
     "execute-command",
-    "Execute a shell command on a remote server over SSH. By default stream=true starts the command in the background and returns immediately with runId/logPath; use command-status to poll status and live log tail. Set stream=false for short commands where you want to wait for the final output in the same tool call. SSH connections are reused by default for speed; if an execute-command call times out or you suspect a stale cached SSH connection, retry with reuseConnection=false to force a fresh TCP/SSH connection for that command. Set vvv=true only when debugging SSH/channel issues; with reuseConnection=false it includes ssh2 handshake/debug lines in the result or error. For stream=false, returned text is tail-only-capped at maxOutputBytes per stream and full stdout/stderr is persisted under <cwd>/.handfree-output/<server>/<user>/.",
+    "Execute a shell command on a remote server over SSH. By default stream=true starts the command in the background and returns immediately with runId/logPath; use command-status to poll status and incremental live output. Set stream=false for short commands where you want to wait for the final output in the same tool call. SSH connections are reused by default for speed; if an execute-command call times out or you suspect a stale cached SSH connection, retry with reuseConnection=false to force a fresh TCP/SSH connection for that command. Set vvv=true only when debugging SSH/channel issues; with reuseConnection=false it includes ssh2 handshake/debug lines in the result or error. For stream=false, returned text is tail-only-capped at maxOutputBytes per stream and full stdout/stderr is persisted under <cwd>/.handfree-output/<server>/<user>/.",
     {
       cmdString: z.string().describe("Exact remote shell command to run. Prefer a single command per call, for example 'pwd', 'ls -la', 'cat /etc/hostname', or 'git status'. Compound commands may be blocked by command policy even if each subcommand is safe."),
       connectionName: z
@@ -88,7 +88,7 @@ export function registerExecuteCommandTool(server: McpServer): void {
 
           const result = {
             ...started,
-            next: `Poll with command-status { "runId": "${started.runId}", "maxOutputBytes": ${maxOutputBytes ?? 65536} }`,
+            next: `Poll with command-status { "runId": "${started.runId}", "maxOutputBytes": ${maxOutputBytes ?? SSHConnectionManager.DEFAULT_MAX_OUTPUT_BYTES} }; incremental output is enabled by default and its cursor advances automatically`,
           };
           return {
             content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

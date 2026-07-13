@@ -34,8 +34,8 @@ export interface SSHConfig {
   // proactively (ssh2 emits close/error → the connection self-heals on the next
   // reuse) instead of only being discovered when a later command hangs.
   // Defaults ON. Set keepaliveInterval to 0 to disable.
-  keepaliveInterval?: number; // ms between keepalive probes. Default 15000. 0 disables keepalive.
-  keepaliveCountMax?: number; // max unanswered probes before ssh2 declares the connection dead. Default 3.
+  keepaliveInterval?: number; // ms between keepalive probes. Default 5000. 0 disables keepalive.
+  keepaliveCountMax?: number; // max unanswered probes before ssh2 declares the connection dead. Default 2.
   // Timeout (ms) for the exec-channel-OPEN phase only, kept separate from the
   // command run timeout. A reused-but-dead connection can accept but never open
   // a channel; a short open timeout fails fast (retriable) and drops the stale

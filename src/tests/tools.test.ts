@@ -862,8 +862,13 @@ describe("MCP tool handlers", () => {
     const { server, handlers } = captureRegisteredTools();
     let captured: any;
 
-    manager.getBackgroundCommandStatus = (runId?: string, maxOutputBytes?: number) => {
-      captured = { runId, maxOutputBytes };
+    manager.getBackgroundCommandStatus = (
+      runId?: string,
+      maxOutputBytes?: number,
+      offset?: number,
+      incremental?: boolean,
+    ) => {
+      captured = { runId, maxOutputBytes, offset, incremental };
       return {
         runId,
         status: "running",
@@ -871,7 +876,12 @@ describe("MCP tool handlers", () => {
         command: "sleep 10",
         startedAt: "2026-07-12T00:00:00.000Z",
         logPath: "E:\\logs\\run-1.log",
-        outputTail: "partial output",
+        outputChunk: "partial output",
+        incremental: true,
+        outputStartOffset: 456,
+        nextOffset: 470,
+        fileSize: 470,
+        hasMore: false,
       };
     };
 
@@ -884,6 +894,7 @@ describe("MCP tool handlers", () => {
         {
           runId: "run-1",
           maxOutputBytes: 123,
+          offset: 456,
         },
         { _meta: {}, sendNotification: () => {} },
       );
@@ -892,8 +903,14 @@ describe("MCP tool handlers", () => {
       const body = JSON.parse(result.content[0].text);
       assert.strictEqual(body.runId, "run-1");
       assert.strictEqual(body.status, "running");
-      assert.strictEqual(body.outputTail, "partial output");
-      assert.deepStrictEqual(captured, { runId: "run-1", maxOutputBytes: 123 });
+      assert.strictEqual(body.outputChunk, "partial output");
+      assert.strictEqual(body.nextOffset, 470);
+      assert.deepStrictEqual(captured, {
+        runId: "run-1",
+        maxOutputBytes: 123,
+        offset: 456,
+        incremental: undefined,
+      });
     } finally {
       manager.getBackgroundCommandStatus = originalGetBackgroundCommandStatus;
     }

@@ -1686,6 +1686,33 @@ describe("SSHConnectionManager regressions", () => {
     }
   });
 
+  it("should apply default keepalive settings to one-shot SSH clients", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const originalConnect = Client.prototype.connect;
+    const originalEnd = Client.prototype.end;
+    let capturedConfig: Record<string, unknown> | undefined;
+
+    Client.prototype.connect = function (this: Client, config: Record<string, unknown>) {
+      capturedConfig = config;
+      queueMicrotask(() => this.emit("ready"));
+      return this;
+    } as any;
+    Client.prototype.end = function (this: Client) {
+      return this;
+    } as any;
+
+    try {
+      const acquired = await manager.connectCommandClient("dev", 1000);
+      assert.strictEqual(capturedConfig?.keepaliveInterval, 5000);
+      assert.strictEqual(capturedConfig?.keepaliveCountMax, 2);
+      acquired.close();
+    } finally {
+      Client.prototype.connect = originalConnect;
+      Client.prototype.end = originalEnd;
+    }
+  });
+
   it("should pass caller timeout through to exec channel opening without a 30s cap", async () => {
     const originalSetTimeout = globalThis.setTimeout;
     const observedDelays: number[] = [];
@@ -2084,7 +2111,9 @@ describe("SSHConnectionManager regressions", () => {
 
       let running = manager.getBackgroundCommandStatus(started.runId, 4096);
       assert.strictEqual(running.status, "running");
-      assert.match(running.outputTail ?? "", /hello/);
+      assert.match(running.outputChunk ?? "", /hello/);
+      assert.strictEqual(running.outputTail, undefined);
+      assert.ok((running.nextOffset ?? 0) > 0);
 
       finishCommand();
       for (let i = 0; i < 20; i++) {
@@ -2097,12 +2126,201 @@ describe("SSHConnectionManager regressions", () => {
       }
 
       assert.strictEqual(running.status, "completed");
-      assert.match(running.outputTail ?? "", /world/);
-      assert.match(running.outputTail ?? "", /=== END ===/);
+      assert.strictEqual(running.outputTail, undefined);
+      assert.match(running.outputChunk ?? "", /world/);
+      assert.match(running.outputChunk ?? "", /=== END ===/);
+      assert.doesNotMatch(running.outputChunk ?? "", /hello/);
+
+      const caughtUp = manager.getBackgroundCommandStatus(started.runId, 4096);
+      assert.strictEqual(caughtUp.outputChunk, "");
+      assert.strictEqual(caughtUp.hasMore, false);
     } finally {
       manager.acquireSshClient = originalAcquireSshClient;
       manager.runCommandStream = originalRunCommandStream;
       manager.setOutputLogRoot(null);
+      fsForTest.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should advance the background output cursor when incremental mode is disabled", () => {
+    const tempRoot = path.resolve(
+      process.cwd(),
+      `handfree-background-tail-cursor-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    const logPath = path.join(tempRoot, "tail-cursor.log");
+    const runId = `tail-cursor-${Date.now()}`;
+
+    fsForTest.mkdirSync(tempRoot, { recursive: true });
+    fsForTest.writeFileSync(logPath, "before\n", "utf8");
+    manager.backgroundCommands.set(runId, {
+      runId,
+      status: "running",
+      serverName: "dev",
+      command: "pwd",
+      startedAt: new Date().toISOString(),
+      logPath,
+    });
+
+    try {
+      const tail = manager.getBackgroundCommandStatus(runId, 4096, undefined, false);
+      assert.strictEqual(tail.incremental, false);
+      assert.strictEqual(tail.outputTail, "before\n");
+      assert.strictEqual(tail.outputChunk, undefined);
+
+      fsForTest.appendFileSync(logPath, "after\n", "utf8");
+      const incremental = manager.getBackgroundCommandStatus(runId, 4096);
+      assert.strictEqual(incremental.incremental, true);
+      assert.strictEqual(incremental.outputChunk, "after\n");
+      assert.strictEqual(incremental.outputTail, undefined);
+    } finally {
+      manager.backgroundCommands.delete(runId);
+      manager.backgroundCommandOffsets.delete(runId);
+      fsForTest.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should return incremental background output without UTF-8 splits or skipped backlog", () => {
+    const tempRoot = path.resolve(
+      process.cwd(),
+      `handfree-background-incremental-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    const logPath = path.join(tempRoot, "incremental.log");
+    const runId = `incremental-${Date.now()}`;
+    const content = "αβgamma";
+
+    fsForTest.mkdirSync(tempRoot, { recursive: true });
+    fsForTest.writeFileSync(logPath, content, "utf8");
+    manager.backgroundCommands.set(runId, {
+      runId,
+      status: "running",
+      serverName: "dev",
+      command: "pwd",
+      startedAt: new Date().toISOString(),
+      logPath,
+    });
+
+    try {
+      const first = manager.getBackgroundCommandStatus(runId, 3, 0);
+      assert.strictEqual(first.outputChunk, "αβ");
+      assert.strictEqual(first.outputTail, undefined);
+      assert.strictEqual(first.outputStartOffset, 0);
+      assert.strictEqual(first.nextOffset, 4);
+      assert.strictEqual(first.hasMore, true);
+
+      const second = manager.getBackgroundCommandStatus(runId, 3, first.nextOffset);
+      assert.strictEqual(second.outputChunk, "gam");
+      assert.strictEqual(second.nextOffset, 7);
+      assert.strictEqual(second.hasMore, true);
+
+      const third = manager.getBackgroundCommandStatus(runId, 3, second.nextOffset);
+      assert.strictEqual(third.outputChunk, "ma");
+      assert.strictEqual(third.nextOffset, Buffer.byteLength(content));
+      assert.strictEqual(third.hasMore, false);
+      assert.strictEqual(first.outputChunk + second.outputChunk + third.outputChunk, content);
+    } finally {
+      manager.backgroundCommands.delete(runId);
+      manager.backgroundCommandOffsets.delete(runId);
+      fsForTest.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should wait for an incomplete UTF-8 character at EOF before advancing the cursor", () => {
+    const tempRoot = path.resolve(process.cwd(), `handfree-background-partial-utf8-${Date.now()}`);
+    const logPath = path.join(tempRoot, "partial-utf8.log");
+    const runId = `partial-utf8-${Date.now()}`;
+    const encoded = Buffer.from("你", "utf8");
+
+    fsForTest.mkdirSync(tempRoot, { recursive: true });
+    fsForTest.writeFileSync(logPath, encoded.subarray(0, 1));
+    manager.backgroundCommands.set(runId, {
+      runId,
+      status: "running",
+      serverName: "dev",
+      command: "pwd",
+      startedAt: new Date().toISOString(),
+      logPath,
+    });
+
+    try {
+      const partial = manager.getBackgroundCommandStatus(runId, 16);
+      assert.strictEqual(partial.outputChunk, "");
+      assert.strictEqual(partial.nextOffset, 0);
+      assert.strictEqual(partial.hasMore, true);
+
+      fsForTest.appendFileSync(logPath, encoded.subarray(1));
+      const complete = manager.getBackgroundCommandStatus(runId, 16);
+      assert.strictEqual(complete.outputChunk, "你");
+      assert.strictEqual(complete.nextOffset, encoded.length);
+      assert.strictEqual(complete.hasMore, false);
+    } finally {
+      manager.backgroundCommands.delete(runId);
+      manager.backgroundCommandOffsets.delete(runId);
+      fsForTest.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should not consume incremental output when maxOutputBytes is zero", () => {
+    const tempRoot = path.resolve(process.cwd(), `handfree-background-zero-cap-${Date.now()}`);
+    const logPath = path.join(tempRoot, "zero-cap.log");
+    const runId = `zero-cap-${Date.now()}`;
+
+    fsForTest.mkdirSync(tempRoot, { recursive: true });
+    fsForTest.writeFileSync(logPath, "pending", "utf8");
+    manager.backgroundCommands.set(runId, {
+      runId,
+      status: "running",
+      serverName: "dev",
+      command: "pwd",
+      startedAt: new Date().toISOString(),
+      logPath,
+    });
+
+    try {
+      const metadataOnly = manager.getBackgroundCommandStatus(runId, 0);
+      assert.strictEqual(metadataOnly.outputChunk, "");
+      assert.strictEqual(metadataOnly.nextOffset, 0);
+      assert.strictEqual(metadataOnly.hasMore, true);
+      assert.strictEqual(manager.getBackgroundCommandStatus(runId, 64).outputChunk, "pending");
+    } finally {
+      manager.backgroundCommands.delete(runId);
+      manager.backgroundCommandOffsets.delete(runId);
+      fsForTest.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should preserve the stored cursor when the background log is temporarily unreadable", () => {
+    const tempRoot = path.resolve(process.cwd(), `handfree-background-read-failure-${Date.now()}`);
+    const logPath = path.join(tempRoot, "read-failure.log");
+    const hiddenPath = `${logPath}.hidden`;
+    const runId = `read-failure-${Date.now()}`;
+
+    fsForTest.mkdirSync(tempRoot, { recursive: true });
+    fsForTest.writeFileSync(logPath, "before\n", "utf8");
+    manager.backgroundCommands.set(runId, {
+      runId,
+      status: "running",
+      serverName: "dev",
+      command: "pwd",
+      startedAt: new Date().toISOString(),
+      logPath,
+    });
+
+    try {
+      assert.strictEqual(manager.getBackgroundCommandStatus(runId, 4096).outputChunk, "before\n");
+      fsForTest.renameSync(logPath, hiddenPath);
+      const unavailable = manager.getBackgroundCommandStatus(runId, 4096, undefined, false);
+      assert.strictEqual(unavailable.outputTail, "");
+      assert.strictEqual(unavailable.outputUnavailable, true);
+      assert.strictEqual(unavailable.nextOffset, Buffer.byteLength("before\n"));
+      fsForTest.renameSync(hiddenPath, logPath);
+      fsForTest.appendFileSync(logPath, "after\n", "utf8");
+      assert.strictEqual(manager.getBackgroundCommandStatus(runId, 4096).outputChunk, "after\n");
+    } finally {
+      if (fsForTest.existsSync(hiddenPath) && !fsForTest.existsSync(logPath)) {
+        fsForTest.renameSync(hiddenPath, logPath);
+      }
+      manager.backgroundCommands.delete(runId);
+      manager.backgroundCommandOffsets.delete(runId);
       fsForTest.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
@@ -2146,15 +2364,17 @@ describe("SSHConnectionManager regressions", () => {
       });
 
       let status = manager.getBackgroundCommandStatus(started.runId, 4096);
+      let output = status.outputChunk ?? "";
       for (let i = 0; i < 40 && status.status === "running"; i++) {
         await new Promise((resolve) => setTimeout(resolve, 5));
         status = manager.getBackgroundCommandStatus(started.runId, 4096);
+        output += status.outputChunk ?? "";
       }
 
       assert.strictEqual(status.status, "failed");
       assert.match(status.error ?? "", /watchdog fired/);
-      assert.match(status.outputTail ?? "", /COMMAND_TIMEOUT/);
-      assert.match(status.outputTail ?? "", /=== END ===/);
+      assert.match(output, /COMMAND_TIMEOUT/);
+      assert.match(output, /=== END ===/);
       assert.ok(closeCalls >= 1);
     } finally {
       manager.acquireSshClient = originalAcquireSshClient;

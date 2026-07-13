@@ -21,8 +21,8 @@ describe("resolveKeepalive", () => {
 
   it("defaults keepalive ON with sane interval/count when unset", () => {
     const k = manager.resolveKeepalive({});
-    assert.strictEqual(k.keepaliveInterval, 15000);
-    assert.strictEqual(k.keepaliveCountMax, 3);
+    assert.strictEqual(k.keepaliveInterval, 5000);
+    assert.strictEqual(k.keepaliveCountMax, 2);
   });
 
   it("honors explicit interval and count", () => {
@@ -39,7 +39,7 @@ describe("resolveKeepalive", () => {
   it("falls back to default count when count is invalid but interval is set", () => {
     const k = manager.resolveKeepalive({ keepaliveInterval: 8000, keepaliveCountMax: 0 });
     assert.strictEqual(k.keepaliveInterval, 8000);
-    assert.strictEqual(k.keepaliveCountMax, 3);
+    assert.strictEqual(k.keepaliveCountMax, 2);
   });
 });
 
