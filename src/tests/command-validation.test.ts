@@ -909,6 +909,71 @@ describe("SSHConnectionManager regressions", () => {
     }
   });
 
+  it("should not synchronously preload a default fast upload before fastPut", async () => {
+    manager.setConfig(
+      {
+        dev: baseConfig({
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["dev"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    const originalReadFileSync = fsForTest.readFileSync;
+    const tempPath = path.resolve(
+      process.cwd(),
+      `handfree-sftp-fast-no-preload-${Date.now()}-${Math.random().toString(36).slice(2)}.bin`,
+    );
+    fsForTest.writeFileSync(tempPath, "payload");
+    let openCalls = 0;
+    let fastPutCalls = 0;
+
+    manager.acquireSshClient = async () => ({
+      client: { cached: true },
+      close: () => {},
+    });
+    manager.openSftp = async () => {
+      openCalls += 1;
+      if (openCalls === 1) {
+        return {
+          end: () => {},
+          stat: (_path: string, callback: (error?: Error) => void) => {
+            callback(new Error("No such file"));
+          },
+        } as any;
+      }
+      return {
+        end: () => {},
+        fastPut: (
+          _localPath: string,
+          _remotePath: string,
+          _options: unknown,
+          callback: (err?: Error) => void,
+        ) => {
+          fastPutCalls += 1;
+          callback();
+        },
+      } as any;
+    };
+    (fsForTest as any).readFileSync = () => {
+      throw new Error("fast upload must not preload the local file");
+    };
+
+    try {
+      const result = await manager.upload(tempPath, "/tmp/file.bin", "dev", { fast: true });
+      assert.match(result, /File uploaded successfully/);
+      assert.match(result, /fast SFTP/);
+      assert.strictEqual(fastPutCalls, 1);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      (fsForTest as any).readFileSync = originalReadFileSync;
+      fsForTest.unlinkSync(tempPath);
+    }
+  });
+
   it("should use ssh2 fastGet when fast SFTP download is enabled", async () => {
     manager.setConfig(
       {

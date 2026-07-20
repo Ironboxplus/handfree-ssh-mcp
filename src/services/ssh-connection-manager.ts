@@ -1105,6 +1105,16 @@ export class SSHConnectionManager {
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       let timer: NodeJS.Timeout | null = null;
+      // ssh2 fastPut/fastGet invokes `step` for every acknowledged chunk. At
+      // the default 32 KiB chunk size that can mean thousands of callbacks per
+      // second. Re-creating a JS timer for every callback eventually dominates
+      // the event loop and makes an otherwise healthy transfer slow down. A
+      // watchdog only needs a recent proof of life, so coalesce those resets.
+      const progressRearmIntervalMs = Math.min(
+        1_000,
+        Math.max(1, Math.floor(timeoutMs / 4)),
+      );
+      let lastArmedAt = 0;
 
       const clear = () => {
         if (timer) {
@@ -1115,6 +1125,7 @@ export class SSHConnectionManager {
 
       const arm = () => {
         clear();
+        lastArmedAt = Date.now();
         timer = setTimeout(() => {
           if (settled) return;
           settled = true;
@@ -1133,7 +1144,9 @@ export class SSHConnectionManager {
       };
 
       const onProgress = () => {
-        if (!settled) arm();
+        if (!settled && Date.now() - lastArmedAt >= progressRearmIntervalMs) {
+          arm();
+        }
       };
 
       arm();
@@ -3130,7 +3143,11 @@ export class SSHConnectionManager {
       path.extname(validatedLocalPath).toLowerCase(),
     );
     const fastUpload = options?.fast === true;
-    const mustReadPayload = skipIfIdentical || !fastUpload || isShellScript;
+    // fastPut reads from disk on its own. Keep that path zero-copy from this
+    // process's perspective: a default skip-if-identical check must not turn a
+    // large fast upload into a synchronous fs.readFileSync() followed by a
+    // second disk read inside ssh2.
+    const mustReadPayload = !fastUpload || isShellScript;
     let payload: Buffer | null = null;
     let crlfFixed: { buffer: Buffer; fixed: boolean; replacedCount: number } = {
       buffer: Buffer.alloc(0),
@@ -3174,14 +3191,23 @@ export class SSHConnectionManager {
 
       // ---- Skip-if-identical check ----
       if (skipIfIdentical) {
-        const decision = await this.shouldSkipUpload(
-          client,
-          payload!,
-          validatedRemotePath,
-          isShellScript,
-          options?.timeout,
-          debug,
-        );
+        const decision = payload
+          ? await this.shouldSkipUpload(
+              client,
+              payload,
+              validatedRemotePath,
+              isShellScript,
+              options?.timeout,
+              debug,
+            )
+          : await this.shouldSkipFastUpload(
+              client,
+              validatedLocalPath,
+              stat.size,
+              validatedRemotePath,
+              options?.timeout,
+              debug,
+            );
         if (decision.skip) {
           return this.appendDebugOutput(
             `Upload skipped: remote file '${validatedRemotePath}' is already identical to local ` +
@@ -3366,6 +3392,136 @@ export class SSHConnectionManager {
       return { skip: true, reason: `identical-md5(${localMd5}, ${remoteSize} bytes)` };
     }
     return { skip: false, reason: `md5-differs(local=${localMd5}, remote=${remoteMd5})` };
+  }
+
+  /**
+   * Skip-if-identical path for a fast upload. Unlike the buffered path, this
+   * never preloads the local file. Most uploads hit the size-different branch
+   * and can enter ssh2 fastPut immediately; equal-sized files are compared with
+   * streaming SHA-256 digests so memory remains bounded on every platform.
+   */
+  private async shouldSkipFastUpload(
+    client: Client,
+    localPath: string,
+    localSize: number,
+    remotePath: string,
+    timeout?: number,
+    debug?: SshDebugSink,
+  ): Promise<{ skip: boolean; reason: string }> {
+    let remoteSize: number;
+    try {
+      const sftp = await this.openSftp(client, "fast-upload-stat", timeout, debug);
+      try {
+        remoteSize = (await this.sftpStat(sftp, remotePath, "dest")).size;
+      } finally {
+        sftp.end();
+      }
+    } catch {
+      return { skip: false, reason: "remote-missing-or-unstat-able" };
+    }
+
+    if (remoteSize !== localSize) {
+      return { skip: false, reason: `size-differs(local=${localSize},remote=${remoteSize})` };
+    }
+
+    try {
+      const identical = await this.filesMatchByStreamingHash(
+        client,
+        localPath,
+        remotePath,
+        timeout,
+        debug,
+      );
+      return identical
+        ? { skip: true, reason: `identical-sha256(${localSize} bytes)` }
+        : { skip: false, reason: "content-differs" };
+    } catch {
+      // A failed optional comparison must not prevent the real upload.
+      return { skip: false, reason: "streamed-content-compare-unavailable" };
+    }
+  }
+
+  /**
+   * Compare one local and one remote file without buffering either whole file.
+   * The two streams are hashed independently because their chunk boundaries are
+   * not guaranteed to align. The same inactivity watchdog used by transfers
+   * makes a stale reused SFTP channel fail rather than hang this comparison.
+   */
+  private async filesMatchByStreamingHash(
+    client: Client,
+    localPath: string,
+    remotePath: string,
+    timeout?: number,
+    debug?: SshDebugSink,
+  ): Promise<boolean> {
+    const sftp = await this.openSftp(client, "fast-upload-compare", timeout, debug);
+    let localStream: fs.ReadStream | null = null;
+    let remoteStream: NodeJS.ReadableStream | null = null;
+    const cleanup = () => {
+      this.destroyStream(localStream);
+      this.destroyStream(remoteStream);
+      try {
+        sftp.end();
+      } catch {
+        // Ignore late SFTP cleanup errors.
+      }
+    };
+
+    try {
+      return await this.runWithInactivityTimeout<boolean>(
+        (onProgress) =>
+          new Promise<boolean>((resolve, reject) => {
+            const localHash = crypto.createHash("sha256");
+            const remoteHash = crypto.createHash("sha256");
+            let localDone = false;
+            let remoteDone = false;
+            let settled = false;
+
+            const fail = (error: Error) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(error);
+            };
+            const finish = () => {
+              if (settled || !localDone || !remoteDone) return;
+              settled = true;
+              resolve(localHash.digest("hex") === remoteHash.digest("hex"));
+            };
+
+            try {
+              localStream = fs.createReadStream(localPath);
+              remoteStream = sftp.createReadStream(remotePath);
+              localStream.on("data", (chunk: string | Buffer) => {
+                localHash.update(chunk);
+                onProgress();
+              });
+              remoteStream.on("data", (chunk: string | Buffer) => {
+                remoteHash.update(chunk);
+                onProgress();
+              });
+              localStream.on("end", () => {
+                localDone = true;
+                finish();
+              });
+              remoteStream.on("end", () => {
+                remoteDone = true;
+                finish();
+              });
+              localStream.on("error", (error: Error) => fail(error));
+              remoteStream.on("error", (error: Error) => fail(error));
+            } catch (error) {
+              fail(error as Error);
+            }
+          }),
+        this.transferStallTimeout(timeout),
+        `compare ${remotePath}`,
+        debug,
+        cleanup,
+      );
+    } finally {
+      cleanup();
+    }
   }
 
   /**

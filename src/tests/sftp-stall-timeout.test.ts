@@ -211,3 +211,37 @@ describe("pipeWithInactivityTimeout watchdog", () => {
     await p;
   });
 });
+
+describe("runWithInactivityTimeout progress coalescing", () => {
+  const manager = SSHConnectionManager.getInstance() as any;
+
+  it("does not recreate the watchdog timer for every fast-transfer acknowledgement", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    let timerArms = 0;
+    (globalThis as any).setTimeout = (
+      callback: (...args: any[]) => void,
+      delay?: number,
+      ...args: any[]
+    ) => {
+      timerArms += 1;
+      return originalSetTimeout(callback, delay, ...args);
+    };
+
+    try {
+      await manager.runWithInactivityTimeout(
+        (onProgress: () => void) =>
+          new Promise<void>((resolve) => {
+            // ssh2 calls step once per acknowledged chunk. A large transfer can
+            // generate tens of thousands of these in one event-loop turn.
+            for (let i = 0; i < 50_000; i += 1) onProgress();
+            resolve();
+          }),
+        60_000,
+        "high-throughput fast transfer",
+      );
+      assert.ok(timerArms < 20, `expected coalesced timer resets, got ${timerArms}`);
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+    }
+  });
+});
