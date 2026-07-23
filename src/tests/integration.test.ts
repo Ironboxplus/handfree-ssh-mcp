@@ -281,6 +281,22 @@ async function main() {
       info(`Found ${servers.length} server(s) in list`);
     });
 
+    // Test: refreshStatus must not hang (the list-servers hang regression)
+    await runTest(`[${serverName}] refreshStatus completes within budget`, async () => {
+      const start = Date.now();
+      const results = await sshManager.refreshStatus(serverName);
+      const elapsed = Date.now() - start;
+      // connect budget 15s + probe 15s + margin
+      if (elapsed > 40_000) {
+        throw new Error(`refreshStatus hung too long: ${elapsed}ms (budget 40s)`);
+      }
+      const st = results[serverName];
+      if (!st) {
+        throw new Error(`refreshStatus returned no entry for ${serverName}`);
+      }
+      info(`refreshStatus in ${elapsed}ms reachable=${st.reachable} hostname=${st.hostname ?? "-"}`);
+    });
+
     // Test: Timeout behavior (short timeout should not hang forever)
     await runTest(`[${serverName}] Short timeout behavior`, async () => {
       const start = Date.now();

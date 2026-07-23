@@ -3,7 +3,10 @@ import type { SFTPWrapper, TransferOptions } from "ssh2";
 import { SocksClient } from "socks";
 import { SSHConfig, SshConnectionConfigMap, ServerStatus } from "../models/types.js";
 import { Logger } from "../utils/logger.js";
-import { collectSystemStatus } from "../utils/status-collector.js";
+import {
+  collectSystemStatus,
+  DEFAULT_STATUS_COLLECT_TIMEOUT_MS,
+} from "../utils/status-collector.js";
 import { ToolError } from "../utils/tool-error.js";
 import { OutputCollector } from "../utils/output-collector.js";
 import { OutputLogWriter } from "../utils/output-log-writer.js";
@@ -484,12 +487,20 @@ export class SSHConnectionManager {
         // 先 resolve，让用户命令可以立即执行
         resolve();
 
-        // 延迟执行系统状态收集，避免与用户的第一个命令竞争 SSH 通道
-        // 这修复了首次连接后第一个命令失败的竞态条件问题
-        // See: https://github.com/classfang/ssh-mcp-server/issues/XX
+        // 延迟执行系统状态收集，避免与用户的第一个命令竞争 SSH 通道。
+        // Status collection is time-bounded (see DEFAULT_STATUS_COLLECT_TIMEOUT_MS)
+        // and uses a single exec channel so a wedged remote probe (e.g. nvidia-smi)
+        // cannot hang forever or exhaust MaxSessions and starve later tools.
         setTimeout(() => {
-          collectSystemStatus(client, key)
+          // Bail out if this client was already replaced/closed.
+          if (this.clients.get(key) !== client) {
+            return;
+          }
+          collectSystemStatus(client, key, {
+            timeoutMs: DEFAULT_STATUS_COLLECT_TIMEOUT_MS,
+          })
             .then((status) => {
+              if (this.clients.get(key) !== client) return;
               this.statusCache.set(key, status);
               Logger.log(
                 `System status collected for [${key}]`,
@@ -497,13 +508,14 @@ export class SSHConnectionManager {
               );
             })
             .catch((error) => {
+              if (this.clients.get(key) !== client) return;
               Logger.log(
                 `Failed to collect system status for [${key}]: ${(error as Error).message}`,
                 "error"
               );
               // Set basic status even if collection fails
               this.statusCache.set(key, {
-                reachable: true,
+                reachable: false,
                 lastUpdated: new Date().toISOString(),
               });
             });
@@ -3912,7 +3924,18 @@ export class SSHConnectionManager {
   }
 
   /**
-   * Refresh system status for a server (or all enabled servers)
+   * Default budget for refreshStatus connect + probe. Kept short so
+   * list-servers {refresh:true} cannot hang the MCP tool call for minutes
+   * when a host is unreachable or a status probe stalls.
+   */
+  private static readonly DEFAULT_STATUS_REFRESH_CONNECT_TIMEOUT_MS = 15_000;
+
+  /**
+   * Refresh system status for a server (or all enabled servers).
+   *
+   * Each server is independently time-bounded (connect + probe). Failures
+   * yield reachable:false cache entries and never block other servers or
+   * the list-servers tool call indefinitely.
    */
   public async refreshStatus(name?: string): Promise<Record<string, ServerStatus>> {
     const results: Record<string, ServerStatus> = {};
@@ -3923,8 +3946,16 @@ export class SSHConnectionManager {
     await Promise.allSettled(
       names.map(async (key) => {
         try {
-          const client = await this.ensureConnected(key);
-          const status = await collectSystemStatus(client, key);
+          // Bound both the connect phase (readyTimeout + withConnectionTimeout)
+          // and the probe. Previously ensureConnected() had NO default timeout,
+          // so a dead host made list-servers {refresh:true} hang forever.
+          const client = await this.ensureConnected(
+            key,
+            SSHConnectionManager.DEFAULT_STATUS_REFRESH_CONNECT_TIMEOUT_MS,
+          );
+          const status = await collectSystemStatus(client, key, {
+            timeoutMs: DEFAULT_STATUS_COLLECT_TIMEOUT_MS,
+          });
           this.statusCache.set(key, status);
           results[key] = status;
         } catch (error) {

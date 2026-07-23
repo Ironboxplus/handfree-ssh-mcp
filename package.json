@@ -1,6 +1,6 @@
 {
   "name": "@aaarc/handfree-ssh-mcp",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "description": "Handfree SSH MCP Server - A hands-free SSH automation tool via MCP protocol",
   "main": "build/index.js",
   "type": "module",
@@ -19,7 +19,9 @@
     "access": "public"
   },
   "scripts": {
-    "test": "npm run build && node --test build/tests/config.test.js build/tests/command-validation.test.js build/tests/tool-error.test.js build/tests/tools.test.js build/tests/output-collector.test.js build/tests/output-log-writer.test.js build/tests/recent-fixes.test.js build/tests/sftp-stall-timeout.test.js build/tests/keepalive-channel-open.test.js",
+    "test": "npm run build && node --test build/tests/config.test.js build/tests/command-validation.test.js build/tests/tool-error.test.js build/tests/tools.test.js build/tests/output-collector.test.js build/tests/output-log-writer.test.js build/tests/recent-fixes.test.js build/tests/sftp-stall-timeout.test.js build/tests/keepalive-channel-open.test.js build/tests/status-collector.test.js",
+    "test:status": "npm run build && node --test build/tests/status-collector.test.js",
+    "smoke:list-servers": "npm run build && node -- scripts/smoke-list-servers.js",
     "test:config": "npm run build && node --test build/tests/config.test.js",
     "test:cmd": "npm run build && node --test build/tests/command-validation.test.js",
     "test:tools": "npm run build && node --test build/tests/tools.test.js",

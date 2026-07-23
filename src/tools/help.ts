@@ -5,16 +5,20 @@ const TOOL_HELP: Record<string, string> = {
   "list-servers": `list-servers — Discover available SSH servers.
 
 Parameters:
-  refresh  (boolean, optional)  When true, re-collects live system status
-           (hostname, CPU, memory, disk, GPUs) from all enabled servers.
-           Without this, cached status from connection time is returned.
+  verbose  (boolean, optional)  Include the cached system status block
+           (hostname, CPU, memory, disk, GPUs). Off by default.
+  refresh  (boolean, optional)  Re-collect live system status from all
+           enabled servers before returning. Implies verbose=true.
+           Connect + probe are time-bounded (~15s each); a stuck remote
+           returns reachable:false instead of hanging the tool call.
 
 Returns: JSON array of server objects with name, host, port, username,
          connected, enabled, and optional status.
 
 Example:
-  list-servers                   → cached info
-  list-servers { refresh: true } → fresh system status`,
+  list-servers                      → lean identity + connected state
+  list-servers { verbose: true }    → include cached status if available
+  list-servers { refresh: true }    → fresh system status (bounded)`,
 
   "execute-command": `execute-command — Run a shell command on a remote server.
 
