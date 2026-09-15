@@ -59,6 +59,7 @@
   },
   "files": [
     "build/config/**/*",
+    "build/connection/**/*",
     "build/core/**/*",
     "build/models/**/*",
     "build/services/**/*",
