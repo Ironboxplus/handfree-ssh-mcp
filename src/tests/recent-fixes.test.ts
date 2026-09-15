@@ -8,6 +8,14 @@
  *
  * These reach into SSHConnectionManager via `as any` to exercise private
  * surfaces directly, matching the style of command-validation.test.ts.
+ *
+ * PLAN.MD P0-04: connect()'s in-flight-dedup logic and its doConnect()
+ * implementation now live on SshConnectionPool (SSHConnectionManager holds
+ * a `pool` instance and delegates). The dedup tests below intercept
+ * `manager.pool.doConnect` (not `manager.doConnect`, which is just a thin
+ * facade forwarding to `manager.pool.connect()` and is never itself
+ * invoked). `manager.connecting`/`manager.clients`/`manager.connected`
+ * still work unchanged -- they are getter proxies onto the same pool Maps.
  */
 
 import { afterEach, describe, it } from "node:test";
@@ -68,8 +76,8 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
     manager.setConfig({ dev: baseConfig() }, ["dev"]);
 
     let doConnectCalls = 0;
-    const originalDoConnect = manager.doConnect;
-    manager.doConnect = async (key: string) => {
+    const originalDoConnect = manager.pool.doConnect;
+    manager.pool.doConnect = async (key: string) => {
       doConnectCalls += 1;
       // Tiny tick so all callers are queued on the same promise.
       await new Promise<void>((resolve) => setTimeout(resolve, 5));
@@ -87,7 +95,7 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
       assert.strictEqual(doConnectCalls, 1, "doConnect must run exactly once for concurrent calls");
       assert.strictEqual(manager.clients.size, 1, "exactly one SSH client must be stored");
     } finally {
-      manager.doConnect = originalDoConnect;
+      manager.pool.doConnect = originalDoConnect;
     }
   });
 
@@ -95,8 +103,8 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
     manager.setConfig({ dev: baseConfig() }, ["dev"]);
 
     let doConnectCalls = 0;
-    const originalDoConnect = manager.doConnect;
-    manager.doConnect = async (key: string) => {
+    const originalDoConnect = manager.pool.doConnect;
+    manager.pool.doConnect = async (key: string) => {
       doConnectCalls += 1;
       manager.connected.set(key, true);
       manager.clients.set(key, { fake: true, n: doConnectCalls });
@@ -111,7 +119,7 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
       assert.strictEqual(doConnectCalls, 2);
       assert.strictEqual(manager.connecting.size, 0, "in-flight map must be empty after settle");
     } finally {
-      manager.doConnect = originalDoConnect;
+      manager.pool.doConnect = originalDoConnect;
     }
   });
 
@@ -119,8 +127,8 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
     manager.setConfig({ dev: baseConfig() }, ["dev"]);
 
     let doConnectCalls = 0;
-    const originalDoConnect = manager.doConnect;
-    manager.doConnect = async (_key: string) => {
+    const originalDoConnect = manager.pool.doConnect;
+    manager.pool.doConnect = async (_key: string) => {
       doConnectCalls += 1;
       throw new Error("simulated connect failure");
     };
@@ -132,19 +140,19 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
       await assert.rejects(manager.connect("dev"));
       assert.strictEqual(doConnectCalls, 2);
     } finally {
-      manager.doConnect = originalDoConnect;
+      manager.pool.doConnect = originalDoConnect;
     }
   });
 
   it("does not let a closed stale connect promise delete a newer in-flight connect", async () => {
     manager.setConfig({ dev: baseConfig() }, ["dev"]);
 
-    const originalDoConnect = manager.doConnect;
+    const originalDoConnect = manager.pool.doConnect;
     let doConnectCalls = 0;
     let resolveFirst!: () => void;
     let resolveSecond!: () => void;
 
-    manager.doConnect = async () => {
+    manager.pool.doConnect = async () => {
       doConnectCalls += 1;
       if (doConnectCalls === 1) {
         return new Promise<void>((resolve) => {
@@ -182,7 +190,7 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
       assert.strictEqual(manager.connecting.has("dev"), false);
       assert.strictEqual(doConnectCalls, 2);
     } finally {
-      manager.doConnect = originalDoConnect;
+      manager.pool.doConnect = originalDoConnect;
     }
   });
 
@@ -192,8 +200,8 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
     manager.clients.set("dev", { fake: true });
 
     let doConnectCalls = 0;
-    const originalDoConnect = manager.doConnect;
-    manager.doConnect = async () => {
+    const originalDoConnect = manager.pool.doConnect;
+    manager.pool.doConnect = async () => {
       doConnectCalls += 1;
     };
 
@@ -202,7 +210,7 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
       await manager.connect("dev");
       assert.strictEqual(doConnectCalls, 0);
     } finally {
-      manager.doConnect = originalDoConnect;
+      manager.pool.doConnect = originalDoConnect;
     }
   });
 

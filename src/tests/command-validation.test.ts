@@ -378,7 +378,7 @@ describe("SSHConnectionManager regressions", () => {
   });
 
   it("should not cap caller-provided SSH setup timeouts at 30s", () => {
-    assert.strictEqual(manager.normalizeConnectTimeout(60000), 60000);
+    assert.strictEqual(manager.pool.normalizeConnectTimeout(60000), 60000);
   });
 
   it("should default to blacklist mode and allow commands outside a whitelist", () => {
@@ -502,14 +502,14 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalConnectCommandClient = manager.pool.connectCommandClient;
     const originalRunCommandStream = manager.runCommandStream;
     const originalCreateLogWriter = manager.createLogWriter;
     let connectCalls = 0;
     let closeCalls = 0;
     let executeCalls = 0;
 
-    manager.connectCommandClient = async () => {
+    manager.pool.connectCommandClient = async () => {
       connectCalls += 1;
       return {
         client: {} as any,
@@ -531,7 +531,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(executeCalls, 1);
       assert.strictEqual(closeCalls, 1);
     } finally {
-      manager.connectCommandClient = originalConnectCommandClient;
+      manager.pool.connectCommandClient = originalConnectCommandClient;
       manager.runCommandStream = originalRunCommandStream;
       manager.createLogWriter = originalCreateLogWriter;
     }
@@ -547,21 +547,21 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalEnsureConnected = manager.ensureConnected;
-    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalEnsureConnected = manager.pool.ensureConnected;
+    const originalConnectCommandClient = manager.pool.connectCommandClient;
     const originalRunCommandStream = manager.runCommandStream;
-    const originalReconnect = manager.reconnect;
+    const originalReconnect = manager.pool.reconnect;
     const originalCreateLogWriter = manager.createLogWriter;
     const originalSleep = manager.sleep;
     let ensureCalls = 0;
     let executeCalls = 0;
     let reconnectCalls = 0;
 
-    manager.ensureConnected = async () => {
+    manager.pool.ensureConnected = async () => {
       ensureCalls += 1;
       return { cached: true } as any;
     };
-    manager.connectCommandClient = async () => {
+    manager.pool.connectCommandClient = async () => {
       throw new Error("fresh connection should not be used by default");
     };
     manager.createLogWriter = () => null;
@@ -578,7 +578,7 @@ describe("SSHConnectionManager regressions", () => {
       sinks.stdoutCollector?.push("ok");
       return 0;
     };
-    manager.reconnect = async () => {
+    manager.pool.reconnect = async () => {
       reconnectCalls += 1;
     };
     manager.sleep = async () => {};
@@ -590,10 +590,10 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(executeCalls, 2);
       assert.strictEqual(reconnectCalls, 1);
     } finally {
-      manager.ensureConnected = originalEnsureConnected;
-      manager.connectCommandClient = originalConnectCommandClient;
+      manager.pool.ensureConnected = originalEnsureConnected;
+      manager.pool.connectCommandClient = originalConnectCommandClient;
       manager.runCommandStream = originalRunCommandStream;
-      manager.reconnect = originalReconnect;
+      manager.pool.reconnect = originalReconnect;
       manager.createLogWriter = originalCreateLogWriter;
       manager.sleep = originalSleep;
     }
@@ -609,7 +609,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalConnectCommandClient = manager.pool.connectCommandClient;
     const originalRunCommandStream = manager.runCommandStream;
     const originalCreateLogWriter = manager.createLogWriter;
     const originalSleep = manager.sleep;
@@ -617,7 +617,7 @@ describe("SSHConnectionManager regressions", () => {
     let closeCalls = 0;
     let executeCalls = 0;
 
-    manager.connectCommandClient = async () => {
+    manager.pool.connectCommandClient = async () => {
       connectCalls += 1;
       return {
         client: { attempt: connectCalls } as any,
@@ -651,7 +651,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(executeCalls, 2);
       assert.strictEqual(closeCalls, 2);
     } finally {
-      manager.connectCommandClient = originalConnectCommandClient;
+      manager.pool.connectCommandClient = originalConnectCommandClient;
       manager.runCommandStream = originalRunCommandStream;
       manager.createLogWriter = originalCreateLogWriter;
       manager.sleep = originalSleep;
@@ -668,12 +668,12 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalConnectCommandClient = manager.pool.connectCommandClient;
     const originalRunCommandStream = manager.runCommandStream;
     const originalCreateLogWriter = manager.createLogWriter;
     let closeCalls = 0;
 
-    manager.connectCommandClient = async () => ({
+    manager.pool.connectCommandClient = async () => ({
       client: {} as any,
       close: () => {
         closeCalls += 1;
@@ -699,7 +699,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(result, "ok");
       assert.strictEqual(closeCalls, 1);
     } finally {
-      manager.connectCommandClient = originalConnectCommandClient;
+      manager.pool.connectCommandClient = originalConnectCommandClient;
       manager.runCommandStream = originalRunCommandStream;
       manager.createLogWriter = originalCreateLogWriter;
     }
@@ -715,7 +715,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalSftpWriteBuffer = manager.sftpWriteBuffer;
     let acquireCalls = 0;
     let writeClient: unknown;
@@ -725,7 +725,7 @@ describe("SSHConnectionManager regressions", () => {
     );
     fsForTest.writeFileSync(tempPath, "payload");
 
-    manager.acquireSshClient = async (_key: string, options: { reuseConnection?: boolean; debug?: (line: string) => void }) => {
+    manager.pool.acquireSshClient = async (_key: string, options: { reuseConnection?: boolean; debug?: (line: string) => void }) => {
       acquireCalls += 1;
       assert.strictEqual(options.reuseConnection, true);
       assert.strictEqual(options.debug, undefined);
@@ -746,7 +746,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(acquireCalls, 1);
       assert.deepStrictEqual(writeClient, { cached: true });
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.sftpWriteBuffer = originalSftpWriteBuffer;
       fsForTest.unlinkSync(tempPath);
     }
@@ -760,20 +760,20 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalEnsureConnected = manager.ensureConnected;
+    const originalEnsureConnected = manager.pool.ensureConnected;
     let endCalls = 0;
-    manager.ensureConnected = async () => ({
+    manager.pool.ensureConnected = async () => ({
       end: () => {
         endCalls += 1;
       },
     }) as any;
 
     try {
-      const connection = await manager.acquireSshClient("dev", { reuseConnection: true });
+      const connection = await manager.pool.acquireSshClient("dev", { reuseConnection: true });
       connection.close();
       assert.strictEqual(endCalls, 0, "cached acquire close must not end the reused SSH client");
     } finally {
-      manager.ensureConnected = originalEnsureConnected;
+      manager.pool.ensureConnected = originalEnsureConnected;
     }
   });
 
@@ -787,7 +787,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalSftpWriteBuffer = manager.sftpWriteBuffer;
     let acquireCalls = 0;
     let closeCalls = 0;
@@ -798,7 +798,7 @@ describe("SSHConnectionManager regressions", () => {
     );
     fsForTest.writeFileSync(tempPath, "payload");
 
-    manager.acquireSshClient = async (
+    manager.pool.acquireSshClient = async (
       _key: string,
       options: { reuseConnection?: boolean; timeout?: number; debug?: (line: string) => void },
     ) => {
@@ -832,7 +832,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.deepStrictEqual(writeClient, { fresh: true });
       assert.strictEqual(closeCalls, 1, "one-shot SFTP clients must close after use");
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.sftpWriteBuffer = originalSftpWriteBuffer;
       fsForTest.unlinkSync(tempPath);
     }
@@ -848,7 +848,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     const originalSftpWriteBuffer = manager.sftpWriteBuffer;
     let sftpEndCalls = 0;
@@ -859,7 +859,7 @@ describe("SSHConnectionManager regressions", () => {
     );
     fsForTest.writeFileSync(tempPath, "payload");
 
-    manager.acquireSshClient = async () => ({
+    manager.pool.acquireSshClient = async () => ({
       client: { cached: true },
       close: () => {},
     });
@@ -902,7 +902,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(typeof putOpts.step, "function");
       assert.strictEqual(sftpEndCalls, 1);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       manager.sftpWriteBuffer = originalSftpWriteBuffer;
       fsForTest.unlinkSync(tempPath);
@@ -919,7 +919,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     const originalReadFileSync = fsForTest.readFileSync;
     const tempPath = path.resolve(
@@ -930,7 +930,7 @@ describe("SSHConnectionManager regressions", () => {
     let openCalls = 0;
     let fastPutCalls = 0;
 
-    manager.acquireSshClient = async () => ({
+    manager.pool.acquireSshClient = async () => ({
       client: { cached: true },
       close: () => {},
     });
@@ -967,7 +967,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.match(result, /fast SFTP/);
       assert.strictEqual(fastPutCalls, 1);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       (fsForTest as any).readFileSync = originalReadFileSync;
       fsForTest.unlinkSync(tempPath);
@@ -984,7 +984,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     let sftpEndCalls = 0;
     let fastGetArgs: unknown[] | null = null;
@@ -993,7 +993,7 @@ describe("SSHConnectionManager regressions", () => {
       `handfree-sftp-fast-get-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
     );
 
-    manager.acquireSshClient = async () => ({
+    manager.pool.acquireSshClient = async () => ({
       client: { cached: true },
       close: () => {},
     });
@@ -1032,7 +1032,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(typeof getOpts.step, "function");
       assert.strictEqual(sftpEndCalls, 1);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       if (fsForTest.existsSync(tempPath)) {
         fsForTest.unlinkSync(tempPath);
@@ -1166,14 +1166,14 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     const originalSftpStat = manager.sftpStat;
     const originalRemoteMd5 = manager.remoteMd5;
     let acquireCalls = 0;
     let closeCalls = 0;
 
-    manager.acquireSshClient = async () => {
+    manager.pool.acquireSshClient = async () => {
       acquireCalls += 1;
       return {
         client: { cached: true },
@@ -1198,7 +1198,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(acquireCalls, 1, "self-relay must acquire one client");
       assert.strictEqual(closeCalls, 1, "self-relay must close the client once");
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       manager.sftpStat = originalSftpStat;
       manager.remoteMd5 = originalRemoteMd5;
@@ -1215,7 +1215,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     const originalCreateWriteStream = (fsForTest as any).createWriteStream;
     let sftpEndCalls = 0;
@@ -1227,7 +1227,7 @@ describe("SSHConnectionManager regressions", () => {
       `handfree-sftp-download-fail-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
     );
 
-    manager.acquireSshClient = async () => ({
+    manager.pool.acquireSshClient = async () => ({
       client: { cached: true },
       close: () => {},
     });
@@ -1268,7 +1268,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(writeDestroyCalls, 1);
       assert.strictEqual(sftpEndCalls, 1);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       (fsForTest as any).createWriteStream = originalCreateWriteStream;
       if (fsForTest.existsSync(tempPath)) {
@@ -1287,8 +1287,8 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
-    const originalCloseClient = manager.closeClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
+    const originalCloseClient = manager.pool.closeClient;
     let closeArgs: unknown[] | null = null;
     const tempPath = path.resolve(
       process.cwd(),
@@ -1300,14 +1300,14 @@ describe("SSHConnectionManager regressions", () => {
     // that contains NONE of the connection keywords. An SFTP channel-open failure
     // means the cached client is unusable, so it must be classified as a
     // connection error and force-dropped for self-heal — regardless of wording.
-    manager.acquireSshClient = async () => ({
+    manager.pool.acquireSshClient = async () => ({
       client: {
         sftp: (cb: (err: Error | undefined, sftp?: unknown) => void) =>
           cb(new Error("administratively prohibited")),
       },
       close: () => {},
     });
-    manager.closeClient = (name: string, force?: boolean) => {
+    manager.pool.closeClient = (name: string, force?: boolean) => {
       closeArgs = [name, force];
     };
 
@@ -1327,8 +1327,8 @@ describe("SSHConnectionManager regressions", () => {
         "SFTP channel-open failure must force-drop the stale cached client",
       );
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
-      manager.closeClient = originalCloseClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
+      manager.pool.closeClient = originalCloseClient;
       if (fsForTest.existsSync(tempPath)) {
         fsForTest.unlinkSync(tempPath);
       }
@@ -1345,7 +1345,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     let openSftpCalls = 0;
     let sftpEndCalls = 0;
@@ -1355,7 +1355,7 @@ describe("SSHConnectionManager regressions", () => {
     );
     fsForTest.writeFileSync(tempPath, "payload");
 
-    manager.acquireSshClient = async () => ({
+    manager.pool.acquireSshClient = async () => ({
       client: { cached: true },
       close: () => {},
     });
@@ -1394,7 +1394,7 @@ describe("SSHConnectionManager regressions", () => {
         "fast upload must not leak an SFTP channel when options are invalid",
       );
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       if (fsForTest.existsSync(tempPath)) {
         fsForTest.unlinkSync(tempPath);
@@ -1412,7 +1412,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     let closeCalls = 0;
     let fastPutCalls = 0;
@@ -1422,7 +1422,7 @@ describe("SSHConnectionManager regressions", () => {
     );
     fsForTest.writeFileSync(tempPath, "payload");
 
-    manager.acquireSshClient = async (_key: string, options: { reuseConnection?: boolean }) => {
+    manager.pool.acquireSshClient = async (_key: string, options: { reuseConnection?: boolean }) => {
       assert.strictEqual(options.reuseConnection, false);
       return {
         client: { fresh: true },
@@ -1454,7 +1454,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(fastPutCalls, 1);
       assert.strictEqual(closeCalls, 1, "one-shot fast SFTP clients must close after use");
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       fsForTest.unlinkSync(tempPath);
     }
@@ -1476,13 +1476,13 @@ describe("SSHConnectionManager regressions", () => {
       ["src", "dst"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     const originalSftpStat = manager.sftpStat;
     let closeCalls = 0;
     const acquired: string[] = [];
 
-    manager.acquireSshClient = async (
+    manager.pool.acquireSshClient = async (
       key: string,
       options: { reuseConnection?: boolean; debug?: (line: string) => void },
     ) => {
@@ -1543,7 +1543,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(closeCalls, 2);
       assert.deepStrictEqual(destination, source);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       manager.sftpStat = originalSftpStat;
     }
@@ -1565,7 +1565,7 @@ describe("SSHConnectionManager regressions", () => {
       ["src", "dst"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     const originalSftpStat = manager.sftpStat;
     let sourceEndCalls = 0;
@@ -1573,7 +1573,7 @@ describe("SSHConnectionManager regressions", () => {
     let sourceCloseCalls = 0;
     let destCloseCalls = 0;
 
-    manager.acquireSshClient = async (key: string) => ({
+    manager.pool.acquireSshClient = async (key: string) => ({
       client: { key },
       close: () => {},
     });
@@ -1627,7 +1627,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.ok(sourceCloseCalls >= 1, "source file handle must be closed after a failed relay");
       assert.ok(destCloseCalls >= 1, "destination file handle must be closed after a failed relay");
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       manager.sftpStat = originalSftpStat;
     }
@@ -1649,7 +1649,7 @@ describe("SSHConnectionManager regressions", () => {
       ["src", "dst"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     const originalSftpStat = manager.sftpStat;
     const source = Buffer.from("abcdefgh");
@@ -1658,7 +1658,7 @@ describe("SSHConnectionManager regressions", () => {
     const writeOffsets: number[] = [];
     const pendingWriteAcks: Array<() => void> = [];
 
-    manager.acquireSshClient = async (key: string) => ({
+    manager.pool.acquireSshClient = async (key: string) => ({
       client: { key },
       close: () => {},
     });
@@ -1718,7 +1718,7 @@ describe("SSHConnectionManager regressions", () => {
       await transfer;
       assert.deepStrictEqual(destination, source);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       manager.sftpStat = originalSftpStat;
     }
@@ -1740,13 +1740,13 @@ describe("SSHConnectionManager regressions", () => {
       ["src", "dst"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     const originalSftpStat = manager.sftpStat;
     let openFileCalls = 0;
     let sftpEndCalls = 0;
 
-    manager.acquireSshClient = async (key: string) => ({
+    manager.pool.acquireSshClient = async (key: string) => ({
       client: { key },
       close: () => {},
     });
@@ -1774,7 +1774,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(openFileCalls, 0);
       assert.strictEqual(sftpEndCalls, 2, "both opened SFTP sessions must close after option validation fails");
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
       manager.sftpStat = originalSftpStat;
     }
@@ -1790,8 +1790,8 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalEnsureConnected = manager.ensureConnected;
-    const originalReconnect = manager.reconnect;
+    const originalEnsureConnected = manager.pool.ensureConnected;
+    const originalReconnect = manager.pool.reconnect;
     const originalCreateLogWriter = manager.createLogWriter;
     const originalSleep = manager.sleep;
     let execCalls = 0;
@@ -1804,8 +1804,8 @@ describe("SSHConnectionManager regressions", () => {
       },
     };
 
-    manager.ensureConnected = async () => fakeClient;
-    manager.reconnect = async () => {
+    manager.pool.ensureConnected = async () => fakeClient;
+    manager.pool.reconnect = async () => {
       reconnectCalls += 1;
     };
     manager.createLogWriter = () => null;
@@ -1819,8 +1819,8 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(execCalls, 2);
       assert.strictEqual(reconnectCalls, 1);
     } finally {
-      manager.ensureConnected = originalEnsureConnected;
-      manager.reconnect = originalReconnect;
+      manager.pool.ensureConnected = originalEnsureConnected;
+      manager.pool.reconnect = originalReconnect;
       manager.createLogWriter = originalCreateLogWriter;
       manager.sleep = originalSleep;
     }
@@ -1878,12 +1878,12 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalConnectCommandClient = manager.pool.connectCommandClient;
     const originalCreateLogWriter = manager.createLogWriter;
     let closeCalls = 0;
     let execCalls = 0;
 
-    manager.connectCommandClient = async () => ({
+    manager.pool.connectCommandClient = async () => ({
       client: {
         exec: () => {
           execCalls += 1;
@@ -1908,7 +1908,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(execCalls, 1);
       assert.strictEqual(closeCalls, 1);
     } finally {
-      manager.connectCommandClient = originalConnectCommandClient;
+      manager.pool.connectCommandClient = originalConnectCommandClient;
       manager.createLogWriter = originalCreateLogWriter;
     }
   });
@@ -1930,7 +1930,7 @@ describe("SSHConnectionManager regressions", () => {
     } as any;
 
     try {
-      const acquired = await manager.connectCommandClient("dev", 1000);
+      const acquired = await manager.pool.connectCommandClient("dev", 1000);
       assert.strictEqual(capturedConfig?.keepaliveInterval, 5000);
       assert.strictEqual(capturedConfig?.keepaliveCountMax, 2);
       acquired.close();
@@ -2023,14 +2023,14 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalRunCommandStream = manager.runCommandStream;
-    const originalReconnect = manager.reconnect;
+    const originalReconnect = manager.pool.reconnect;
     const originalCreateLogWriter = manager.createLogWriter;
     let runCalls = 0;
     let reconnectCalls = 0;
 
-    manager.acquireSshClient = async () => ({
+    manager.pool.acquireSshClient = async () => ({
       client: {},
       close: () => {},
     });
@@ -2042,7 +2042,7 @@ describe("SSHConnectionManager regressions", () => {
         true,
       );
     };
-    manager.reconnect = async () => {
+    manager.pool.reconnect = async () => {
       reconnectCalls += 1;
     };
     manager.createLogWriter = () => null;
@@ -2058,9 +2058,9 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(runCalls, 1);
       assert.strictEqual(reconnectCalls, 0);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.runCommandStream = originalRunCommandStream;
-      manager.reconnect = originalReconnect;
+      manager.pool.reconnect = originalReconnect;
       manager.createLogWriter = originalCreateLogWriter;
     }
   });
@@ -2075,7 +2075,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalRunCommandStream = manager.runCommandStream;
     const originalCreateLogWriter = manager.createLogWriter;
     let replacementEndCalls = 0;
@@ -2086,7 +2086,7 @@ describe("SSHConnectionManager regressions", () => {
       },
     };
 
-    manager.acquireSshClient = async () => {
+    manager.pool.acquireSshClient = async () => {
       manager.clients.set("dev", replacementClient);
       manager.connected.set("dev", true);
       return {
@@ -2112,7 +2112,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(manager.connected.get("dev"), true);
       assert.strictEqual(replacementEndCalls, 0);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.runCommandStream = originalRunCommandStream;
       manager.createLogWriter = originalCreateLogWriter;
     }
@@ -2128,8 +2128,8 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalEnsureConnected = manager.ensureConnected;
-    const originalReconnect = manager.reconnect;
+    const originalEnsureConnected = manager.pool.ensureConnected;
+    const originalReconnect = manager.pool.reconnect;
     const originalCreateLogWriter = manager.createLogWriter;
     let execCalls = 0;
     let signalCalls = 0;
@@ -2153,8 +2153,8 @@ describe("SSHConnectionManager regressions", () => {
       },
     };
 
-    manager.ensureConnected = async () => fakeClient;
-    manager.reconnect = async () => {
+    manager.pool.ensureConnected = async () => fakeClient;
+    manager.pool.reconnect = async () => {
       reconnectCalls += 1;
     };
     manager.createLogWriter = () => null;
@@ -2169,8 +2169,8 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(closeCalls, 1);
       assert.strictEqual(reconnectCalls, 0);
     } finally {
-      manager.ensureConnected = originalEnsureConnected;
-      manager.reconnect = originalReconnect;
+      manager.pool.ensureConnected = originalEnsureConnected;
+      manager.pool.reconnect = originalReconnect;
       manager.createLogWriter = originalCreateLogWriter;
     }
   });
@@ -2185,7 +2185,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalEnsureConnected = manager.ensureConnected;
+    const originalEnsureConnected = manager.pool.ensureConnected;
     const originalCreateLogWriter = manager.createLogWriter;
 
     const stream = new EventEmitter() as any;
@@ -2200,7 +2200,7 @@ describe("SSHConnectionManager regressions", () => {
       },
     };
 
-    manager.ensureConnected = async () => fakeClient;
+    manager.pool.ensureConnected = async () => fakeClient;
     manager.createLogWriter = () => null;
 
     try {
@@ -2213,7 +2213,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.match(result, /reuseConnection=true/);
       assert.match(result, /exec channel opened/);
     } finally {
-      manager.ensureConnected = originalEnsureConnected;
+      manager.pool.ensureConnected = originalEnsureConnected;
       manager.createLogWriter = originalCreateLogWriter;
     }
   });
@@ -2228,13 +2228,13 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalConnectCommandClient = manager.pool.connectCommandClient;
     const originalRunCommandStream = manager.runCommandStream;
     const originalCreateLogWriter = manager.createLogWriter;
     let closeCalls = 0;
     const progressChunks: string[] = [];
 
-    manager.connectCommandClient = async (_key: string, _timeout: number, debug?: (line: string) => void) => {
+    manager.pool.connectCommandClient = async (_key: string, _timeout: number, debug?: (line: string) => void) => {
       debug?.("[ssh2] fresh handshake");
       return {
         client: {} as any,
@@ -2276,7 +2276,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.deepStrictEqual(progressChunks, ["ok"]);
       assert.strictEqual(closeCalls, 1);
     } finally {
-      manager.connectCommandClient = originalConnectCommandClient;
+      manager.pool.connectCommandClient = originalConnectCommandClient;
       manager.runCommandStream = originalRunCommandStream;
       manager.createLogWriter = originalCreateLogWriter;
     }
@@ -2292,7 +2292,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalRunCommandStream = manager.runCommandStream;
     const tempRoot = path.resolve(
       process.cwd(),
@@ -2302,7 +2302,7 @@ describe("SSHConnectionManager regressions", () => {
     let commandStarted = false;
 
     manager.setOutputLogRoot(tempRoot);
-    manager.acquireSshClient = async () => ({
+    manager.pool.acquireSshClient = async () => ({
       client: {},
       close: () => {},
     });
@@ -2362,7 +2362,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(caughtUp.outputChunk, "");
       assert.strictEqual(caughtUp.hasMore, false);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.runCommandStream = originalRunCommandStream;
       manager.setOutputLogRoot(null);
       fsForTest.rmSync(tempRoot, { recursive: true, force: true });
@@ -2562,7 +2562,7 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalAcquireSshClient = manager.pool.acquireSshClient;
     const originalRunCommandStream = manager.runCommandStream;
     const tempRoot = path.resolve(
       process.cwd(),
@@ -2571,7 +2571,7 @@ describe("SSHConnectionManager regressions", () => {
     let closeCalls = 0;
 
     manager.setOutputLogRoot(tempRoot);
-    manager.acquireSshClient = async () => ({
+    manager.pool.acquireSshClient = async () => ({
       client: {},
       close: () => {
         closeCalls += 1;
@@ -2604,7 +2604,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.match(output, /=== END ===/);
       assert.ok(closeCalls >= 1);
     } finally {
-      manager.acquireSshClient = originalAcquireSshClient;
+      manager.pool.acquireSshClient = originalAcquireSshClient;
       manager.runCommandStream = originalRunCommandStream;
       manager.setOutputLogRoot(null);
       fsForTest.rmSync(tempRoot, { recursive: true, force: true });
@@ -2621,8 +2621,8 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalEnsureConnected = manager.ensureConnected;
-    const originalReconnect = manager.reconnect;
+    const originalEnsureConnected = manager.pool.ensureConnected;
+    const originalReconnect = manager.pool.reconnect;
     const originalCreateLogWriter = manager.createLogWriter;
     const originalSleep = manager.sleep;
     let execCalls = 0;
@@ -2635,8 +2635,8 @@ describe("SSHConnectionManager regressions", () => {
       },
     };
 
-    manager.ensureConnected = async () => fakeClient;
-    manager.reconnect = async () => {
+    manager.pool.ensureConnected = async () => fakeClient;
+    manager.pool.reconnect = async () => {
       reconnectCalls += 1;
     };
     manager.sleep = async () => {};
@@ -2650,8 +2650,8 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(execCalls, 2);
       assert.strictEqual(reconnectCalls, 1);
     } finally {
-      manager.ensureConnected = originalEnsureConnected;
-      manager.reconnect = originalReconnect;
+      manager.pool.ensureConnected = originalEnsureConnected;
+      manager.pool.reconnect = originalReconnect;
       manager.createLogWriter = originalCreateLogWriter;
       manager.sleep = originalSleep;
     }
@@ -2709,12 +2709,12 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalConnectCommandClient = manager.connectCommandClient;
+    const originalConnectCommandClient = manager.pool.connectCommandClient;
     const originalCreateLogWriter = manager.createLogWriter;
     let closeCalls = 0;
     let execCalls = 0;
 
-    manager.connectCommandClient = async () => ({
+    manager.pool.connectCommandClient = async () => ({
       client: {
         exec: () => {
           execCalls += 1;
@@ -2739,7 +2739,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(execCalls, 1);
       assert.strictEqual(closeCalls, 1);
     } finally {
-      manager.connectCommandClient = originalConnectCommandClient;
+      manager.pool.connectCommandClient = originalConnectCommandClient;
       manager.createLogWriter = originalCreateLogWriter;
     }
   });
@@ -2757,12 +2757,12 @@ describe("SSHConnectionManager regressions", () => {
       ["bastion", "dev"],
     );
 
-    const originalOpenJumpTunnel = manager.openJumpTunnel;
+    const originalOpenJumpTunnel = manager.pool.openJumpTunnel;
     const originalRunCommandStream = manager.runCommandStream;
     let observedTimeout: number | undefined;
     let runCalls = 0;
 
-    manager.openJumpTunnel = async (
+    manager.pool.openJumpTunnel = async (
       _targetKey: string,
       _config: unknown,
       _debug?: unknown,
@@ -2789,7 +2789,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.notStrictEqual(manager.connected.get("dev"), true);
       assert.strictEqual(manager.clients.has("dev"), false);
     } finally {
-      manager.openJumpTunnel = originalOpenJumpTunnel;
+      manager.pool.openJumpTunnel = originalOpenJumpTunnel;
       manager.runCommandStream = originalRunCommandStream;
     }
   });
@@ -2807,12 +2807,12 @@ describe("SSHConnectionManager regressions", () => {
       ["bastion", "dev"],
     );
 
-    const originalOpenJumpTunnel = manager.openJumpTunnel;
+    const originalOpenJumpTunnel = manager.pool.openJumpTunnel;
     const originalRunCommandStream = manager.runCommandStream;
     let observedTimeout: number | undefined;
     let runCalls = 0;
 
-    manager.openJumpTunnel = async (
+    manager.pool.openJumpTunnel = async (
       _targetKey: string,
       _config: unknown,
       _debug?: unknown,
@@ -2839,7 +2839,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.notStrictEqual(manager.connected.get("dev"), true);
       assert.strictEqual(manager.clients.has("dev"), false);
     } finally {
-      manager.openJumpTunnel = originalOpenJumpTunnel;
+      manager.pool.openJumpTunnel = originalOpenJumpTunnel;
       manager.runCommandStream = originalRunCommandStream;
     }
   });
@@ -2943,12 +2943,12 @@ describe("SSHConnectionManager regressions", () => {
       ["bastion", "dev"],
     );
 
-    const originalOpenJumpTunnel = manager.openJumpTunnel;
+    const originalOpenJumpTunnel = manager.pool.openJumpTunnel;
     const debugLines: string[] = [];
     let observedTimeout: number | undefined;
     let observedDebug = false;
 
-    manager.openJumpTunnel = async (
+    manager.pool.openJumpTunnel = async (
       _targetKey: string,
       _config: unknown,
       debug?: (line: string) => void,
@@ -2961,7 +2961,7 @@ describe("SSHConnectionManager regressions", () => {
 
     try {
       await assert.rejects(
-        () => manager.connectCommandClient("dev", 1, (line: string) => debugLines.push(line)),
+        () => manager.pool.connectCommandClient("dev", 1, (line: string) => debugLines.push(line)),
         (error: unknown) =>
           error instanceof ToolError &&
           error.code === "SSH_CONNECTION_FAILED" &&
@@ -2971,7 +2971,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(observedDebug, true);
       assert.ok(debugLines.some((line) => /jump tunnel.*timed out/.test(line)));
     } finally {
-      manager.openJumpTunnel = originalOpenJumpTunnel;
+      manager.pool.openJumpTunnel = originalOpenJumpTunnel;
     }
   });
 
@@ -2997,7 +2997,7 @@ describe("SSHConnectionManager regressions", () => {
 
     try {
       await assert.rejects(
-        () => manager.connectCommandClient("dev", 1, (line: string) => debugLines.push(line)),
+        () => manager.pool.connectCommandClient("dev", 1, (line: string) => debugLines.push(line)),
         (error: unknown) =>
           error instanceof ToolError &&
           error.code === "SSH_CONNECTION_FAILED" &&
@@ -3026,7 +3026,7 @@ describe("SSHConnectionManager regressions", () => {
     };
 
     try {
-      const jumpClient = await manager.connectJumpClient(
+      const jumpClient = await manager.pool.connectJumpClient(
         "dev",
         "bastion",
         baseConfig({ name: "bastion" }),
@@ -3090,9 +3090,9 @@ describe("SSHConnectionManager regressions", () => {
       ["dev"],
     );
 
-    const originalConnect = manager.connect;
+    const originalConnect = manager.pool.connect;
     const connectedNames: string[] = [];
-    manager.connect = async (name?: string) => {
+    manager.pool.connect = async (name?: string) => {
       connectedNames.push(name ?? manager.defaultName);
     };
 
@@ -3100,7 +3100,7 @@ describe("SSHConnectionManager regressions", () => {
       await manager.connectAll();
       assert.deepStrictEqual(connectedNames, ["dev"]);
     } finally {
-      manager.connect = originalConnect;
+      manager.pool.connect = originalConnect;
     }
   });
 
@@ -3474,7 +3474,7 @@ describe("Upload skip-if-identical", () => {
     const local = writeLocal(Buffer.from("hello world", "utf8"));
 
     // Stub: ensureConnected returns a sentinel client; sftp ops return identical bytes
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => ({ size: Buffer.byteLength("hello world") });
     manager.sftpReadBuffer = async () => Buffer.from("hello world", "utf8");
@@ -3493,7 +3493,7 @@ describe("Upload skip-if-identical", () => {
 
     const local = writeLocal(Buffer.from("hello world", "utf8"));
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => ({ size: Buffer.byteLength("hello world") });
     manager.sftpReadBuffer = async () => Buffer.from("hello world", "utf8");
@@ -3511,7 +3511,7 @@ describe("Upload skip-if-identical", () => {
 
     const local = writeLocal(Buffer.from("payload", "utf8"));
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => { throw new ToolError("SFTP_ERROR", "no such file", false); };
 
@@ -3528,7 +3528,7 @@ describe("Upload skip-if-identical", () => {
 
     const local = writeLocal(Buffer.from("hello", "utf8"));
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => ({ size: 999 });
 
@@ -3545,7 +3545,7 @@ describe("Upload skip-if-identical", () => {
 
     const local = writeLocal(Buffer.from("hello", "utf8"));
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => ({ size: 5 });
     manager.sftpReadBuffer = async () => Buffer.from("world", "utf8");
@@ -3563,7 +3563,7 @@ describe("Upload skip-if-identical", () => {
 
     const local = writeLocal(Buffer.from("#!/bin/sh\r\necho hi\r\n", "utf8"), ".sh");
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => { throw new ToolError("SFTP_ERROR", "missing", false); };
 
@@ -3583,7 +3583,7 @@ describe("Upload skip-if-identical", () => {
     // Use cwd itself (a directory) as the local path
     const dirPath = process.cwd();
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
 
     await assert.rejects(
       () => manager.upload(dirPath, "/tmp/whatever", "dev"),
@@ -3636,7 +3636,7 @@ describe("Upload shell-script line-ending-agnostic compare", () => {
     const local = writeLocal(Buffer.from("#!/bin/sh\necho hi\n", "utf8"), ".sh");
     const remoteRaw = Buffer.from("#!/bin/sh\r\necho hi\r\n", "utf8");
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => ({ size: remoteRaw.length });
     manager.sftpReadBuffer = async () => remoteRaw;
@@ -3657,7 +3657,7 @@ describe("Upload shell-script line-ending-agnostic compare", () => {
     const local = writeLocal(Buffer.from("#!/bin/sh\r\necho hi\r\n", "utf8"), ".sh");
     const remoteRaw = Buffer.from("#!/bin/sh\necho hi\n", "utf8");
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => ({ size: remoteRaw.length });
     manager.sftpReadBuffer = async () => remoteRaw;
@@ -3678,7 +3678,7 @@ describe("Upload shell-script line-ending-agnostic compare", () => {
     const local = writeLocal(Buffer.from("#!/bin/sh\necho hi\n", "utf8"), ".sh");
     const remoteRaw = Buffer.from("#!/bin/sh\r\necho BYE\r\n", "utf8"); // different content
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => ({ size: remoteRaw.length });
     manager.sftpReadBuffer = async () => remoteRaw;
@@ -3698,7 +3698,7 @@ describe("Upload shell-script line-ending-agnostic compare", () => {
     const local = writeLocal(Buffer.from("a\nb\n", "utf8"), ".txt");
     const remoteRaw = Buffer.from("a\r\nb\r\n", "utf8");
 
-    manager.ensureConnected = async () => ({}) as any;
+    manager.pool.ensureConnected = async () => ({}) as any;
     manager.openSftp = async () => ({ end: () => {} }) as any;
     manager.sftpStat = async () => ({ size: remoteRaw.length });
     manager.sftpReadBuffer = async () => remoteRaw;
