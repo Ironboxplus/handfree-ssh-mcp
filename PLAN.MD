@@ -764,7 +764,17 @@ P0-03 实施记录与发现：
 - [ ] 提取 `TransferService`，现有 upload/download/transfer tool 只调用 service。
 - [ ] 不在本任务中改变传输算法或 tool schema。
 
-- [ ] **P0-04-A1**：既有测试全部通过；新增真实 SSH characterization tests 通过；公共返回文本和错误码不变。
+- [x] **P0-04-A1**：已完成（2026-09-15 验收）。分两步提交：`1e0a62f` 抽出 `SshConnectionPool`，`9760990` 抽出 `TransferService` 并让 upload/download/transfer 工具直连服务。`SSHConnectionManager` 由 5372 行降至 1877 行（pool 1403 / transfer 2533 / debug 助手 71），保留全部方法为委派门面。独立复核：`npm test` 404/404、`tsc --noEmit` 干净；`git diff` 确认 `characterization-legacy-tools.test.ts`、`contracts.test.ts` 与 `src/contracts/` **完全未改**；第二步中测试里**删除的 assert 行数为 0**，第一步仅 1 行且是同一机械改写（`manager.X` → `manager.pool.X`）。
+
+P0-04 实施记录：
+
+- [x] 门面模式：被抽出的字段改为对 pool/service 的 get/set 代理，方法改为单行委派，其余约 3000 行未抽出代码零改动。
+- [x] `debug-output.ts` 抽为纯函数模块：这四个助手只读参数、不碰实例状态，而命令执行（留在 manager）与传输（已迁出）都要用，独立模块可避免 manager↔service 循环引用。
+- [x] 工具在注册时缓存服务引用是安全的：`pool` 与 `transferService` 均为 `readonly` 且只构造一次，配置热重载走 `pool.replaceConfig` 修改内部状态、不重建对象（已核对 `ssh-connection-manager.ts:101-102,192-194`）。
+- [ ] **量化出的技术债**：两步累计需要改写 367 处测试拦截点（第一步 137、第二步 230），因为 legacy fake-client 测试用猴子补丁直接戳私有内部。**今后每次重构都会重复支付这笔成本**，直到它们按 §7.2 迁移到真实 SSH lab。建议在 Phase 1 结束后专门安排一次迁移。
+- [ ] 为让门面与反射测试仍能访问，两步累计把若干 private 成员放宽为 public，封装有所削弱。待上述测试不再戳内部后应收窄。
+
+- [ ] **PHASE-0-GATE**：**尚未达成**。四项条件中已满足三项：外部行为不变（特征化套件冻结并通过，`1e0a62f`/`9760990`）；真实 SSH lab 可重复运行（`6f07052`，`.88` 实测 A1 通过且清理干净）；契约 artifacts 完整（`7172793`，`validate-contracts` 真实 exit 0）。**第四项「持久 job 与 daemon 生命周期成立」仍缺**——P0-05（JobStore/EventBus）与 P0-06（Controller daemon 与 IPC）均未实施。Phase 1 不得在此之前开工。
 
 ### P0-05 JobStore 与 EventBus
 
