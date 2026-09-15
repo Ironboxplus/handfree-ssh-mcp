@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
-import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
+import { formatToolErrorResponse, ToolError, toToolError } from "../utils/tool-error.js";
 
 /**
  * Register unified file transfer tool
@@ -11,6 +11,7 @@ import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
  *   upload   — push a local file or directory to a remote server
  *   download — pull a remote file or directory to the MCP host
  *   relay    — relay a file between two remote servers through the MCP host
+ *              with a bounded parallel SFTP read-ahead window
  */
 export function registerTransferTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
@@ -22,12 +23,16 @@ export function registerTransferTool(server: McpServer): void {
 Modes:
   upload   — push a local file or directory to a remote server.
   download — pull a remote file or directory to the MCP host.
-  relay    — stream a file from one remote server to another via SFTP piping.
-             No temp file touches the MCP host disk. No SCP or authorized-key
+  relay    — stream a file from one remote server to another via a bounded
+             parallel SFTP read-ahead window. No temp file touches the MCP host
+             disk. No SCP or authorized-key
              exchange between the two servers is needed — each side uses its
              own existing SSH session.
 
 Set recursive=true when transferring a directory (upload/download only).
+Set archive=true to package a file or directory into one temporary tar before
+transfer and extract it into the destination directory. Archive mode does not
+require recursive=true.
 For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePath.`,
     {
       mode: z.enum(["upload", "download", "relay"]).describe(
@@ -73,36 +78,66 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         "Default false. Append bounded SSH/SFTP debug output for single-file and relay results, and for recursive errors. For fresh ssh2 handshake logs, also set reuseConnection=false.",
       ),
       fast: z.boolean().optional().describe(
-        "Default false. Upload/download only: use ssh2 fastPut/fastGet for single files, with parallel SFTP chunks for better throughput. Relay mode keeps the streaming pipe path.",
+        "Default true. Upload/download use ssh2 fastPut/fastGet with parallel SFTP chunks for better throughput. Set false for the buffered compatibility path. Relay mode always uses its bounded parallel read-ahead path.",
       ),
       sftpConcurrency: z.number().int().positive().optional().describe(
-        "Only used when fast=true for upload/download. Number of concurrent SFTP chunks; omitted uses ssh2's default.",
+        "Upload/download: only used when fast=true. Relay: number of concurrent prefetched source chunks, default 64. The relay window is bounded to 64 MiB.",
       ),
       chunkSize: z.number().int().positive().optional().describe(
-        "Only used when fast=true for upload/download. Chunk size in bytes; omitted uses ssh2's default.",
+        "Upload/download: only used when fast=true. Relay: bytes per prefetched source chunk, default 32768. The relay window is bounded to 64 MiB.",
+      ),
+      fileConcurrency: z.number().int().positive().optional().describe(
+        "Recursive upload/download only: maximum independent files transferred in parallel. Default 4, maximum 8. Each file transferred in parallel opens its own SFTP channel on the same SSH connection, and the cap is kept under OpenSSH's common default MaxSessions=10 so it does not reliably fail against a default-configured remote sshd. This improves directory trees with many small files without creating an archive.",
+      ),
+      archive: z.boolean().optional().describe(
+        "When true, package the source file/directory into one temporary tar, transfer it, extract it into the destination directory, then clean both temporary archives. Default false.",
+      ),
+      archiveCompression: z.enum(["none", "gzip", "bzip2", "xz", "zstd"]).optional().describe(
+        "Only used when archive=true. Compression for the temporary tar; default none. Requires compatible tar/compressor support on every remote endpoint that packs or extracts the archive.",
       ),
     },
     async (params) => {
       try {
-        const { mode } = params;
+        const { mode, archive, archiveCompression } = params;
+        if (!archive && archiveCompression !== undefined) {
+          throw new ToolError(
+            "INVALID_CONFIGURATION",
+            "archiveCompression requires archive=true",
+            false,
+          );
+        }
+        const compression = archiveCompression ?? "none";
 
         if (mode === "relay") {
-          const { sourceServer, sourceRemotePath, destServer, destRemotePath, skipIfIdentical, reuseConnection, timeout, vvv } = params;
+          const { sourceServer, sourceRemotePath, destServer, destRemotePath, skipIfIdentical, reuseConnection, timeout, vvv, sftpConcurrency, chunkSize } = params;
           if (!sourceServer || !sourceRemotePath || !destServer || !destRemotePath) {
             return {
               content: [{ type: "text", text: "relay mode requires: sourceServer, sourceRemotePath, destServer, destRemotePath" }],
               isError: true,
             };
           }
-          const result = await sshManager.transferBetweenServers(
-            sourceServer, sourceRemotePath, destServer, destRemotePath,
-            { skipIfIdentical: skipIfIdentical !== false, reuseConnection, timeout, vvv },
-          );
+          const relayOptions = { reuseConnection, timeout, vvv, sftpConcurrency, chunkSize };
+          const result = archive
+            ? await sshManager.transferArchiveBetweenServers(
+                sourceServer,
+                sourceRemotePath,
+                destServer,
+                destRemotePath,
+                compression,
+                relayOptions,
+              )
+            : await sshManager.transferBetweenServers(
+                sourceServer,
+                sourceRemotePath,
+                destServer,
+                destRemotePath,
+                { skipIfIdentical: skipIfIdentical !== false, ...relayOptions },
+              );
           return { content: [{ type: "text", text: result }] };
         }
 
         // upload or download
-        const { localPath, remotePath, connectionName, recursive, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize } = params;
+        const { localPath, remotePath, connectionName, recursive, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, fileConcurrency } = params;
         if (!localPath || !remotePath) {
           return {
             content: [{ type: "text", text: `${mode} mode requires: localPath, remotePath` }],
@@ -111,8 +146,23 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         }
 
         const resolvedName = sshManager.resolveServer(connectionName);
-        const sftpOptions = { reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize };
+        const sftpOptions = {
+          reuseConnection,
+          timeout,
+          vvv,
+          fast: fast !== false,
+          sftpConcurrency,
+          chunkSize,
+          ...(fileConcurrency === undefined ? {} : { fileConcurrency }),
+        };
         const uploadOptions = { skipIfIdentical: skipIfIdentical !== false, ...sftpOptions };
+
+        if (archive) {
+          const result = mode === "upload"
+            ? await sshManager.uploadArchive(localPath, remotePath, resolvedName, compression, sftpOptions)
+            : await sshManager.downloadArchive(remotePath, localPath, resolvedName, compression, sftpOptions);
+          return { content: [{ type: "text", text: result }] };
+        }
 
         if (recursive) {
           let files: string[];

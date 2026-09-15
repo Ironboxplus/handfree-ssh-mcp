@@ -756,7 +756,7 @@ describe("MCP tool handlers", () => {
     }
   });
 
-  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on transfer relay mode", async () => {
+  it("should forward relay prefetch-window options on transfer relay mode", async () => {
     const originalTransferBetweenServers = manager.transferBetweenServers;
     const { server, handlers } = captureRegisteredTools();
     let captured: any;
@@ -803,6 +803,8 @@ describe("MCP tool handlers", () => {
           reuseConnection: false,
           timeout: 123,
           vvv: true,
+          sftpConcurrency: 2,
+          chunkSize: 32768,
         },
       });
     } finally {

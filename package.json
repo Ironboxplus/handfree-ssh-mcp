@@ -1,6 +1,6 @@
 {
   "name": "@aaarc/handfree-ssh-mcp",
-  "version": "1.0.18",
+  "version": "1.0.19",
   "description": "Handfree SSH MCP Server - A hands-free SSH automation tool via MCP protocol",
   "main": "build/index.js",
   "type": "module",
@@ -19,12 +19,15 @@
     "access": "public"
   },
   "scripts": {
-    "test": "npm run build && node --test build/tests/config.test.js build/tests/command-validation.test.js build/tests/tool-error.test.js build/tests/tools.test.js build/tests/output-collector.test.js build/tests/output-log-writer.test.js build/tests/recent-fixes.test.js build/tests/sftp-stall-timeout.test.js build/tests/keepalive-channel-open.test.js build/tests/status-collector.test.js",
+    "test": "npm run build && node --test build/tests/config.test.js build/tests/command-validation.test.js build/tests/tool-error.test.js build/tests/tools.test.js build/tests/output-collector.test.js build/tests/output-log-writer.test.js build/tests/recent-fixes.test.js build/tests/sftp-stall-timeout.test.js build/tests/keepalive-channel-open.test.js build/tests/status-collector.test.js build/tests/transfer-real.test.js build/tests/preflight.test.js",
+    "preflight": "node scripts/preflight.mjs --require A",
     "test:status": "npm run build && node --test build/tests/status-collector.test.js",
     "smoke:list-servers": "npm run build && node -- scripts/smoke-list-servers.js",
     "test:config": "npm run build && node --test build/tests/config.test.js",
     "test:cmd": "npm run build && node --test build/tests/command-validation.test.js",
     "test:tools": "npm run build && node --test build/tests/tools.test.js",
+    "test:transfer:real": "npm run build && node --test build/tests/transfer-real.test.js",
+    "test:coverage:transfer": "npm run build && node --experimental-test-coverage --test-coverage-include=build/services/ssh-connection-manager.js --test-coverage-include=build/tools/transfer.js --test-coverage-lines=45 --test-coverage-branches=54 --test-coverage-functions=60 --test build/tests/transfer-real.test.js",
     "test:integration": "npm run build && node build/tests/integration.test.js",
     "test:all": "npm run test && npm run test:integration",
     "build": "node scripts/build.js",

@@ -5,6 +5,9 @@ package-lock.json
 # 构建输出
 build/
 
+# 脚本产物（preflight 等 gate 脚本按 PLAN.MD §7.4 写入的 result.json）
+artifacts/
+
 # 操作系统文件
 .DS_Store
 Thumbs.db

@@ -14,6 +14,8 @@ import { BackgroundCommandLogWriter } from "../utils/background-command-log-writ
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import os from "os";
+import { spawn } from "node:child_process";
 
 const CONNECTION_RESET_FIELDS: Array<keyof SSHConfig> = [
   "host",
@@ -65,7 +67,44 @@ type SftpOptions = {
   fast?: boolean;
   sftpConcurrency?: number;
   chunkSize?: number;
+  fileConcurrency?: number;
 };
+export type ArchiveCompression = "none" | "gzip" | "bzip2" | "xz" | "zstd";
+
+/**
+ * Build the actual argv passed to a locally-spawned `tar`, given the raw
+ * archive args and a target platform. Pure and platform-parameterized (not
+ * `process.platform` read internally) so both branches can be exhaustively
+ * white-box tested from a single test run regardless of which OS the suite
+ * actually executes on — see G1.
+ *
+ * GNU tar (Windows/MSYS builds, e.g. the one bundled with Git for Windows)
+ * parses an absolute `X:\...` path as a `host:path` remote spec and tries to
+ * open an rsh connection to a one-letter "host". `--force-local` tells it
+ * every path argument, including any that contain a colon, is on the local
+ * filesystem. Only add it on win32: bsdtar (macOS) does not support the
+ * flag, and POSIX paths never contain a drive letter that could be misread.
+ *
+ * Separately, this MSYS tar build also mis-resolves a backslash-separated
+ * `-C <dir>` argument during extraction (its path-safety canonicalization
+ * corrupts the string, e.g. `C:\Users\...` becomes `C\:\\Users\\...` and
+ * then fails with ENOENT). Forward slashes are valid Win32 path separators
+ * and sidestep that bug entirely. A leading `//` is additionally the
+ * standard MSYS/Cygwin spelling of a UNC path, so `\\server\share\x`
+ * becoming `//server/share/x` is the idiomatic form for this tar build, not
+ * just a safe fallback.
+ *
+ * Backslash never legitimately appears in any other argument here (flags,
+ * and Windows disallows backslash in filenames), so this rewrite is safe to
+ * apply blanket on win32 — and it must never run on other platforms, where
+ * backslash is a perfectly legal POSIX filename character.
+ */
+export function buildLocalTarArgv(args: readonly string[], platform: NodeJS.Platform): string[] {
+  if (platform !== "win32") {
+    return [...args];
+  }
+  return ["--force-local", ...args.map((arg) => arg.replace(/\\/g, "/"))];
+}
 type BackgroundCommandState = {
   runId: string;
   status: "running" | "completed" | "failed";
@@ -130,6 +169,13 @@ export class SSHConnectionManager {
   private defaultName: string = "default";
   private enabledServers: string[] | null = null; // null = all servers enabled
   private outputLogRoot: string | null = null; // null = use <cwd>/.handfree-output at write time
+  // Absolute directories this service created itself under os.tmpdir() to
+  // hold a transfer's temporary local archive (see createLocalArchiveWorkspace).
+  // validateLocalPath exempts paths inside these from the user-facing local
+  // path policy: the archive path is never user input, it is generated here
+  // and immediately consumed by the same upload()/download() call, so this
+  // does not open any new user-reachable local path.
+  private readonly internalTransferWorkspaces = new Set<string>();
 
   private constructor() {}
 
@@ -1191,6 +1237,25 @@ export class SSHConnectionManager {
   private static readonly SFTP_WRITE_CHUNK_BYTES = 256 * 1024;
 
   /**
+   * Relay uses explicit offset reads/writes instead of a single stream pipe so
+   * the source can keep a bounded number of later ranges in flight while the
+   * destination acknowledges earlier writes. These match ssh2 fastGet's
+   * defaults, but the window is held only in MCP-host memory and never disk.
+   */
+  private static readonly DEFAULT_RELAY_SFTP_CONCURRENCY = 64;
+  private static readonly DEFAULT_RELAY_SFTP_CHUNK_BYTES = 32 * 1024;
+  private static readonly MAX_RELAY_PREFETCH_BYTES = 64 * 1024 * 1024;
+  private static readonly DEFAULT_RECURSIVE_FILE_CONCURRENCY = 4;
+  // Each concurrent worker opens its own SFTP channel (see upload/download),
+  // and every recursive transfer already holds one extra channel briefly for
+  // mkdir. OpenSSH's default `MaxSessions 10` bounds concurrently open
+  // channels on a single connection, so a cap above that reliably produces
+  // channel-open failures against a default-configured sshd. 8 leaves headroom
+  // under the common default instead of assuming operators raised it.
+  private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = 8;
+  private static readonly ARCHIVE_ERROR_OUTPUT_BYTES = 16 * 1024;
+
+  /**
    * Resolve the inactivity window for a data transfer: the caller's timeout if
    * valid, otherwise the generous default so a dead connection never hangs.
    */
@@ -1252,6 +1317,300 @@ export class SSHConnectionManager {
       debug,
       teardown,
     );
+  }
+
+  /**
+   * Resolve the bounded relay prefetch window. `sftpConcurrency` is the
+   * maximum number of source ranges that can be downloaded or awaiting a
+   * destination write at once; each owns one `chunkSize` Buffer.
+   */
+  private createRelayTransferOptions(options?: SftpOptions): Required<Pick<TransferOptions, "concurrency" | "chunkSize">> {
+    const requested = this.createSftpTransferOptions(options);
+    const concurrency = requested.concurrency ?? SSHConnectionManager.DEFAULT_RELAY_SFTP_CONCURRENCY;
+    const chunkSize = requested.chunkSize ?? SSHConnectionManager.DEFAULT_RELAY_SFTP_CHUNK_BYTES;
+    const prefetchBytes = concurrency * chunkSize;
+
+    if (!Number.isSafeInteger(prefetchBytes) || prefetchBytes > SSHConnectionManager.MAX_RELAY_PREFETCH_BYTES) {
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `relay prefetch window is too large (${concurrency} x ${chunkSize} bytes; max ${SSHConnectionManager.MAX_RELAY_PREFETCH_BYTES} bytes)`,
+        false,
+      );
+    }
+
+    return { concurrency, chunkSize };
+  }
+
+  /**
+   * Pure: how many parallel workers a relay transfer should start for a given
+   * (sourceSize, chunkSize, concurrency) triple. Never more workers than there
+   * are chunks to fetch, and never more than the configured concurrency.
+   * Callers must only invoke this for sourceSize > 0; a zero-byte transfer
+   * skips the worker pool entirely (see relayWithPrefetchWindow).
+   */
+  private resolveRelayWorkerCount(sourceSize: number, chunkSize: number, concurrency: number): number {
+    return Math.min(concurrency, Math.ceil(sourceSize / chunkSize));
+  }
+
+  private sftpOpenFile(
+    sftp: SFTPWrapper,
+    remotePath: string,
+    mode: "r" | "w",
+    mapError: (error: Error) => Error,
+  ): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      sftp.open(remotePath, mode, (error, handle) => {
+        if (error) {
+          reject(mapError(error));
+          return;
+        }
+        resolve(handle);
+      });
+    });
+  }
+
+  private sftpCloseFile(sftp: SFTPWrapper, handle: Buffer): Promise<void> {
+    return new Promise((resolve, reject) => {
+      sftp.close(handle, (error?: Error | null) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * Read one known-size range, retrying a short successful SFTP read until the
+   * full range arrives. A zero-byte successful read before the known source
+   * size is an unexpected source truncation rather than EOF we may silently
+   * copy.
+   */
+  private async sftpReadRelayChunk(
+    sftp: SFTPWrapper,
+    handle: Buffer,
+    offset: number,
+    length: number,
+  ): Promise<Buffer> {
+    const chunk = Buffer.allocUnsafe(length);
+    let received = 0;
+
+    while (received < length) {
+      const bytesRead = await new Promise<number>((resolve, reject) => {
+        sftp.read(
+          handle,
+          chunk,
+          received,
+          length - received,
+          offset + received,
+          (error, count) => {
+            if (error) {
+              reject(this.makeSftpError("Source read error", error));
+              return;
+            }
+            resolve(count);
+          },
+        );
+      });
+
+      if (bytesRead <= 0) {
+        throw new ToolError(
+          "SFTP_ERROR",
+          `Source read error: source file changed or ended early at offset ${offset + received}`,
+          true,
+        );
+      }
+      received += bytesRead;
+    }
+
+    return chunk;
+  }
+
+  private sftpWriteRelayChunk(
+    sftp: SFTPWrapper,
+    handle: Buffer,
+    chunk: Buffer,
+    offset: number,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      sftp.write(handle, chunk, 0, chunk.length, offset, (error?: Error | null) => {
+        if (error) {
+          reject(this.makeSftpError("Dest write error", error));
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * Relay through a bounded range window. A worker reserves a source range,
+   * downloads it, then writes that exact range at the same destination offset.
+   * Multiple workers deliberately finish out of order: SFTP offset writes make
+   * that safe and prevent one source/destination RTT pair from serializing the
+   * entire relay.
+   */
+  private async relayWithPrefetchWindow(
+    srcSftp: SFTPWrapper,
+    dstSftp: SFTPWrapper,
+    sourcePath: string,
+    destPath: string,
+    sourceSize: number,
+    options: SftpOptions | undefined,
+    timeout: number | undefined,
+    description: string,
+    debug: SshDebugSink | undefined,
+  ): Promise<void> {
+    // Validate before opening a pair of file handles so a bad requested window
+    // cannot leave remote handles behind.
+    const { concurrency, chunkSize } = this.createRelayTransferOptions(options);
+    debug?.(
+      `[mcp] relay prefetch window: concurrency=${concurrency}, chunkSize=${chunkSize}, maxBuffered=${concurrency * chunkSize}`,
+    );
+
+    let sourceHandle: Buffer | null = null;
+    let destHandle: Buffer | null = null;
+    let aborted = false;
+
+    const abort = () => {
+      if (aborted) return;
+      aborted = true;
+      // Closing the SFTP sessions below is the reliable cancellation mechanism
+      // for ssh2 requests which have no per-request abort handle. Best-effort
+      // close the file handles too; do not wait here or a dead server would turn
+      // an inactivity timeout back into a hang.
+      if (sourceHandle) {
+        try {
+          srcSftp.close(sourceHandle, () => {});
+        } catch {
+          // Ignore a channel that is already gone.
+        }
+      }
+      if (destHandle) {
+        try {
+          dstSftp.close(destHandle, () => {});
+        } catch {
+          // Ignore a channel that is already gone.
+        }
+      }
+      try {
+        srcSftp.end();
+      } catch {
+        // Ignore a channel that is already gone.
+      }
+      try {
+        dstSftp.end();
+      } catch {
+        // Ignore a channel that is already gone.
+      }
+    };
+
+    await this.runWithInactivityTimeout<void>(
+        (onProgress) =>
+          new Promise<void>((resolve, reject) => {
+            let settled = false;
+            let nextOffset = 0;
+            let workersRemaining = 0;
+
+            const fail = (error: Error) => {
+              if (settled) return;
+              settled = true;
+              abort();
+              reject(error);
+            };
+
+            const finish = async () => {
+              if (settled) return;
+              settled = true;
+              try {
+                // Close both remote handles before verification so every
+                // acknowledged write is durable and visible to `stat`/md5sum.
+                if (sourceHandle) {
+                  await this.sftpCloseFile(srcSftp, sourceHandle);
+                  sourceHandle = null;
+                }
+                if (destHandle) {
+                  await this.sftpCloseFile(dstSftp, destHandle);
+                  destHandle = null;
+                }
+                resolve();
+              } catch (error) {
+                abort();
+                reject(this.makeSftpError("Relay file close error", error as Error));
+              }
+            };
+
+            const runWorker = async () => {
+              try {
+                while (!settled) {
+                  const offset = nextOffset;
+                  if (offset >= sourceSize) break;
+                  nextOffset += chunkSize;
+                  const length = Math.min(chunkSize, sourceSize - offset);
+                  const chunk = await this.sftpReadRelayChunk(srcSftp, sourceHandle!, offset, length);
+                  onProgress();
+                  if (settled) return;
+                  await this.sftpWriteRelayChunk(dstSftp, destHandle!, chunk, offset);
+                  onProgress();
+                }
+              } catch (error) {
+                fail(error as Error);
+                return;
+              }
+
+              workersRemaining -= 1;
+              if (workersRemaining === 0) {
+                void finish();
+              }
+            };
+
+            const openAndStart = async () => {
+              try {
+                sourceHandle = await this.sftpOpenFile(
+                  srcSftp,
+                  sourcePath,
+                  "r",
+                  (error) => this.makeSftpError("Source open error", error),
+                );
+                destHandle = await this.sftpOpenFile(
+                  dstSftp,
+                  destPath,
+                  "w",
+                  (error) => this.makeSftpError("Dest open error", error),
+                );
+
+                if (sourceSize === 0) {
+                  await finish();
+                  return;
+                }
+
+                // workerCount is a local const used only for the loop bound.
+                // workersRemaining is a separate completion counter that
+                // runWorker decrements; keeping them distinct means a future
+                // worker that manages to decrement synchronously (e.g. a
+                // same-tick resolved read) can never shrink the loop bound
+                // out from under this for-loop.
+                const workerCount = this.resolveRelayWorkerCount(sourceSize, chunkSize, concurrency);
+                workersRemaining = workerCount;
+                for (let index = 0; index < workerCount; index += 1) {
+                  void runWorker();
+                }
+              } catch (error) {
+                fail(error as Error);
+              }
+            };
+
+            void openAndStart();
+          }),
+        this.transferStallTimeout(timeout),
+        description,
+        debug,
+        abort,
+      );
+    // Do not end the SFTP sessions on success: transferBetweenServers owns
+    // them and immediately reuses them for post-transfer stat verification.
+    // Failure and timeout paths already call abort(), which ends both sessions.
   }
 
   /**
@@ -1633,6 +1992,61 @@ export class SSHConnectionManager {
       );
     }
     return value;
+  }
+
+  /**
+   * Recursive directory transfer is dominated by per-file SFTP setup and
+   * round trips when a tree contains many small files. Keep a conservative
+   * default so the optimization remains safe for smaller SSH servers, but let
+   * callers tune it within a hard cap.
+   */
+  private resolveRecursiveFileConcurrency(options?: SftpOptions): number {
+    const requested = this.optionalPositiveInteger(options?.fileConcurrency, "fileConcurrency");
+    const concurrency = requested ?? SSHConnectionManager.DEFAULT_RECURSIVE_FILE_CONCURRENCY;
+    if (concurrency > SSHConnectionManager.MAX_RECURSIVE_FILE_CONCURRENCY) {
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `fileConcurrency must not exceed ${SSHConnectionManager.MAX_RECURSIVE_FILE_CONCURRENCY}`,
+        false,
+      );
+    }
+    return concurrency;
+  }
+
+  /**
+   * Run independent file transfers with a bounded worker pool. Once a worker
+   * fails no new files are scheduled; existing workers are awaited first so
+   * their SFTP channels can finish/clean up before the original error is
+   * returned to the caller.
+   */
+  private async runBoundedTransfers<T>(
+    items: readonly T[],
+    concurrency: number,
+    worker: (item: T) => Promise<void>,
+  ): Promise<void> {
+    let nextIndex = 0;
+    let firstError: unknown;
+
+    const runWorker = async (): Promise<void> => {
+      while (firstError === undefined) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) return;
+        try {
+          await worker(items[index]);
+        } catch (error) {
+          firstError ??= error;
+          return;
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, items.length) }, () => runWorker()),
+    );
+    if (firstError !== undefined) {
+      throw firstError;
+    }
   }
 
   /**
@@ -3013,6 +3427,19 @@ export class SSHConnectionManager {
    */
   private validateLocalPath(localPath: string, name?: string): string {
     const resolvedPath = path.resolve(localPath);
+
+    // Exempt this service's own internally-created temp archive workspaces
+    // (under os.tmpdir(), see createLocalArchiveWorkspace) from the
+    // user-facing local path policy below. These paths are never user input:
+    // they are generated by this service for one archive transfer and
+    // consumed by the very same upload()/download() call, so this cannot be
+    // used to reach an otherwise-disallowed user path.
+    for (const workspace of this.internalTransferWorkspaces) {
+      if (resolvedPath === workspace || resolvedPath.startsWith(workspace + path.sep)) {
+        return resolvedPath;
+      }
+    }
+
     const config = name ? this.getServerConfig(name) : undefined;
 
     // disableSftpPathPolicy fully opens the local side too (any path allowed).
@@ -4061,14 +4488,16 @@ export class SSHConnectionManager {
       sourceRemotePath = validatedSourcePath;
       destRemotePath = validatedDestPath;
 
-      await this.pipeWithInactivityTimeout(
-        srcSftp.createReadStream(validatedSourcePath),
-        dstSftp.createWriteStream(validatedDestPath),
-        this.transferStallTimeout(options?.timeout),
+      await this.relayWithPrefetchWindow(
+        srcSftp,
+        dstSftp,
+        validatedSourcePath,
+        validatedDestPath,
+        srcStat.size,
+        options,
+        options?.timeout,
         `relay ${sourceName}:${validatedSourcePath} -> ${destName}:${validatedDestPath}`,
         debug,
-        (err) => this.makeSftpError("Source read error", err),
-        (err) => this.makeSftpError("Dest write error", err),
       );
 
       // --- Verification ---
@@ -4105,7 +4534,7 @@ export class SSHConnectionManager {
       const srcConfig = this.getConfig(sourceName);
       const dstConfig = this.getConfig(destName);
       return this.appendDebugOutput(
-        `Transfer complete (streamed via SFTP, verified: ${verification.join(", ")}): ` +
+        `Transfer complete (windowed via SFTP, verified: ${verification.join(", ")}): ` +
           `${srcConfig.username}@${srcConfig.host}:${sourceRemotePath}` +
           ` → ${dstConfig.username}@${dstConfig.host}:${destRemotePath}`,
         debugCollector,
@@ -4121,6 +4550,173 @@ export class SSHConnectionManager {
       dstSftp?.end();
       srcConnection?.close();
       if (!selfRelay) dstConnection?.close();
+    }
+  }
+
+  /**
+   * Pack a local file/directory into a temporary tar archive, upload that one
+   * file, and extract it into a remote destination directory. The source
+   * basename is retained inside the archive.
+   */
+  public async uploadArchive(
+    localSourcePath: string,
+    remoteDestinationDirectory: string,
+    name?: string,
+    compression: ArchiveCompression = "none",
+    options?: SftpOptions,
+  ): Promise<string> {
+    const resolvedName = name || this.defaultName;
+    const validatedSource = this.validateLocalPath(localSourcePath, resolvedName);
+    const validatedDestination = this.validateRemotePath(remoteDestinationDirectory, resolvedName);
+    this.assertLocalArchiveSource(validatedSource);
+    const { collector: debugCollector, debug } = this.createDebugCollector(options?.vvv === true);
+    const workspace = this.createLocalArchiveWorkspace(compression);
+    const remoteArchive = this.createRemoteArchivePath(validatedDestination, compression);
+    let remoteArchiveMayExist = false;
+
+    try {
+      await this.runLocalTar(
+        this.archiveCreateArgs(workspace.archivePath, validatedSource, compression, path),
+        `create ${compression} archive from '${validatedSource}'`,
+        "LOCAL_FILE_READ_FAILED",
+      );
+      await this.ensureRemoteDirectory(resolvedName, validatedDestination, options, debug);
+      remoteArchiveMayExist = true;
+      await this.upload(workspace.archivePath, remoteArchive, resolvedName, {
+        ...options,
+        fast: options?.fast !== false,
+        skipIfIdentical: false,
+      });
+      await this.runRemoteTarOnServer(
+        resolvedName,
+        this.archiveExtractArgs(remoteArchive, validatedDestination, compression),
+        `extract ${compression} archive into '${validatedDestination}'`,
+        options,
+        debug,
+      );
+      return this.appendDebugOutput(
+        `Archive upload complete (${compression}): '${validatedSource}' → ${resolvedName}:'${validatedDestination}'`,
+        debugCollector,
+      );
+    } catch (error) {
+      throw this.appendDebugToError(error as Error, debugCollector);
+    } finally {
+      if (remoteArchiveMayExist) {
+        await this.cleanupRemoteArchive(resolvedName, remoteArchive, options, debug);
+      }
+      this.cleanupLocalArchiveWorkspace(workspace.directory);
+    }
+  }
+
+  /**
+   * Pack a remote file/directory into one temporary archive, download it, and
+   * extract it locally. The source basename is retained inside the archive.
+   */
+  public async downloadArchive(
+    remoteSourcePath: string,
+    localDestinationDirectory: string,
+    name?: string,
+    compression: ArchiveCompression = "none",
+    options?: SftpOptions,
+  ): Promise<string> {
+    const resolvedName = name || this.defaultName;
+    const validatedSource = this.validateRemotePath(remoteSourcePath, resolvedName);
+    const validatedDestination = this.validateLocalPath(localDestinationDirectory, resolvedName);
+    this.ensureLocalDestinationDirectory(validatedDestination);
+    this.assertArchiveBasename(path.posix.basename(validatedSource), validatedSource);
+    const { collector: debugCollector, debug } = this.createDebugCollector(options?.vvv === true);
+    const workspace = this.createLocalArchiveWorkspace(compression);
+    const remoteArchive = this.createRemoteArchivePath(path.posix.dirname(validatedSource), compression);
+    let remoteArchiveMayExist = false;
+
+    try {
+      remoteArchiveMayExist = true;
+      await this.runRemoteTarOnServer(
+        resolvedName,
+        this.archiveCreateArgs(remoteArchive, validatedSource, compression, path.posix),
+        `create ${compression} archive from '${validatedSource}'`,
+        options,
+        debug,
+      );
+      await this.download(remoteArchive, workspace.archivePath, resolvedName, {
+        ...options,
+        fast: options?.fast !== false,
+      });
+      await this.runLocalTar(
+        this.archiveExtractArgs(workspace.archivePath, validatedDestination, compression),
+        `extract ${compression} archive into '${validatedDestination}'`,
+        "LOCAL_FILE_WRITE_FAILED",
+      );
+      return this.appendDebugOutput(
+        `Archive download complete (${compression}): ${resolvedName}:'${validatedSource}' → '${validatedDestination}'`,
+        debugCollector,
+      );
+    } catch (error) {
+      throw this.appendDebugToError(error as Error, debugCollector);
+    } finally {
+      if (remoteArchiveMayExist) {
+        await this.cleanupRemoteArchive(resolvedName, remoteArchive, options, debug);
+      }
+      this.cleanupLocalArchiveWorkspace(workspace.directory);
+    }
+  }
+
+  /**
+   * Pack on the source server, relay one archive through the existing bounded
+   * SFTP window, and extract on the destination server.
+   */
+  public async transferArchiveBetweenServers(
+    sourceName: string,
+    sourceRemotePath: string,
+    destName: string,
+    destRemoteDirectory: string,
+    compression: ArchiveCompression = "none",
+    options?: SftpOptions,
+  ): Promise<string> {
+    const validatedSource = this.validateRemotePath(sourceRemotePath, sourceName);
+    const validatedDestination = this.validateRemotePath(destRemoteDirectory, destName);
+    this.assertArchiveBasename(path.posix.basename(validatedSource), validatedSource);
+    const { collector: debugCollector, debug } = this.createDebugCollector(options?.vvv === true);
+    const sourceArchive = this.createRemoteArchivePath(path.posix.dirname(validatedSource), compression);
+    const destArchive = this.createRemoteArchivePath(validatedDestination, compression);
+    let sourceArchiveMayExist = false;
+    let destArchiveMayExist = false;
+
+    try {
+      sourceArchiveMayExist = true;
+      await this.runRemoteTarOnServer(
+        sourceName,
+        this.archiveCreateArgs(sourceArchive, validatedSource, compression, path.posix),
+        `create ${compression} archive from '${validatedSource}'`,
+        options,
+        debug,
+      );
+      await this.ensureRemoteDirectory(destName, validatedDestination, options, debug);
+      destArchiveMayExist = true;
+      await this.transferBetweenServers(sourceName, sourceArchive, destName, destArchive, {
+        ...options,
+        skipIfIdentical: false,
+      });
+      await this.runRemoteTarOnServer(
+        destName,
+        this.archiveExtractArgs(destArchive, validatedDestination, compression),
+        `extract ${compression} archive into '${validatedDestination}'`,
+        options,
+        debug,
+      );
+      return this.appendDebugOutput(
+        `Archive relay complete (${compression}): ${sourceName}:'${validatedSource}' → ${destName}:'${validatedDestination}'`,
+        debugCollector,
+      );
+    } catch (error) {
+      throw this.appendDebugToError(error as Error, debugCollector);
+    } finally {
+      if (sourceArchiveMayExist) {
+        await this.cleanupRemoteArchive(sourceName, sourceArchive, options, debug);
+      }
+      if (destArchiveMayExist) {
+        await this.cleanupRemoteArchive(destName, destArchive, options, debug);
+      }
     }
   }
 
@@ -4170,6 +4766,302 @@ export class SSHConnectionManager {
    */
   private shellQuote(s: string): string {
     return "'" + s.replace(/'/g, "'\\''") + "'";
+  }
+
+  private archiveSuffix(compression: ArchiveCompression): string {
+    switch (compression) {
+      case "none": return ".tar";
+      case "gzip": return ".tar.gz";
+      case "bzip2": return ".tar.bz2";
+      case "xz": return ".tar.xz";
+      case "zstd": return ".tar.zst";
+    }
+  }
+
+  private archiveCreateArgs(
+    archivePath: string,
+    sourcePath: string,
+    compression: ArchiveCompression,
+    pathApi: Pick<typeof path, "dirname" | "basename">,
+  ): string[] {
+    const basename = pathApi.basename(sourcePath);
+    this.assertArchiveBasename(basename, sourcePath);
+    const flagArgs = compression === "zstd"
+      ? ["--zstd", "-cf"]
+      : [{ none: "-cf", gzip: "-czf", bzip2: "-cjf", xz: "-cJf" }[compression]];
+    return [...flagArgs, archivePath, "-C", pathApi.dirname(sourcePath), "--", basename];
+  }
+
+  private archiveExtractArgs(
+    archivePath: string,
+    destinationDirectory: string,
+    compression: ArchiveCompression,
+  ): string[] {
+    const flagArgs = compression === "zstd"
+      ? ["--zstd", "-xf"]
+      : [{ none: "-xf", gzip: "-xzf", bzip2: "-xjf", xz: "-xJf" }[compression]];
+    return [...flagArgs, archivePath, "-C", destinationDirectory];
+  }
+
+  private assertArchiveBasename(basename: string, sourcePath: string): void {
+    if (!basename || basename === "." || basename === "..") {
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `Archive source must name a file or directory, not a filesystem root: ${sourcePath}`,
+        false,
+      );
+    }
+  }
+
+  private assertLocalArchiveSource(sourcePath: string): void {
+    try {
+      fs.statSync(sourcePath);
+    } catch (error) {
+      throw new ToolError(
+        "LOCAL_FILE_READ_FAILED",
+        `Failed to stat archive source '${sourcePath}': ${(error as Error).message}`,
+        false,
+      );
+    }
+    this.assertArchiveBasename(path.basename(sourcePath), sourcePath);
+  }
+
+  private ensureLocalDestinationDirectory(destinationDirectory: string): void {
+    try {
+      if (fs.existsSync(destinationDirectory)) {
+        if (!fs.statSync(destinationDirectory).isDirectory()) {
+          throw new Error("destination exists and is not a directory");
+        }
+      } else {
+        fs.mkdirSync(destinationDirectory, { recursive: true });
+      }
+    } catch (error) {
+      throw new ToolError(
+        "LOCAL_FILE_WRITE_FAILED",
+        `Failed to prepare archive destination '${destinationDirectory}': ${(error as Error).message}`,
+        false,
+      );
+    }
+  }
+
+  private createLocalArchiveWorkspace(compression: ArchiveCompression): {
+    directory: string;
+    archivePath: string;
+  } {
+    try {
+      // Use the OS temp directory, not process.cwd(): an MCP server's working
+      // directory is arbitrary and often a user's project directory, so
+      // creating archive scratch space there would litter it and tie large
+      // temporary archives to whatever volume cwd happens to live on.
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), ".handfree-transfer-"));
+      this.internalTransferWorkspaces.add(directory);
+      return {
+        directory,
+        archivePath: path.join(directory, `payload${this.archiveSuffix(compression)}`),
+      };
+    } catch (error) {
+      throw new ToolError(
+        "LOCAL_FILE_WRITE_FAILED",
+        `Failed to create local transfer workspace: ${(error as Error).message}`,
+        false,
+      );
+    }
+  }
+
+  private cleanupLocalArchiveWorkspace(directory: string): void {
+    try {
+      fs.rmSync(directory, { recursive: true, force: true });
+    } catch (error) {
+      Logger.log(`Failed to clean local transfer workspace '${directory}': ${(error as Error).message}`, "error");
+    } finally {
+      this.internalTransferWorkspaces.delete(directory);
+    }
+  }
+
+  private createRemoteArchivePath(
+    remoteDirectory: string,
+    compression: ArchiveCompression,
+  ): string {
+    const token = crypto.randomBytes(12).toString("hex");
+    return path.posix.join(
+      remoteDirectory,
+      `.handfree-transfer-${token}${this.archiveSuffix(compression)}`,
+    );
+  }
+
+  private async runLocalTar(
+    args: string[],
+    description: string,
+    errorCode: "LOCAL_FILE_READ_FAILED" | "LOCAL_FILE_WRITE_FAILED",
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const stderr = new OutputCollector(SSHConnectionManager.ARCHIVE_ERROR_OUTPUT_BYTES);
+      let settled = false;
+      // See buildLocalTarArgv's doc comment for why this platform-conditional
+      // rewrite exists (drive-letter misparse + extraction path corruption on
+      // Windows/MSYS tar builds).
+      const localArgs = buildLocalTarArgv(args, process.platform);
+      const child = spawn("tar", localArgs, {
+        stdio: ["ignore", "ignore", "pipe"],
+        windowsHide: true,
+      });
+      child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      child.once("error", (error) => {
+        if (settled) return;
+        settled = true;
+        reject(new ToolError(errorCode, `Failed to ${description}: ${error.message}`, false));
+      });
+      child.once("close", (code) => {
+        if (settled) return;
+        settled = true;
+        if (code === 0) {
+          resolve();
+          return;
+        }
+        const detail = stderr.getSnapshot().tail.toString("utf8").trim();
+        reject(new ToolError(
+          errorCode,
+          `Failed to ${description} (tar exit ${code})${detail ? `: ${detail}` : ""}`,
+          false,
+        ));
+      });
+    });
+  }
+
+  private async runRemoteTarOnServer(
+    name: string,
+    args: string[],
+    description: string,
+    options: SftpOptions | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<void> {
+    const reuseConnection = options?.reuseConnection !== false;
+    let connection: AcquiredSshClient | null = null;
+    try {
+      connection = await this.acquireSshClient(name, {
+        reuseConnection,
+        timeout: options?.timeout,
+        debug,
+        purpose: "command",
+      });
+      const command = ["tar", ...args].map((arg) => this.shellQuote(arg)).join(" ");
+      debug?.(`[mcp] remote archive command on [${name}]: tar ${args[0] ?? ""}`);
+      const stream = await this.withConnectionTimeout(
+        new Promise<ClientChannel>((resolve, reject) => {
+          connection!.client.exec(command, (error, channel) => {
+            if (error) {
+              reject(this.isConnectionShapedMessage(error.message)
+                ? new ToolError("SSH_CONNECTION_FAILED", `Failed to open remote archive command: ${error.message}`, true)
+                : new ToolError("COMMAND_EXECUTION_ERROR", `Failed to open remote archive command: ${error.message}`, false));
+              return;
+            }
+            resolve(channel);
+          });
+        }),
+        this.normalizeConnectTimeout(options?.timeout),
+        `Remote archive command channel open on [${name}]`,
+        debug,
+      );
+      await new Promise<void>((resolve, reject) => {
+        const stderr = new OutputCollector(SSHConnectionManager.ARCHIVE_ERROR_OUTPUT_BYTES);
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          error ? reject(error) : resolve();
+        };
+        stream.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+        stream.on("error", (error: Error) => finish(this.makeSftpError(`Remote archive command failed on [${name}]`, error)));
+        const finishWithExitCode = (code: number | null) => {
+          if (code === 0) {
+            finish();
+            return;
+          }
+          const detail = stderr.getSnapshot().tail.toString("utf8").trim();
+          finish(new ToolError(
+            "COMMAND_EXECUTION_ERROR",
+            `Failed to ${description} on [${name}] (tar exit ${code ?? "unknown"})${detail ? `: ${detail}` : ""}`,
+            false,
+          ));
+        };
+        // RFC 4254 exit-status precedes channel close. Some SSH servers send a
+        // valid exit-status but delay or omit the reciprocal close handshake;
+        // accepting either event prevents a completed tar from hanging forever.
+        // `finish` is idempotent, so normal servers emitting both are safe.
+        stream.on("exit", (code: number | null) => finishWithExitCode(code));
+        stream.on("close", (code: number | null) => finishWithExitCode(code));
+      });
+    } catch (error) {
+      if (reuseConnection && this.isConnectionError(error as Error)) {
+        this.closeClient(name, true);
+      }
+      throw error;
+    } finally {
+      connection?.close();
+    }
+  }
+
+  private async ensureRemoteDirectory(
+    name: string,
+    remoteDirectory: string,
+    options: SftpOptions | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<void> {
+    const reuseConnection = options?.reuseConnection !== false;
+    let connection: AcquiredSshClient | null = null;
+    try {
+      connection = await this.acquireSshClient(name, {
+        reuseConnection,
+        timeout: options?.timeout,
+        debug,
+        purpose: "sftp",
+      });
+      await this.sftpMkdirRecursive(connection.client, remoteDirectory, options?.timeout, debug);
+    } catch (error) {
+      if (reuseConnection && this.isConnectionError(error as Error)) {
+        this.closeClient(name, true);
+      }
+      throw error;
+    } finally {
+      connection?.close();
+    }
+  }
+
+  private async cleanupRemoteArchive(
+    name: string,
+    remoteArchivePath: string,
+    options: SftpOptions | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<void> {
+    const reuseConnection = options?.reuseConnection !== false;
+    let connection: AcquiredSshClient | null = null;
+    let sftp: SFTPWrapper | null = null;
+    try {
+      connection = await this.acquireSshClient(name, {
+        reuseConnection,
+        timeout: options?.timeout,
+        debug,
+        purpose: "sftp",
+      });
+      sftp = await this.openSftp(connection.client, "archive-cleanup", options?.timeout, debug);
+      await new Promise<void>((resolve, reject) => {
+        sftp!.unlink(remoteArchivePath, (error?: Error | null) => {
+          if (!error || /no such|not found/i.test(error.message)) {
+            resolve();
+            return;
+          }
+          reject(this.makeSftpError("Failed to remove remote temporary archive", error));
+        });
+      });
+    } catch (error) {
+      Logger.log(
+        `Failed to clean remote temporary archive [${name}] '${remoteArchivePath}': ${(error as Error).message}`,
+        "error",
+      );
+    } finally {
+      try { sftp?.end(); } catch { /* ignore cleanup errors */ }
+      connection?.close();
+    }
   }
 
   /**
@@ -4262,7 +5154,9 @@ export class SSHConnectionManager {
   }
 
   /**
-   * Upload a local directory recursively to a remote server
+   * Upload a local directory recursively to a remote server. Directory
+   * creation is completed before a bounded pool uploads independent files;
+   * this avoids the per-file serial round-trip bottleneck for small trees.
    */
   public async uploadDirectory(
     localDir: string,
@@ -4276,8 +5170,7 @@ export class SSHConnectionManager {
     if (!fs.statSync(resolvedLocal).isDirectory()) {
       throw new ToolError("LOCAL_FILE_READ_FAILED", `Not a directory: ${localDir}`, false);
     }
-
-    const results: string[] = [];
+    const fileConcurrency = this.resolveRecursiveFileConcurrency(options);
 
     const reuseConnection = options?.reuseConnection !== false;
     const { collector: debugCollector, debug } = this.createDebugCollector(options?.vvv === true);
@@ -4300,25 +5193,58 @@ export class SSHConnectionManager {
       connection?.close();
     }
 
-    const entries = fs.readdirSync(resolvedLocal, { withFileTypes: true });
-    for (const entry of entries) {
-      const localPath = path.join(localDir, entry.name);
-      const remoteSub = `${validatedRemoteDir}/${entry.name}`;
+    const directories: string[] = [];
+    const files: Array<{ localPath: string; remotePath: string }> = [];
+    const collect = (currentLocal: string, currentRemote: string): void => {
+      for (const entry of fs.readdirSync(currentLocal, { withFileTypes: true })) {
+        const localPath = path.join(currentLocal, entry.name);
+        const remotePath = path.posix.join(currentRemote, entry.name);
+        if (entry.isDirectory()) {
+          directories.push(remotePath);
+          collect(localPath, remotePath);
+        } else {
+          files.push({ localPath, remotePath });
+        }
+      }
+    };
+    collect(resolvedLocal, validatedRemoteDir);
 
-      if (entry.isDirectory()) {
-        const subResults = await this.uploadDirectory(localPath, remoteSub, resolvedName, options);
-        results.push(...subResults);
-      } else {
-        await this.upload(localPath, remoteSub, resolvedName, options);
-        results.push(remoteSub);
+    // Create the full directory tree through one SSH connection/SFTP channel
+    // before opening parallel file transfers.
+    if (directories.length > 0) {
+      let directoryConnection: AcquiredSshClient | null = null;
+      try {
+        directoryConnection = await this.acquireSshClient(resolvedName, {
+          reuseConnection,
+          timeout: options?.timeout,
+          debug,
+          purpose: "sftp",
+        });
+        await this.sftpMkdirMany(directoryConnection.client, directories, options?.timeout, debug);
+      } catch (error) {
+        if (reuseConnection && this.isConnectionError(error as Error)) {
+          this.closeClient(resolvedName, true);
+        }
+        throw this.appendDebugToError(error as Error, debugCollector);
+      } finally {
+        directoryConnection?.close();
       }
     }
 
-    return results;
+    await this.runBoundedTransfers(
+      files,
+      fileConcurrency,
+      async ({ localPath, remotePath }) => {
+        await this.upload(localPath, remotePath, resolvedName, options);
+      },
+    );
+    return files.map(({ remotePath }) => remotePath);
   }
 
   /**
-   * Download a remote directory recursively to a local path
+   * Download a remote directory recursively to a local path. First enumerate
+   * and create the local directory tree, then pull independent files through a
+   * bounded worker pool to amortize small-file SFTP round trips.
    */
   public async downloadDirectory(
     remoteDir: string,
@@ -4329,30 +5255,38 @@ export class SSHConnectionManager {
     const resolvedName = name || this.defaultName;
     const resolvedLocal = this.validateLocalPath(localDir, resolvedName);
     const validatedRemoteDir = this.validateRemotePath(remoteDir, resolvedName);
+    const fileConcurrency = this.resolveRecursiveFileConcurrency(options);
 
     if (!fs.existsSync(resolvedLocal)) {
       fs.mkdirSync(resolvedLocal, { recursive: true });
     }
 
-    const results: string[] = [];
-    const entries = await this.listRemoteDir(validatedRemoteDir, resolvedName, options);
+    const files: Array<{ remotePath: string; localPath: string }> = [];
+    const collect = async (currentRemote: string, currentLocal: string): Promise<void> => {
+      const entries = await this.listRemoteDir(currentRemote, resolvedName, options);
+      for (const entry of entries) {
+        if (entry.filename === "." || entry.filename === "..") continue;
 
-    for (const entry of entries) {
-      if (entry.filename === "." || entry.filename === "..") continue;
-
-      const remotePath = `${validatedRemoteDir}/${entry.filename}`;
-      const localPath = path.join(localDir, entry.filename);
-
-      if (entry.isDirectory) {
-        const subResults = await this.downloadDirectory(remotePath, localPath, resolvedName, options);
-        results.push(...subResults);
-      } else {
-        await this.download(remotePath, localPath, resolvedName, options);
-        results.push(localPath);
+        const remotePath = path.posix.join(currentRemote, entry.filename);
+        const localPath = path.join(currentLocal, entry.filename);
+        if (entry.isDirectory) {
+          fs.mkdirSync(localPath, { recursive: true });
+          await collect(remotePath, localPath);
+        } else {
+          files.push({ remotePath, localPath });
+        }
       }
-    }
+    };
+    await collect(validatedRemoteDir, resolvedLocal);
 
-    return results;
+    await this.runBoundedTransfers(
+      files,
+      fileConcurrency,
+      async ({ remotePath, localPath }) => {
+        await this.download(remotePath, localPath, resolvedName, options);
+      },
+    );
+    return files.map(({ localPath }) => localPath);
   }
 
   /**
@@ -4403,6 +5337,36 @@ export class SSHConnectionManager {
       } catch {
         // Ignore late SFTP cleanup errors.
       }
+    }
+  }
+
+  /** Create already-parent-ordered directories through one SFTP channel. */
+  private async sftpMkdirMany(
+    client: Client,
+    remoteDirectories: readonly string[],
+    timeout?: number,
+    debug?: SshDebugSink,
+  ): Promise<void> {
+    const sftp = await this.openSftp(client, "mkdir-many", timeout, debug);
+    try {
+      for (const remoteDirectory of remoteDirectories) {
+        await this.withConnectionTimeout(
+          new Promise<void>((resolve, reject) => {
+            sftp.mkdir(remoteDirectory, (error?: Error | null) => {
+              if (error && this.isConnectionShapedMessage(error.message)) {
+                reject(this.makeSftpError(`Remote mkdir failed for '${remoteDirectory}'`, error));
+                return;
+              }
+              resolve();
+            });
+          }),
+          this.normalizeConnectTimeout(timeout),
+          `SFTP mkdir ${remoteDirectory}`,
+          debug,
+        );
+      }
+    } finally {
+      try { sftp.end(); } catch { /* ignore late cleanup errors */ }
     }
   }
 }

@@ -20,7 +20,7 @@ export function registerDownloadTool(server: McpServer): void {
       reuseConnection: z.boolean().optional().describe("Default true. Reuse the cached SSH connection for SFTP. Set false after a timeout or suspected stale cached SSH connection to force a fresh TCP/SSH connection for this transfer; the fresh connection closes afterwards."),
       timeout: z.number().positive().optional().describe("Timeout in ms for SSH setup and SFTP channel opening. Transfer stream duration itself is not forcibly interrupted by this option."),
       vvv: z.boolean().optional().describe("Default false. Append bounded SSH/SFTP debug output. For fresh ssh2 handshake logs, also set reuseConnection=false."),
-      fast: z.boolean().optional().describe("Default false. When true, use ssh2 fastGet for a single-file download, which performs parallel SFTP reads for better throughput."),
+      fast: z.boolean().optional().describe("Default true. Use ssh2 fastGet for a single-file download, which performs parallel SFTP reads for better throughput. Set false for the buffered compatibility path."),
       sftpConcurrency: z.number().int().positive().optional().describe("Only used when fast=true. Number of concurrent SFTP chunks for ssh2 fastGet; omitted uses ssh2's default."),
       chunkSize: z.number().int().positive().optional().describe("Only used when fast=true. Chunk size in bytes for ssh2 fastGet; omitted uses ssh2's default."),
     },
@@ -31,7 +31,7 @@ export function registerDownloadTool(server: McpServer): void {
           reuseConnection,
           timeout,
           vvv,
-          fast,
+          fast: fast !== false,
           sftpConcurrency,
           chunkSize,
         });

@@ -1497,18 +1497,30 @@ describe("SSHConnectionManager regressions", () => {
         },
       };
     };
-    manager.openSftp = async () => ({
-      end: () => {},
-      createReadStream: () => {
-        const stream = new EventEmitter() as any;
-        stream.pipe = (dest: EventEmitter) => {
-          setImmediate(() => dest.emit("close"));
-          return dest;
-        };
-        return stream;
-      },
-      createWriteStream: () => new EventEmitter(),
-    }) as any;
+    const source = Buffer.from("payload");
+    const destination = Buffer.alloc(source.length);
+    manager.openSftp = async (_client: unknown, label: string) => {
+      if (label === "source") {
+        return {
+          end: () => {},
+          open: (_path: string, _mode: string, callback: (error: Error | undefined, handle: Buffer) => void) => callback(undefined, Buffer.from("src")),
+          read: (_handle: Buffer, buffer: Buffer, bufferOffset: number, length: number, position: number, callback: (error: Error | undefined, bytesRead: number) => void) => {
+            const count = source.copy(buffer, bufferOffset, position, position + length);
+            callback(undefined, count);
+          },
+          close: (_handle: Buffer, callback: (error?: Error) => void) => callback(),
+        } as any;
+      }
+      return {
+        end: () => {},
+        open: (_path: string, _mode: string, callback: (error: Error | undefined, handle: Buffer) => void) => callback(undefined, Buffer.from("dst")),
+        write: (_handle: Buffer, buffer: Buffer, bufferOffset: number, length: number, position: number, callback: (error?: Error) => void) => {
+          buffer.copy(destination, position, bufferOffset, bufferOffset + length);
+          callback();
+        },
+        close: (_handle: Buffer, callback: (error?: Error) => void) => callback(),
+      } as any;
+    };
     manager.sftpStat = async () => ({ size: 7 });
 
     try {
@@ -1529,6 +1541,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.match(result, /dst relay handshake/);
       assert.deepStrictEqual(acquired, ["src", "dst"]);
       assert.strictEqual(closeCalls, 2);
+      assert.deepStrictEqual(destination, source);
     } finally {
       manager.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;
@@ -1536,7 +1549,7 @@ describe("SSHConnectionManager regressions", () => {
     }
   });
 
-  it("should tear down both relay streams when the destination write fails", async () => {
+  it("should tear down both relay SFTP sessions when the destination write fails", async () => {
     manager.setConfig(
       {
         src: baseConfig({
@@ -1555,9 +1568,10 @@ describe("SSHConnectionManager regressions", () => {
     const originalAcquireSshClient = manager.acquireSshClient;
     const originalOpenSftp = manager.openSftp;
     const originalSftpStat = manager.sftpStat;
-    let readUnpipeCalls = 0;
-    let readDestroyCalls = 0;
-    let writeDestroyCalls = 0;
+    let sourceEndCalls = 0;
+    let destEndCalls = 0;
+    let sourceCloseCalls = 0;
+    let destCloseCalls = 0;
 
     manager.acquireSshClient = async (key: string) => ({
       client: { key },
@@ -1567,32 +1581,32 @@ describe("SSHConnectionManager regressions", () => {
     manager.openSftp = async (_client: unknown, label: string) => {
       if (label === "source") {
         return {
-          end: () => {},
-          createReadStream: () => {
-            const stream = new EventEmitter() as any;
-            stream.pipe = (dest: EventEmitter) => {
-              setImmediate(() => dest.emit("error", new Error("dest write failed")));
-              return dest;
-            };
-            stream.unpipe = () => {
-              readUnpipeCalls += 1;
-            };
-            stream.destroy = () => {
-              readDestroyCalls += 1;
-            };
-            return stream;
+          end: () => {
+            sourceEndCalls += 1;
+          },
+          open: (_path: string, _mode: string, callback: (error: Error | undefined, handle: Buffer) => void) => callback(undefined, Buffer.from("src")),
+          read: (_handle: Buffer, buffer: Buffer, bufferOffset: number, length: number, _position: number, callback: (error: Error | undefined, bytesRead: number) => void) => {
+            Buffer.from("payload").copy(buffer, bufferOffset, 0, length);
+            callback(undefined, length);
+          },
+          close: (_handle: Buffer, callback: (error?: Error) => void) => {
+            sourceCloseCalls += 1;
+            callback();
           },
         } as any;
       }
 
       return {
-        end: () => {},
-        createWriteStream: () => {
-          const stream = new EventEmitter() as any;
-          stream.destroy = () => {
-            writeDestroyCalls += 1;
-          };
-          return stream;
+        end: () => {
+          destEndCalls += 1;
+        },
+        open: (_path: string, _mode: string, callback: (error: Error | undefined, handle: Buffer) => void) => callback(undefined, Buffer.from("dst")),
+        write: (_handle: Buffer, _buffer: Buffer, _bufferOffset: number, _length: number, _position: number, callback: (error?: Error) => void) => {
+          setImmediate(() => callback(new Error("dest write failed")));
+        },
+        close: (_handle: Buffer, callback: (error?: Error) => void) => {
+          destCloseCalls += 1;
+          callback();
         },
       } as any;
     };
@@ -1608,9 +1622,157 @@ describe("SSHConnectionManager regressions", () => {
         ),
         (error: unknown) => error instanceof ToolError && error.code === "SFTP_ERROR",
       );
-      assert.strictEqual(readUnpipeCalls, 1);
-      assert.strictEqual(readDestroyCalls, 1);
-      assert.strictEqual(writeDestroyCalls, 1);
+      assert.ok(sourceEndCalls >= 1, "source SFTP session must be closed after a failed relay");
+      assert.ok(destEndCalls >= 1, "destination SFTP session must be closed after a failed relay");
+      assert.ok(sourceCloseCalls >= 1, "source file handle must be closed after a failed relay");
+      assert.ok(destCloseCalls >= 1, "destination file handle must be closed after a failed relay");
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      manager.sftpStat = originalSftpStat;
+    }
+  });
+
+  it("should prefetch relay chunks while earlier destination writes are pending", async () => {
+    manager.setConfig(
+      {
+        src: baseConfig({
+          name: "src",
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+        dst: baseConfig({
+          name: "dst",
+          host: "127.0.0.2",
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["src", "dst"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    const originalSftpStat = manager.sftpStat;
+    const source = Buffer.from("abcdefgh");
+    const destination = Buffer.alloc(source.length);
+    const readOffsets: number[] = [];
+    const writeOffsets: number[] = [];
+    const pendingWriteAcks: Array<() => void> = [];
+
+    manager.acquireSshClient = async (key: string) => ({
+      client: { key },
+      close: () => {},
+    });
+    manager.sftpStat = async () => ({ size: source.length });
+    manager.openSftp = async (_client: unknown, label: string) => {
+      if (label === "source") {
+        return {
+          end: () => {},
+          open: (_path: string, _mode: string, callback: (error: Error | undefined, handle: Buffer) => void) => callback(undefined, Buffer.from("src")),
+          read: (_handle: Buffer, buffer: Buffer, bufferOffset: number, length: number, position: number, callback: (error: Error | undefined, bytesRead: number) => void) => {
+            readOffsets.push(position);
+            const count = source.copy(buffer, bufferOffset, position, position + length);
+            callback(undefined, count);
+          },
+          close: (_handle: Buffer, callback: (error?: Error) => void) => callback(),
+        } as any;
+      }
+      return {
+        end: () => {},
+        open: (_path: string, _mode: string, callback: (error: Error | undefined, handle: Buffer) => void) => callback(undefined, Buffer.from("dst")),
+        write: (_handle: Buffer, buffer: Buffer, bufferOffset: number, length: number, position: number, callback: (error?: Error) => void) => {
+          writeOffsets.push(position);
+          pendingWriteAcks.push(() => {
+            buffer.copy(destination, position, bufferOffset, bufferOffset + length);
+            callback();
+          });
+        },
+        close: (_handle: Buffer, callback: (error?: Error) => void) => callback(),
+      } as any;
+    };
+
+    try {
+      const transfer = manager.transferBetweenServers(
+        "src",
+        "/tmp/source.txt",
+        "dst",
+        "/tmp/dest.txt",
+        { skipIfIdentical: false, sftpConcurrency: 2, chunkSize: 2 },
+      );
+
+      for (let attempt = 0; attempt < 10 && pendingWriteAcks.length < 2; attempt += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      assert.deepStrictEqual(readOffsets.slice(0, 2), [0, 2]);
+      assert.deepStrictEqual(writeOffsets.slice(0, 2), [0, 2]);
+      assert.strictEqual(
+        pendingWriteAcks.length,
+        2,
+        "the second source chunk must be prefetched before the first destination write is acknowledged",
+      );
+
+      for (let attempt = 0; attempt < 20 && !destination.equals(source); attempt += 1) {
+        const acknowledgements = pendingWriteAcks.splice(0);
+        acknowledgements.forEach((ack) => ack());
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      await transfer;
+      assert.deepStrictEqual(destination, source);
+    } finally {
+      manager.acquireSshClient = originalAcquireSshClient;
+      manager.openSftp = originalOpenSftp;
+      manager.sftpStat = originalSftpStat;
+    }
+  });
+
+  it("should reject an oversized relay prefetch window before opening remote files", async () => {
+    manager.setConfig(
+      {
+        src: baseConfig({
+          name: "src",
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+        dst: baseConfig({
+          name: "dst",
+          host: "127.0.0.2",
+          allowedRemoteDirectories: ["/tmp"],
+        }),
+      },
+      ["src", "dst"],
+    );
+
+    const originalAcquireSshClient = manager.acquireSshClient;
+    const originalOpenSftp = manager.openSftp;
+    const originalSftpStat = manager.sftpStat;
+    let openFileCalls = 0;
+    let sftpEndCalls = 0;
+
+    manager.acquireSshClient = async (key: string) => ({
+      client: { key },
+      close: () => {},
+    });
+    manager.sftpStat = async () => ({ size: 1 });
+    manager.openSftp = async () => ({
+      end: () => {
+        sftpEndCalls += 1;
+      },
+      open: () => {
+        openFileCalls += 1;
+      },
+    }) as any;
+
+    try {
+      await assert.rejects(
+        () => manager.transferBetweenServers(
+          "src",
+          "/tmp/source.txt",
+          "dst",
+          "/tmp/dest.txt",
+          { skipIfIdentical: false, sftpConcurrency: 1025, chunkSize: 65536 },
+        ),
+        (error: unknown) => error instanceof ToolError && error.code === "INVALID_CONFIGURATION",
+      );
+      assert.strictEqual(openFileCalls, 0);
+      assert.strictEqual(sftpEndCalls, 2, "both opened SFTP sessions must close after option validation fails");
     } finally {
       manager.acquireSshClient = originalAcquireSshClient;
       manager.openSftp = originalOpenSftp;

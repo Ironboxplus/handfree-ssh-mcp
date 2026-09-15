@@ -186,6 +186,11 @@ Parameters for upload / download:
                   recursion stays sequential; no multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
+  fileConcurrency (number, optional)   Recursive only: independent files transferred
+                  in parallel. Default 4, maximum 8. Each parallel file opens
+                  its own SFTP channel on the same SSH connection; capped
+                  under OpenSSH's common default MaxSessions=10 so it does not
+                  reliably fail channel-open against a default-configured remote.
 
 Parameters for relay:
   mode              (string, required)   "relay"
