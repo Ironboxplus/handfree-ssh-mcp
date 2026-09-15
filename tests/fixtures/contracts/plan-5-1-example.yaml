@@ -1,0 +1,109 @@
+# Transcribed verbatim from PLAN.MD §5.1's documented YAML config example.
+# Read by BOTH src/tests/contracts.test.ts (unit test) and
+# scripts/validate-contracts.mjs (the P0-03-A1 gate's "所有文档示例可解析"
+# check) from this single file, so the two never drift out of sync with
+# each other. If PLAN.MD's §5.1 example ever changes, update this file to
+# match and both consumers stay correct.
+
+daemon:
+  instanceName: default
+  mode: auto
+
+web:
+  enabled: false
+  host: 127.0.0.1
+  port: 8765
+
+transferDefaults:
+  strategy: auto
+  engine: auto
+  fast: true
+  striped: auto
+  checkers: 8
+  transfers: 4
+  streams: 4
+  requestsPerStream: 64
+  chunkSize: 32768
+  maxBufferBytes: 268435456
+
+runProfiles:
+  qwen-dev:
+    syncProfile: qwen-dev
+    environment:
+      type: venv
+      path: /data/arc/venvs/qwen
+    executable: python
+    allowedEntrypoints:
+      - train.py
+      - benchmarks/*.py
+    env:
+      PYTHONUNBUFFERED: '1'
+    secretEnv:
+      HF_TOKEN:
+        provider: process-env
+        key: HF_TOKEN
+    gpu:
+      required: true
+      visibleDevices: auto
+    timeout: 24h
+
+syncProfiles:
+  qwen-dev:
+    localRoot: E:/Projects/qwen
+    server: gpu4090
+    remoteRoot: /data/arc/qwen
+    direction: bidirectional
+    watch: true
+    remoteScanInterval: 5m
+    initialSync: archive
+    archiveCompression: zstd
+    reconcileInterval: 10m
+    debounceMs: 500
+    maxBatchDelayMs: 5000
+    maxPendingEvents: 4096
+    atomicWrites: true
+    conflict:
+      policy: fail
+      keepBothSuffix: '.conflict-{side}-{timestamp}'
+      typeChange: fail
+    delete:
+      enabled: false
+      propagate: none
+      requireApproval: true
+      approvalTtl: 5m
+      rootIdentity: marker-and-volume
+      divergence: conflict-fail
+      backupRetention: 7d
+      remote:
+        maxCountPerRun: 100
+        maxBytesPerRun: 1GiB
+        maxPercentPerEpoch: 5
+        maxCountPerEpoch: 500
+        maxBytesPerEpoch: 5GiB
+      local:
+        backupBeforeDelete: true
+        backupDir: .handfree-trash
+        maxCountPerRun: 50
+        maxBytesPerRun: 512MiB
+        maxPercentPerEpoch: 2
+        maxCountPerEpoch: 200
+        maxBytesPerEpoch: 2GiB
+    ignore:
+      - .git/**
+      - node_modules/**
+      - .venv/**
+      - __pycache__/**
+      - build/**
+      - dist/**
+      - '*.pyc'
+
+directRoutes:
+  source-to-destination:
+    sourceServer: source
+    destinationServer: destination
+    destinationHost: destination.internal
+    destinationPort: 22
+    destinationUser: app
+    hostKey: SHA256:REQUIRED_PIN
+    credentialMode: existing-remote-key
+    backends: [rsync, rclone, tar-ssh]

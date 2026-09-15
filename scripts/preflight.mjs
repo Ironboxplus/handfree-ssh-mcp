@@ -559,9 +559,13 @@ function renderTable(capabilities) {
 function computeConfigFingerprint({ requiredClasses }) {
   // This is an environment/invocation fingerprint scoped to this script — it
   // identifies "these inputs produced this preflight artifact" for later
-  // comparison. It is intentionally NOT the full config-schema fingerprint
-  // (instanceId/configRevision/policyFingerprint) described in PLAN.MD §4.2 /
-  // §2.2's contracts, which land in P0-03 once src/contracts/ exists.
+  // comparison. It is intentionally NOT the full identity scheme
+  // (instanceId/configRevision/policyFingerprint) described in PLAN.MD §4.2,
+  // which now lives in src/contracts/identity.ts (computeInstanceId /
+  // computeConfigRevision / computePolicyFingerprint, built in P0-03). This
+  // preflight fingerprint and that daemon identity scheme are deliberately
+  // separate concepts computed the same way (canonical-JSON + SHA-256) but
+  // over different, non-interchangeable inputs — do not conflate them.
   let packageVersion = "unknown";
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));

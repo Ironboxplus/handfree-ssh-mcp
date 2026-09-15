@@ -746,8 +746,16 @@ P0-02 实施记录：
 - [ ] 对旧 foreground tool response 建 characterization contract；对新/background tool 建 envelope contract。
 - [ ] schema 版本与 IPC/HTTP major version 绑定；不兼容请求必须失败。
 
-- [ ] **P0-03-A1**：`node scripts/validate-contracts.mjs` exit 0，生成 `artifacts/openapi.json` 和 `artifacts/schemas/*.json`；所有文档示例可解析。
-- [ ] **P0-03-A2**：三模式决策表穷举测试 100% 分支覆盖；`push` 分支不产生任何本地写操作、`pull` 分支不产生任何远端写操作，由类型或断言强制。
+- [x] **P0-03-A1**：已完成（2026-09-15 验收）。`src/contracts/` 10 个模块 + `scripts/validate-contracts.mjs`。独立复核：门禁真实 exit 0，生成 `artifacts/schemas/*.json`（10 个）与 `artifacts/openapi.json`；§5.1 的 YAML 示例由 `tests/fixtures/contracts/plan-5-1-example.yaml` 单一 fixture 供门禁脚本与单测共用，不会漂移；`npm test` 404/404。
+- [ ] **P0-03-A2（随 Phase 3 暂缓）**：三模式决策表的**类型**已在 `sync-placeholder.ts` 定义，`modePlanner` 真实抛出未实现错误（已实测，错误信息指明 §5.6 / Phase 3 / Rev.3 §0）。穷举分支覆盖与 push/pull 写入方向约束留待 Phase 3 启动时实现——不为未构建的逻辑伪造覆盖率。
+
+P0-03 实施记录与发现：
+
+- [x] **`retriable` vs `retryable` 命名分歧（重要）**：1.x 的 `tool-error.ts:21` 字段名为 `retriable`，而 §5.2 新错误对象规定为 `retryable`。二者**不是**同一字段，不得在 P0-04 重构时当作拼写错误「顺手修正」——那会静默改变 1.x 对外响应。已在新旧两个 schema 上都加注释锁定。
+- [x] §4.2 身份体系已真实实现（`identity.ts`）：`computeInstanceId` 顺序无关且不含配置内容/policy/secret；`assertNoSecretLikeKeys` 是**真运行时守卫**（已实测拦截顶层与嵌套的 password/apiKey 等键），不是注释约定。P0-00 preflight 中 `configFingerprint` 的注释已改为指向此处并说明两者不可互换。
+- [x] §5.5 job 状态机做了全部 100 组 `(from,to)` × 2 actor 的穷举 value test。这属于 Phase 0/2 在建机制，与上面暂缓的 sync 决策表是两回事。
+- [x] 特征化测试（`characterization-legacy-tools.test.ts`，11 用例 31 断言）经真实 MCP client/server 驱动全部 9 个 1.x 工具，冻结共享响应信封与各自真实 JSON 形状；断言逐字段核对而非仅查 `isError`。构建过程中据真实运行修正了两处自身错误假设（`command-status` 未知 runId 的码是 `BACKGROUND_COMMAND_NOT_FOUND`；`upload` 成功返回的是散文而非 JSON）。
+- [x] **范围边界（非遗漏）**：`config-schema.ts` 只覆盖 v2 新增配置面（daemon/web/transferDefaults/runProfiles/syncProfiles/directRoutes），**不**用 Zod 重新推导已有的 1.x `servers`/whitelist 配置——那部分已有真实解析器，重推有与实际运行行为漂移的风险。
 
 ### P0-04 模块化 facade
 
