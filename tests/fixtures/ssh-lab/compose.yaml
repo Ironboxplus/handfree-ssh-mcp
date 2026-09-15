@@ -1,0 +1,52 @@
+# PLAN.MD P0-02 real SSH lab: two independent OpenSSH/SFTP containers,
+# `source` and `destination`, sharing one image (Dockerfile in this
+# directory) but each getting its own host key, file root, and log at
+# container start (see entrypoint.sh).
+#
+# This file defines only logical service/network names. Actual container,
+# network, and image names are namespaced by the caller via `docker compose
+# -p <unique-project-name>` (or COMPOSE_PROJECT_NAME) — see
+# scripts/ssh-lab.mjs, which generates a fresh unique project name per run.
+# Never invoke this file with a shared/fixed project name on a shared host.
+#
+# Host ports are published as ephemeral ("0:22") so this fixture never
+# collides with a fixed port on a shared machine; scripts/ssh-lab.mjs
+# discovers the assigned ports via `docker compose port`.
+# NOTE on image tags: `source` and `destination` build from the identical
+# Dockerfile/context but MUST use distinct image tags. Docker Compose builds
+# services in parallel (via buildx bake); two targets exporting to the same
+# tag concurrently race and one fails with "image ... already exists" (found
+# for real during the first live P0-02 run against the lab host — not a
+# theoretical concern).
+services:
+  source:
+    build:
+      context: .
+      args:
+        APT_PROXY: "${APT_PROXY:-}"
+    image: "${LAB_IMAGE_TAG:-handfree-sshlab-image:local}-source"
+    environment:
+      LAB_ROLE: source
+    ports:
+      - "0:22"
+    networks:
+      - lab
+    restart: "no"
+
+  destination:
+    build:
+      context: .
+      args:
+        APT_PROXY: "${APT_PROXY:-}"
+    image: "${LAB_IMAGE_TAG:-handfree-sshlab-image:local}-destination"
+    environment:
+      LAB_ROLE: destination
+    ports:
+      - "0:22"
+    networks:
+      - lab
+    restart: "no"
+
+networks:
+  lab:
+    driver: bridge

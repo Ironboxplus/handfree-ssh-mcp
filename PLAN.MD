@@ -698,7 +698,7 @@ P0-00 实施记录与偏差：
 - [ ] F5（串行目录枚举）登记为 P1-03 范围，本任务不修；但需检查 README/README_CN 现有「递归小文件并发」措辞是否夸大，必要时先改准确。
 - [ ] 记录 `git status --short`、`git diff --stat`、commit、Node/npm 和依赖版本到实施 journal。
 - [ ] 确认现有 v1.0.19 未提交文件归属，避免新功能覆盖这些改动。
-- [ ] 请求用户选择可恢复检查点：授权 commit/branch、授权 stash，或授权在权限受控的 state directory 创建包含 tracked diff 与 untracked 文件的本地 snapshot。三者均未授权时将 P0-01 标记 BLOCKED，禁止进入 P0-03/P0-04。
+- [x] **检查点已建立（2026-09-15）**：用户明确授权直接提交到 `main`（「你是唯一开发者」）。提交 `9e90405`，含 16 个文件，排除无关的 `bash.exe.stackdump` 崩溃残留。提交时状态为 `npm test` 336/336、`tsc --noEmit` 干净、覆盖率达标 —— 即检查点保存的是**已验收的绿状态**，而非半成品。P0-03/P0-04 的门禁就此解除。
 - [ ] 检查点记录类型、绝对位置、文件 manifest、SHA-256 和恢复命令；在一次性临时副本执行 restore drill，验证与原工作树内容 hash 相同。
 - [ ] 运行并保存：`npm test`、`npm run test:coverage:transfer`、`npm pack --dry-run`。
 - [ ] 运行 `git diff --check`；只允许已知换行警告，不允许 whitespace error。
@@ -708,6 +708,16 @@ P0-00 实施记录与偏差：
 
 ### P0-02 真实 SSH 实验室
 
+**宿主决策（2026-09-15）**：lab 不跑在 Windows 开发机上，而是跑在局域网内的 `10.100.100.88`（用户 `arc`）。实测环境：Ubuntu 22.04 / 内核 6.8、Docker 29.1.5（overlayfs）、752 GB 可用、`rsync`/`zstd`/`tar`/`git`/`tc` 齐备、`python3` 带 `venv`+`ensurepip`、免密 `sudo`。
+
+因此 PLAN 原本的双容器设计**原样保留**，只是宿主从开发机换成 `.88`，开发机上不安装任何东西（无 Docker、WSL 无发行版）。相应约定：
+
+- [ ] Docker 需经 `sudo`（`arc` 不在 docker 组）。lab 脚本一律用 `sudo -n docker`，**不要**为图方便去改用户组 —— 那是对他人机器的权限变更，需单独授权。
+- [ ] 容器端口绑定到 `.88` 的随机高位端口，测试进程从 Windows 经局域网连入。
+- [ ] 该 LAN 往返延迟叠加在 netem 整形之上。§8.2 的同场相对比较因此仍然成立（baseline 与优化模式经过同一条链路），但**绝对吞吐数字不得**当作 WAN 结论；benchmark 报告必须记录 lab 宿主与链路。
+- [ ] 单元测试与进程内 harness 仍在 Windows 上跑；只有 SSH lab acceptance 打到 `.88`。Linux 侧矩阵可另行在 `.88` 上原生跑全量套件。
+- [ ] `.88` 是共享的真实机器：所有 lab 资源必须带唯一前缀命名，并在 finally 中清理；禁止触碰前缀之外的任何路径、容器或网络。
+
 - [ ] 新建 `tests/fixtures/ssh-lab/compose.yaml`。
 - [ ] 至少启动 `source`、`destination` 两个真实 Linux OpenSSH 容器。
 - [ ] 两台容器分别有独立 host key、用户、文件根和日志。
@@ -716,7 +726,16 @@ P0-00 实施记录与偏差：
 - [ ] fixture 使用随机高位 host port，避免占用开发机固定端口。
 - [ ] 测试结束删除容器和测试 volume；失败时保留日志 artifact，不保留秘密。
 
-- [ ] **P0-02-A1**：从测试进程分别通过 SSH 执行 `uname`、SFTP 上传固定 seed 随机文件、下载并核对 SHA-256；日志写 `artifacts/ssh-lab/`。
+- [x] **P0-02-A1**：已完成（2026-09-15 验收）。`tests/fixtures/ssh-lab/{Dockerfile,entrypoint.sh,compose.yaml}` + `scripts/ssh-lab.mjs` + `src/tests/ssh-lab.test.ts`。真实运行于 `.88`，project `handfree-sshlab-3d74efbb`，exit 0：两容器各自 `uname -a` 返回独立容器 ID；256 KiB 固定 seed 文件 SFTP 往返 SHA-256 均匹配；pinned key 的 source→destination 为 `direct-ok`；未授权 key 真实失败（exit 255 `Permission denied (publickey,password)`），relay fallback 可测。独立复核：`.88` 上 handfree 前缀的容器/镜像/网络/`/tmp` 目录全部为空（悬空镜像仅剩 3 周前与 8 个月前的既有项，非本次残留）；`npm test` 346/346；代理与主机名仅来自环境变量，仓库内无凭据。
+
+P0-02 实施记录：
+
+- [x] 宿主端 apt 存在 IPv6 镜像源间歇性故障。解法是复用该机 `/etc/docker/daemon.json` 里 daemon 自身已信任的 LAN 代理（经 `SSH_LAB_APT_PROXY` 传入，**未**硬编码进仓库），而非用裸重试硬扛。
+- [x] `timeout N` 包裹前台 `sudo docker run` 不能可靠杀掉容器（SIGTERM 不能沿 sudo→docker CLI→daemon 传播）。改为一律 detached + 具名 + `finally` 中显式 `compose down`/`rm`。
+- [x] Compose 并行构建时，两个 service 指向同一 image tag 会真实竞争失败（`image ... already exists`）。改为 `-source`/`-destination` 两个不同 tag。
+- [x] teardown 缺口：若 build/up 在返回前抛错，project 名等变量仍为 `undefined`，`finally` 会整个跳过清理。改为在任何远程命令之前先纯计算出 project 名/远程目录/image tag/compose 路径，使 teardown 在任何失败点都有据可依。
+- [x] 全程仅按唯一前缀精确清理，未使用任何批量清理（`.88` 为共享真机）。未修改 docker 组或该机任何配置。
+- [ ] 承接 P0-00 的已知缺口：现在 `.88` 上有可验证的 Linux 环境了，preflight 中 5 个「lab 内部」探针（openssh-server/rsync/zstd/python-venv/netem）可以补齐真实 exec 探测并真实验收。
 
 ### P0-03 契约先行
 
