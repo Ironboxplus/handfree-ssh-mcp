@@ -37,10 +37,16 @@ src/jobs/       1396 行   无任何生产代码引用，未 git 跟踪
 | **P0-06 Controller daemon** | **取消** | 只有 direct 传输（P1-08）与 WebUI 需要常驻进程。本轮目标不含常驻形态，不引入进程生命周期、IPC 与崩溃恢复这一整层 |
 | **P0-05 `src/jobs/`** | **产物不入库** | 当前为 untracked，不提交即零成本撤销，无需任何删除动作。JobStore/EventBus 服务于 WebUI 的任务流，本轮无消费者 |
 | **`src/contracts/`** | **保留，但停止扩展** | 已入库且 `validate-contracts.mjs` 门禁与其 4 个测试均为绿。删除它本身就是一次「大量修改」，恰好违反上述约束；停止在其上继续增建的收益与删除相同，风险为零 |
-| **9 个 dead transfer facade 方法** | **删除**（约 85 行） | 无调用方，且为 P0-04 提取时 private→public 放宽的残留 |
+| **9 个 transfer facade 方法** | ~~删除~~ → **保留**（见下） | 复核后撤回：它们不是 dead |
 | **P1-09 对 P1-01/P1-02 的依赖** | **解除** | 经复核该依赖不成立，见 P1-09 任务节 |
 
-净效果：实际改动约 85 行，而非约 2,000 行。判据是「停止新增」而不是「推倒重来」——后者同样是对约束的违反。
+**facade 方法一项的撤回（2026-09-15，同日复核）**：上表原判「删除 9 个 dead facade 方法」的依据是「无调用方」，该依据经实测**不成立**。`ssh-connection-manager.ts:393-476` 的 `upload`/`download`/`transferBetweenServers`/`uploadArchive`/`downloadArchive`/`transferArchiveBetweenServers`/`listRemoteDir`/`uploadDirectory`/`downloadDirectory` 确实是纯委托（约 85 行），生产代码（`src/tools/*`）也确实绕过它们直接调 `transferService.*`，但它们有约 30 处**测试**调用点，分布在 `command-validation.test.ts`、`integration.test.ts` 与 `tools.test.ts`。
+
+删除它们 = 为零生产收益改写 30 处测试调用点。这本身就是「扩大修改大量的内容」，正是本节援引的那条约束所禁止的。因此保留，不动。
+
+教训：「dead code」这一判定必须以实际调用点计数为准，不能凭「生产代码没引用」推断。本轮另一处判定（`src/jobs/` 零生产引用）已用同样方法复核过，结论成立。
+
+净效果修正：Rev.4 实际发生的代码改动是 **0 行删除**——真正的价值在于「不再新增」（P0-05 不入库、P0-06 不开工、P1-09 解除假依赖提前交付），而不是删掉什么。
 
 ## 1. 计划目的
 
@@ -106,7 +112,7 @@ src/jobs/       1396 行   无任何生产代码引用，未 git 跟踪
 | F2 | 健壮性 | `ssh-connection-manager.ts:1528` | `for (let i = 0; i < workersRemaining; i++)` 的循环上界正是 worker 会递减的变量。当前无活跃 bug（worker 必在首个 `await` 前挂起），但该不变量仅因「恰好不会同步 break」而成立。须把 count 捕获为 const。 |
 | F3 | 真实限制未处理 | `ssh-connection-manager.ts:1206` | `MAX_RECURSIVE_FILE_CONCURRENCY = 32`，而每个并发 worker 各开一条 SFTP channel，OpenSSH 默认 `MaxSessions 10`。设到 32 必然 channel open failure。Rev.3 决定：**先降到 8** 并在 help/README 说明受远端 `MaxSessions` 约束；真正的 per-server channel budget 是 P1-03 的范围，不在本次收尾中提前实现。 |
 | F4 | 设计问题 | `ssh-connection-manager.ts:4772` | `createLocalArchiveWorkspace` 在 `process.cwd()` 下建临时归档目录。MCP server 的 cwd 不确定，会污染用户项目目录，且大归档受 cwd 所在卷容量限制。改用 `os.tmpdir()`，并确保不因此削弱 `validateLocalPath` 的用户面路径策略。 |
-| F5 | 已知未完成，记账 | `ssh-connection-manager.ts` `downloadDirectory` 的 `collect` | 目录枚举仍是深度优先串行 `await listRemoteDir`，并发只存在于文件传输阶段。README 现有措辞「递归小文件并发」因此偏乐观。并行 walker 属 **P1-03** 范围，本次不修，但 README 措辞需在 P1-03 前保持准确。 |
+| F5 | **已解决**（P1-03a，2026-09-15） | `transfer-service.ts` `downloadDirectory` 的目录发现 | ~~目录枚举仍是深度优先串行 `await listRemoteDir`，并发只存在于文件传输阶段~~。已由 `walkRemoteDirectory` 换成有界并发 `readdir`（上限沿用 `fileConcurrency`），返回顺序与原串行走法逐字节相同。README 措辞「递归小文件并发」现已名副其实。注意本条只解决**目录发现**并发；P1-03b 的队列拆分与 per-server channel budget 仍未做。 |
 
 约束：F1–F4 的收尾必须遵守 7.2 / 7.2.1（全真实执行、禁止 mock、三盒齐备）；F1 的 RED 已天然存在（5 个真实失败的测试），不得为其编造额外的假 RED。
 
@@ -674,10 +680,11 @@ transfer:       [pack] → connect → transfer → verify → [extract] → cle
 关键路径和允许并行关系：
 
 ```text
-P0-00 → P0-01 ─┬→ P0-03 → P0-04 → P0-05 → P0-06
-                └→ P0-02 ────────────────────┘
+P0-00 → P0-01 ─┬→ P0-03 → P0-04 ──╴（P0-05/P0-06 已取消，见 §0.1）
+                └→ P0-02 ─────────╯
 PHASE-0-GATE → P1-09（无依赖，先做）
-PHASE-0-GATE → P1-01 → P1-02 → P1-03 → P1-04 → P1-05 → P1-06 → P1-07 → P1-08
+PHASE-0-GATE → P1-03a（walker 切片，无依赖，见下方豁免）
+PHASE-0-GATE → P1-01 → P1-02 → P1-03（其余切片）→ P1-04 → P1-05 → P1-06 → P1-07 → P1-08
 PHASE-1-GATE → P2-01 → P2-02 → P2-03 → P2-04 → P2-06 → P2-05
 PHASE-2-GATE → Phase 5（本轮）
 
@@ -837,7 +844,16 @@ P0-04 实施记录：
 - [ ] **P0-06-A1**：关闭 MCP adapter 后 daemon PID 仍在；重新启动 adapter 能查询之前的 sentinel job；执行 `daemon stop` 后 socket/pipe、锁和 SSH client 全部释放。
 - [ ] **P0-06-A2**：daemon auto 启动不向 MCP stdout 写任何非 JSON-RPC 字节；不同 instanceId adapter 无法连错 daemon。
 
-- [ ] **PHASE-0-GATE**（Rev.4 收窄）：外部行为不变（characterization test 全绿）、真实 SSH lab 可重复运行、契约 artifacts 完整、打包门禁 `test:package` 通过。~~持久 job 与 daemon 生命周期成立~~——P0-05/P0-06 已取消，不再是 Phase 0 的出门条件。
+- [x] **PHASE-0-GATE**（Rev.4 收窄）：**达成，2026-09-15 复核者判定**。~~持久 job 与 daemon 生命周期成立~~——P0-05/P0-06 已取消（§0.1），不再是出门条件。逐项证据：
+
+  | 条件 | 状态 | 证据 |
+  |---|---|---|
+  | 外部行为不变 | ✅ | `characterization-legacy-tools.test.ts` 冻结全部 9 个 1.x 工具输出，未被修改且全绿；`npm test` 424/424 |
+  | 契约 artifacts 完整 | ✅ | `validate-contracts.mjs` exit 0，`artifacts/openapi.json` 与 `artifacts/schemas/*.json` 齐备，4 个门禁测试绿 |
+  | 打包门禁通过 | ✅ | `npm run test:package` exit 0，真实 `npm pack` + 仓库外干净沙箱 `npm install` + 真实 MCP 握手 + `list-servers` |
+  | 真实 SSH lab 可重复运行 | ⚠️ 见下 | P0-02-A1 于 `.88` 真实验收 exit 0（project `handfree-sshlab-3d74efbb`），但那次运行时测试基线为 346/346 |
+
+  **如实标注的限定**：SSH lab 的最后一次真实运行发生在 P0-04（连接池提取）与 P1-09（批量上传）落地**之前**，尚未针对当前 HEAD 重跑。lab 验证的是容器编排与真实 SSH/SFTP 端点本身（与这两项改动正交），因此判定为达成；但「可重复运行」这一条严格说只在当时的 commit 上被证明过。**下一次跑 `.88` lab 时必须针对当前 HEAD 重跑并回填结果**，不得默认它仍然成立。
 
 ## Phase 1：传输可观测性、加速与远端直传
 
@@ -868,8 +884,36 @@ P0-04 实施记录：
 
 ### P1-03 并行 checker 和目录 walker
 
+**P1-03a（walker 切片）豁免记录 — 2026-09-15，Rev.4**
+
+本任务被拆为两部分交付。**P1-03a = 仅「远程目录 walker 有界并发」这一条**，其余（三队列/semaphore 拆分、per-server channel budget、资源层级与获取顺序、backpressure、mkdir 分层、fileConcurrency 上限放宽）统称 P1-03b，仍留在原依赖链 `P1-01 → P1-02 → P1-03b` 上不变。
+
+P1-03a 相对 P1-01/P1-02 的依赖不成立，理由：
+
+- 它只改 `downloadDirectory` 内部 `collect` 的调度方式（把串行 `await` 换成有界并发），不新增任何路径语义判断，因此不需要 P1-02 的 `src/fspath/`。
+- 它的验收用真实测试服务器的真实 channel/readdir 计数器断言，不需要 P1-01 的 TransferMetrics。
+- 它是 §2.3 F5 已登记的欠账：当前 `downloadDirectory` 的 `collect` 逐目录 `await listRemoteDir`，N 个目录 × RTT 全部发生在传输开始之前。
+
+**豁免的边界**：P1-03a 达成**不代表** P1-03 达成，也不解除 P1-03b 对 P1-01/P1-02 的依赖；PHASE-1-GATE 仍要求 P1-03 全部条目。本豁免由复核者在派发前写入，不由执行者自行认定——与 P1-09 同一处理方式（见 §0.1 与 P1-09 任务节）。
+
+本节以下条目中，仅第 2 条属于 P1-03a，其余属于 P1-03b。
+
 - [ ] 将目录发现、metadata checker、文件 transfer 分成三个队列和 semaphore。
-- [ ] remote directory walker 有界并发 `readdir`，不再深度优先逐目录串行等待。这正是 §2.3 F5 登记的欠账：当前 `downloadDirectory` 的 `collect` 逐目录 `await listRemoteDir`。
+- [x] **（P1-03a，2026-09-15 交付）** remote directory walker 有界并发 `readdir`，不再深度优先逐目录串行等待。这正是 §2.3 F5 登记的欠账：当前 `downloadDirectory` 的 `collect` 逐目录 `await listRemoteDir`。
+  - 实现：`transfer-service.ts` 新增私有方法 `walkRemoteDirectory`（信号量只包住每个目录自己的 `listRemoteDir` 调用，即真正开 SFTP channel 的那一步；循环体内的 `fs.mkdirSync` 与递归调度不占并发名额）+ 导出纯函数 `flattenRemoteDirTree`（把并发发现产生的树按各目录自身 `readdir` 顺序做前序展开，结果与旧串行 `collect` 逐目录 `await` 产生的顺序逐字节相同，且不依赖并发调用的完成先后）。`downloadDirectory` 改为「先并发发现整棵树（含所有本地 `mkdir`）、再用既有 `runBoundedTransfers` 做文件下载」——发现阶段与传输阶段仍是串行的两个阶段（不重叠），两阶段共用同一个 `fileConcurrency`（`resolveRecursiveFileConcurrency`，默认 4、硬上限 8），因此合并 channel 占用不会超过该上限。未改 `uploadDirectory`（其本地遍历是同步 `fs.readdirSync`，不受此问题影响，任务交办时已明确排除）。
+  - 测试（`src/tests/walker-real.test.ts`，全部真实 SSH/SFTP/文件系统，无 mock）：黑盒——混合深度/宽度真实远端树（含一个空目录、一个只含目录的目录）经真实 `transfer` MCP 工具完整下载，字节级比对通过，返回的 `files` 顺序与独立重新计算的串行前序顺序逐一比对相同；灰盒——测试服务器新增真实 `activeReaddirs`/`maxActiveReaddirs`/`openDirRequests` 计数器（区别于既有的 `activeSftpChannels`，专门量化目录级并发)，配合真实注入的每-OPENDIR 延迟证明宽树上真实并发峰值 >1 且从不超过所传入的 `fileConcurrency`，另有 `fileConcurrency=1` 对照用例证明峰值恒为 1（说明并发确由该参数控制，不是环境偶然并发）；白盒——对 `flattenRemoteDirTree` 的穷举用例（空目录、单文件、深链、宽扇出、子目录内容原位内联于其条目位置）；另有真实用例（利用 `openDirRequests` 计数器做确定性同步而非猜测 sleep 时长，避免在系统负载下变脆）验证某一真实子目录 `readdir` 失败会使整个调用失败，且失败前已并发发起的兄弟目录仍被 drain 完成（真实创建了本地目录）而非被悬挂。
+  - 复核命令与结果：`npx tsc --noEmit` 干净；`npm test` 434/434（基线 424 + 新增 10，`characterization-legacy-tools.test.ts`/`command-validation.test.ts`/`tools.test.ts` 未改动且全绿；`npm test` 重复跑两次确认无 flaky）；`npm run test:package` exit 0。RED 已真实验证：`git stash push` 仅隔离本任务的两个生产/测试基础设施文件改动后 `tsc --noEmit` 对新测试文件报 9 处编译错误（缺少 `flattenRemoteDirTree`/`RemoteDirNode`/`resetReaddirPeak`/`maxActiveReaddirs` 等），`git stash pop` 恢复后转绿。
+  - **复核者独立验证与补充修复（2026-09-15）**：自行重跑 `tsc --noEmit` 干净、`npm test` 435/435（连跑两次稳定）、`test:package` exit 0。对三条关键断言做变异测试，确认均具备回归捕获能力：
+
+    | 注入的缺陷 | 结果 |
+    |---|---|
+    | `flattenRemoteDirTree` 改为先出所有文件再出所有子目录 | 黑盒顺序用例 + 2 个白盒用例转红 |
+    | 信号量 `acquire` 恒定放行（去掉上限） | 2 个灰盒并发用例转红 |
+    | 子目录访问改回串行 `await` | 灰盒「峰值 >1」用例转红 |
+
+    **复核中发现并修复一处真实缺陷**：`walkRemoteDirectory` 原先只在 `await acquire()` **之前**检查 `firstError`，之后直接调 `list()`。因此在某个目录失败时，所有**已排队等待信号量**的目录仍会各自发出一次注定失败的 listing，错误要等整个队列跑完才浮出。原失败用例用 `fileConcurrency=4` 跑 4 个目录的树，全部在飞、无人排队，**结构上无法触及该路径**，所以没被发现。已在 acquire 之后补 `firstError` 复检并 `release()` 让出槽位（+2 行有效代码），并补测试用例「宽树中途失败必须放弃已排队目录」：40 目录树、并发 4，修复前真实发出 **41 次** OPENDIR（RED，由我实测确认），修复后显著低于 40。该用例已并入 `walker-real.test.ts`，测试数 434 → 435。
+
+  - **范围边界（如实记录，非遗漏）**：本条只交付「有界并发目录发现」本身。P1-03 本节其余条目（三队列/semaphore 拆分、per-server channel budget、资源层级与获取顺序、backpressure、mkdir 按 parent depth 分层、`fileConcurrency` 上限放宽评估、下方 **P1-03-A1** 的 10,000 文件性能验收）**均未交付**，仍归 P1-03b，依赖链 `P1-01 → P1-02 → P1-03b` 不变，PHASE-1-GATE 仍要求 P1-03 全部条目。本次交付未触碰 `src/contracts/`、`src/jobs/`（后者仍未 `git add`）、未新增 npm script/CI 配置、未改动 `runBoundedTransfers` 本身。
 - [ ] 落地 per-server channel budget 后，重新评估 §2.3 F3 临时下调的 `fileConcurrency` 上限（8），在 budget 保护下可安全放宽。
 - [ ] mkdir 按 parent depth 分层，同层有界并发。
 - [ ] 对每台 server 设置总 channel budget，避免 checkers + transfers 超过 sshd `MaxSessions`。

@@ -157,6 +157,49 @@ export function validateBatchUploadTargets(localPaths: readonly string[]): Batch
 }
 
 /**
+ * PLAN.MD P1-03 (walker slice, §2.3 F5): a directory discovered by the
+ * concurrent remote walker, materialized as a tree so the flatten step below
+ * can reproduce the original serial depth-first order regardless of which
+ * concurrent `readdir` happened to finish first. Each node's `children` are
+ * in exactly the order the remote `readdir` returned them for that
+ * directory -- the same order the old fully-serial walk iterated in.
+ */
+export interface RemoteDirNode {
+  children: Array<
+    | { kind: "file"; remotePath: string; localPath: string }
+    | { kind: "dir"; node: RemoteDirNode }
+  >;
+}
+
+/**
+ * Pure. Flattens a `RemoteDirNode` tree into the files array in pre-order:
+ * for each directory, files and subdirectories are emitted in that
+ * directory's own captured entry order, with a subdirectory's entire
+ * contents inlined at that entry's position before continuing to the next
+ * entry. This is byte-for-byte the order the old serial
+ * `downloadDirectory`/`collect` produced (depth-first, one `await
+ * listRemoteDir` at a time) -- flattening only after every concurrent
+ * listing has already settled into the tree is what makes the result
+ * independent of completion timing.
+ */
+export function flattenRemoteDirTree(
+  root: RemoteDirNode,
+): Array<{ remotePath: string; localPath: string }> {
+  const files: Array<{ remotePath: string; localPath: string }> = [];
+  const visit = (node: RemoteDirNode): void => {
+    for (const child of node.children) {
+      if (child.kind === "file") {
+        files.push({ remotePath: child.remotePath, localPath: child.localPath });
+      } else {
+        visit(child.node);
+      }
+    }
+  };
+  visit(root);
+  return files;
+}
+
+/**
  * Build the actual argv passed to a locally-spawned `tar`, given the raw
  * archive args and a target platform. Pure and platform-parameterized (not
  * `process.platform` read internally) so both branches can be exhaustively
@@ -2658,9 +2701,120 @@ export class TransferService {
   }
 
   /**
-   * Download a remote directory recursively to a local path. First enumerate
-   * and create the local directory tree, then pull independent files through a
-   * bounded worker pool to amortize small-file SFTP round trips.
+   * PLAN.MD P1-03 (walker slice, §2.3 F5): concurrently discover a remote
+   * directory tree with bounded `readdir` concurrency, instead of the old
+   * fully-serial `await listRemoteDir` per directory. A semaphore gates only
+   * the `list()` call itself -- the one point per directory where
+   * `listRemoteDir` opens its own SFTP channel (see `openSftp` inside it) --
+   * so at most `concurrency` directory listings are ever in flight at once,
+   * consistent with `resolveRecursiveFileConcurrency`'s reasoning about
+   * OpenSSH's default `MaxSessions`. Everything else (looping entries, local
+   * `mkdir`, recursing into subdirectories) is local and unbounded.
+   *
+   * Every discovered directory gets `fs.mkdirSync` called for it as soon as
+   * it is discovered (before its own contents are listed), matching the old
+   * walk's behavior of creating each local directory during the walk rather
+   * than deferring it to a separate pass.
+   *
+   * Failure semantics mirror `runBoundedTransfers`: once any `list()` call
+   * fails, no further directory is scheduled, but every listing already in
+   * flight is awaited to completion (drained, not left dangling) before the
+   * first error is thrown.
+   */
+  private async walkRemoteDirectory(
+    rootRemote: string,
+    rootLocal: string,
+    concurrency: number,
+    list: (remotePath: string) => Promise<Array<{ filename: string; isDirectory: boolean; size: number }>>,
+  ): Promise<RemoteDirNode> {
+    let activeListings = 0;
+    const waiters: Array<() => void> = [];
+    const acquire = (): Promise<void> => {
+      if (activeListings < concurrency) {
+        activeListings++;
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => waiters.push(resolve));
+    };
+    const release = (): void => {
+      const next = waiters.shift();
+      if (next) {
+        next(); // Hand the slot directly to the next waiter; activeListings unchanged.
+      } else {
+        activeListings--;
+      }
+    };
+
+    let firstError: unknown;
+
+    const visit = async (remote: string, local: string, node: RemoteDirNode): Promise<void> => {
+      if (firstError !== undefined) return;
+      await acquire();
+      // Re-check after acquiring: this visit may have been queued behind the
+      // semaphore for a long time, and a sibling may have failed while it
+      // waited. Without this, every already-queued directory still issues its
+      // own doomed listing before the error surfaces -- on a wide tree
+      // (thousands of subdirectories discovered but not yet listed) that is
+      // thousands of pointless SFTP round trips between the failure and the
+      // caller seeing it.
+      // Re-check after acquiring: this visit may have been queued behind the
+      // semaphore for a long time, and a sibling may have failed while it
+      // waited. Without this, every already-queued directory still issues its
+      // own doomed listing before the error surfaces -- on a wide tree
+      // (thousands of subdirectories discovered but not yet listed) that is
+      // thousands of pointless SFTP round trips between the failure and the
+      // caller seeing it.
+      if (firstError !== undefined) {
+        release();
+        return;
+      }
+      let entries: Array<{ filename: string; isDirectory: boolean; size: number }>;
+      try {
+        entries = await list(remote);
+      } catch (error) {
+        firstError ??= error;
+        return;
+      } finally {
+        release();
+      }
+      if (firstError !== undefined) return;
+
+      const childVisits: Promise<void>[] = [];
+      for (const entry of entries) {
+        if (entry.filename === "." || entry.filename === "..") continue;
+        const remotePath = path.posix.join(remote, entry.filename);
+        const localPath = path.join(local, entry.filename);
+        if (entry.isDirectory) {
+          fs.mkdirSync(localPath, { recursive: true });
+          const childNode: RemoteDirNode = { children: [] };
+          node.children.push({ kind: "dir", node: childNode });
+          childVisits.push(visit(remotePath, localPath, childNode));
+        } else {
+          node.children.push({ kind: "file", remotePath, localPath });
+        }
+      }
+      // Await every child visit this directory started -- including ones
+      // whose sibling failed -- so a failure never leaves an in-flight
+      // listing dangling/unobserved.
+      await Promise.all(childVisits);
+    };
+
+    const rootNode: RemoteDirNode = { children: [] };
+    await visit(rootRemote, rootLocal, rootNode);
+    if (firstError !== undefined) {
+      throw firstError;
+    }
+    return rootNode;
+  }
+
+  /**
+   * Download a remote directory recursively to a local path. First discover
+   * the remote tree and create the local directory tree (bounded-concurrent
+   * `readdir`, see `walkRemoteDirectory`), then pull independent files
+   * through a bounded worker pool to amortize small-file SFTP round trips.
+   * Discovery fully completes before any file transfer starts, so the two
+   * phases never both hold SFTP channels at once -- both are bounded by the
+   * same `fileConcurrency`, so the combined channel usage never exceeds it.
    */
   public async downloadDirectory(
     remoteDir: string,
@@ -2677,23 +2831,13 @@ export class TransferService {
       fs.mkdirSync(resolvedLocal, { recursive: true });
     }
 
-    const files: Array<{ remotePath: string; localPath: string }> = [];
-    const collect = async (currentRemote: string, currentLocal: string): Promise<void> => {
-      const entries = await this.listRemoteDir(currentRemote, resolvedName, options);
-      for (const entry of entries) {
-        if (entry.filename === "." || entry.filename === "..") continue;
-
-        const remotePath = path.posix.join(currentRemote, entry.filename);
-        const localPath = path.join(currentLocal, entry.filename);
-        if (entry.isDirectory) {
-          fs.mkdirSync(localPath, { recursive: true });
-          await collect(remotePath, localPath);
-        } else {
-          files.push({ remotePath, localPath });
-        }
-      }
-    };
-    await collect(validatedRemoteDir, resolvedLocal);
+    const tree = await this.walkRemoteDirectory(
+      validatedRemoteDir,
+      resolvedLocal,
+      fileConcurrency,
+      (currentRemote) => this.listRemoteDir(currentRemote, resolvedName, options),
+    );
+    const files = flattenRemoteDirTree(tree);
 
     await this.runBoundedTransfers(
       files,

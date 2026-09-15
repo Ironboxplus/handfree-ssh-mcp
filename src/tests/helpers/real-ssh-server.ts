@@ -20,6 +20,19 @@ export interface RealSshServerStats {
   tarCommands: number;
   activeSftpChannels: number;
   maxActiveSftpChannels: number;
+  // PLAN.MD P1-03 (walker slice): a directory listing's real server-side
+  // lifetime, from the client's OPENDIR request to its CLOSE of that
+  // handle. This is distinct from activeSftpChannels (one SFTP channel can
+  // carry many sequential OPENDIR/OPEN lifetimes) and lets tests prove the
+  // walker's concurrent `readdir` calls specifically, without conflating
+  // that with file-transfer concurrency.
+  activeReaddirs: number;
+  maxActiveReaddirs: number;
+  // Cumulative count of OPENDIR requests received (never decrements). Lets a
+  // test deterministically wait for "N directory listings have really been
+  // requested" as a real synchronization signal, instead of guessing at a
+  // wall-clock sleep duration that would be flaky under system load.
+  openDirRequests: number;
 }
 
 const { Server } = ssh2;
@@ -87,6 +100,9 @@ export class RealSshTestServer {
     tarCommands: 0,
     activeSftpChannels: 0,
     maxActiveSftpChannels: 0,
+    activeReaddirs: 0,
+    maxActiveReaddirs: 0,
+    openDirRequests: 0,
   };
 
   public port = 0;
@@ -96,6 +112,15 @@ export class RealSshTestServer {
   public constructor(
     public readonly rootDirectory: string,
     private readonly writeResponseDelayMs = 8,
+    // PLAN.MD P1-03 (walker slice): a real, injected per-OPENDIR delay. Local
+    // in-process fs.readdir calls otherwise resolve in well under a
+    // millisecond, which can make genuinely concurrent `readdir` calls fail
+    // to overlap in wall-clock terms even when the client legitimately
+    // issued them concurrently -- a real delay in a real server (the same
+    // pattern already used for writeResponseDelayMs above), not a mock,
+    // makes the overlap observable and non-flaky. Zero by default so every
+    // other test's behavior is unchanged.
+    private readonly readdirResponseDelayMs = 0,
   ) {
     const { privateKey } = generateKeyPairSync("rsa", {
       modulusLength: 2048,
@@ -179,6 +204,11 @@ export class RealSshTestServer {
    */
   public resetChannelPeak(): void {
     this.stats.maxActiveSftpChannels = this.stats.activeSftpChannels;
+  }
+
+  /** Same reasoning as resetChannelPeak(), for the readdir-lifetime counter. */
+  public resetReaddirPeak(): void {
+    this.stats.maxActiveReaddirs = this.stats.activeReaddirs;
   }
 
   public toLocalPath(remotePath: string): string {
@@ -277,7 +307,10 @@ export class RealSshTestServer {
       const state = handles.get(id);
       if (!state) return sftp.status(requestId, STATUS_CODE.FAILURE);
       handles.delete(id);
-      if (state.kind === "directory") return sftp.status(requestId, STATUS_CODE.OK);
+      if (state.kind === "directory") {
+        this.stats.activeReaddirs--;
+        return sftp.status(requestId, STATUS_CODE.OK);
+      }
       fs.close(state.fd, (error) => error ? fail(requestId, error) : sftp.status(requestId, STATUS_CODE.OK));
     });
     sftp.on("SETSTAT", (requestId: number, remotePath: string, attrs: { mode?: number; size?: number }) => {
@@ -304,19 +337,33 @@ export class RealSshTestServer {
     });
     sftp.on("OPENDIR", (requestId: number, remotePath: string) => {
       trace("OPENDIR", remotePath);
+      // Counts from the OPENDIR request itself (not after the local
+      // fs.readdir resolves) so the peak reflects real concurrent in-flight
+      // listings, matching how activeSftpChannels counts from channel open.
+      this.stats.activeReaddirs++;
+      this.stats.openDirRequests++;
+      this.stats.maxActiveReaddirs = Math.max(this.stats.maxActiveReaddirs, this.stats.activeReaddirs);
       const localPath = this.toLocalPath(remotePath);
-      fs.readdir(localPath, { withFileTypes: true }, (error, entries) => {
-        if (error) return fail(requestId, error);
-        try {
-          const names = entries.map((entry) => {
-            const stat = fs.lstatSync(path.join(localPath, entry.name));
-            return { filename: entry.name, longname: entry.name, attrs: attrsFromStat(stat) };
-          });
-          sftp.handle(requestId, makeHandle({ kind: "directory", entries: names, sent: false }));
-        } catch (statError) {
-          fail(requestId, statError);
-        }
-      });
+      const respond = (): void => {
+        fs.readdir(localPath, { withFileTypes: true }, (error, entries) => {
+          if (error) {
+            this.stats.activeReaddirs--;
+            return fail(requestId, error);
+          }
+          try {
+            const names = entries.map((entry) => {
+              const stat = fs.lstatSync(path.join(localPath, entry.name));
+              return { filename: entry.name, longname: entry.name, attrs: attrsFromStat(stat) };
+            });
+            sftp.handle(requestId, makeHandle({ kind: "directory", entries: names, sent: false }));
+          } catch (statError) {
+            this.stats.activeReaddirs--;
+            fail(requestId, statError);
+          }
+        });
+      };
+      if (this.readdirResponseDelayMs > 0) setTimeout(respond, this.readdirResponseDelayMs);
+      else respond();
     });
     sftp.on("READDIR", (requestId: number, handle: Buffer) => {
       trace("READDIR");
