@@ -576,12 +576,12 @@ describe("MCP tool handlers", () => {
 
   it("should forward SFTP reuseConnection, timeout, vvv, and fast options on upload", async () => {
     const originalResolveServer = manager.resolveServer;
-    const originalUpload = manager.upload;
+    const originalUpload = manager.transferService.upload;
     const { server, handlers } = captureRegisteredTools();
     let captured: any;
 
     manager.resolveServer = (name?: string) => name ?? "dev";
-    manager.upload = async (localPath: string, remotePath: string, connectionName: string, options: any) => {
+    manager.transferService.upload = async (localPath: string, remotePath: string, connectionName: string, options: any) => {
       captured = { localPath, remotePath, connectionName, options };
       return "uploaded";
     };
@@ -619,18 +619,18 @@ describe("MCP tool handlers", () => {
       });
     } finally {
       manager.resolveServer = originalResolveServer;
-      manager.upload = originalUpload;
+      manager.transferService.upload = originalUpload;
     }
   });
 
   it("should forward SFTP reuseConnection, timeout, vvv, and fast options on download", async () => {
     const originalResolveServer = manager.resolveServer;
-    const originalDownload = manager.download;
+    const originalDownload = manager.transferService.download;
     const { server, handlers } = captureRegisteredTools();
     let captured: any;
 
     manager.resolveServer = (name?: string) => name ?? "dev";
-    manager.download = async (remotePath: string, localPath: string, connectionName: string, options: any) => {
+    manager.transferService.download = async (remotePath: string, localPath: string, connectionName: string, options: any) => {
       captured = { remotePath, localPath, connectionName, options };
       return "downloaded";
     };
@@ -666,23 +666,23 @@ describe("MCP tool handlers", () => {
       });
     } finally {
       manager.resolveServer = originalResolveServer;
-      manager.download = originalDownload;
+      manager.transferService.download = originalDownload;
     }
   });
 
   it("should forward SFTP reuseConnection, timeout, vvv, and fast options on transfer upload/download modes", async () => {
     const originalResolveServer = manager.resolveServer;
-    const originalUpload = manager.upload;
-    const originalDownload = manager.download;
+    const originalUpload = manager.transferService.upload;
+    const originalDownload = manager.transferService.download;
     const { server, handlers } = captureRegisteredTools();
     const captured: any[] = [];
 
     manager.resolveServer = (name?: string) => name ?? "dev";
-    manager.upload = async (localPath: string, remotePath: string, connectionName: string, options: any) => {
+    manager.transferService.upload = async (localPath: string, remotePath: string, connectionName: string, options: any) => {
       captured.push({ kind: "upload", localPath, remotePath, connectionName, options });
       return "uploaded";
     };
-    manager.download = async (remotePath: string, localPath: string, connectionName: string, options: any) => {
+    manager.transferService.download = async (remotePath: string, localPath: string, connectionName: string, options: any) => {
       captured.push({ kind: "download", remotePath, localPath, connectionName, options });
       return "downloaded";
     };
@@ -751,17 +751,17 @@ describe("MCP tool handlers", () => {
       ]);
     } finally {
       manager.resolveServer = originalResolveServer;
-      manager.upload = originalUpload;
-      manager.download = originalDownload;
+      manager.transferService.upload = originalUpload;
+      manager.transferService.download = originalDownload;
     }
   });
 
   it("should forward relay prefetch-window options on transfer relay mode", async () => {
-    const originalTransferBetweenServers = manager.transferBetweenServers;
+    const originalTransferBetweenServers = manager.transferService.transferBetweenServers;
     const { server, handlers } = captureRegisteredTools();
     let captured: any;
 
-    manager.transferBetweenServers = async (
+    manager.transferService.transferBetweenServers = async (
       sourceServer: string,
       sourceRemotePath: string,
       destServer: string,
@@ -808,7 +808,7 @@ describe("MCP tool handlers", () => {
         },
       });
     } finally {
-      manager.transferBetweenServers = originalTransferBetweenServers;
+      manager.transferService.transferBetweenServers = originalTransferBetweenServers;
     }
   });
 

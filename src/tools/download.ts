@@ -9,6 +9,7 @@ import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
  */
 export function registerDownloadTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
+  const transferService = sshManager.getTransferService();
 
   server.tool(
     "download",
@@ -27,7 +28,7 @@ export function registerDownloadTool(server: McpServer): void {
     async ({ remotePath, localPath, connectionName, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize }) => {
       try {
         const resolvedName = sshManager.resolveServer(connectionName);
-        const result = await sshManager.download(remotePath, localPath, resolvedName, {
+        const result = await transferService.download(remotePath, localPath, resolvedName, {
           reuseConnection,
           timeout,
           vvv,

@@ -14,6 +14,7 @@ import { EventEmitter } from "node:events";
 import { SocksClient } from "socks";
 import { Client } from "ssh2";
 import { SSHConnectionManager, BUILT_IN_DESTRUCTIVE_GUARDS } from "../services/ssh-connection-manager.js";
+import { TransferService } from "../services/transfer-service.js";
 import { ToolError } from "../utils/tool-error.js";
 
 /**
@@ -716,7 +717,7 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalSftpWriteBuffer = manager.sftpWriteBuffer;
+    const originalSftpWriteBuffer = manager.transferService.sftpWriteBuffer;
     let acquireCalls = 0;
     let writeClient: unknown;
     const tempPath = path.resolve(
@@ -734,7 +735,7 @@ describe("SSHConnectionManager regressions", () => {
         close: () => {},
       };
     };
-    manager.sftpWriteBuffer = async (client: unknown) => {
+    manager.transferService.sftpWriteBuffer = async (client: unknown) => {
       writeClient = client;
     };
 
@@ -747,7 +748,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.deepStrictEqual(writeClient, { cached: true });
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.sftpWriteBuffer = originalSftpWriteBuffer;
+      manager.transferService.sftpWriteBuffer = originalSftpWriteBuffer;
       fsForTest.unlinkSync(tempPath);
     }
   });
@@ -788,7 +789,7 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalSftpWriteBuffer = manager.sftpWriteBuffer;
+    const originalSftpWriteBuffer = manager.transferService.sftpWriteBuffer;
     let acquireCalls = 0;
     let closeCalls = 0;
     let writeClient: unknown;
@@ -814,7 +815,7 @@ describe("SSHConnectionManager regressions", () => {
         },
       };
     };
-    manager.sftpWriteBuffer = async (client: unknown) => {
+    manager.transferService.sftpWriteBuffer = async (client: unknown) => {
       writeClient = client;
     };
 
@@ -833,7 +834,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(closeCalls, 1, "one-shot SFTP clients must close after use");
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.sftpWriteBuffer = originalSftpWriteBuffer;
+      manager.transferService.sftpWriteBuffer = originalSftpWriteBuffer;
       fsForTest.unlinkSync(tempPath);
     }
   });
@@ -849,8 +850,8 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
-    const originalSftpWriteBuffer = manager.sftpWriteBuffer;
+    const originalOpenSftp = manager.transferService.openSftp;
+    const originalSftpWriteBuffer = manager.transferService.sftpWriteBuffer;
     let sftpEndCalls = 0;
     let fastPutArgs: unknown[] | null = null;
     const tempPath = path.resolve(
@@ -863,7 +864,7 @@ describe("SSHConnectionManager regressions", () => {
       client: { cached: true },
       close: () => {},
     });
-    manager.openSftp = async () => ({
+    manager.transferService.openSftp = async () => ({
       end: () => {
         sftpEndCalls += 1;
       },
@@ -877,7 +878,7 @@ describe("SSHConnectionManager regressions", () => {
         callback();
       },
     }) as any;
-    manager.sftpWriteBuffer = async () => {
+    manager.transferService.sftpWriteBuffer = async () => {
       throw new Error("buffer upload should not be used when fast=true");
     };
 
@@ -903,8 +904,8 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(sftpEndCalls, 1);
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
-      manager.sftpWriteBuffer = originalSftpWriteBuffer;
+      manager.transferService.openSftp = originalOpenSftp;
+      manager.transferService.sftpWriteBuffer = originalSftpWriteBuffer;
       fsForTest.unlinkSync(tempPath);
     }
   });
@@ -920,7 +921,7 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
+    const originalOpenSftp = manager.transferService.openSftp;
     const originalReadFileSync = fsForTest.readFileSync;
     const tempPath = path.resolve(
       process.cwd(),
@@ -934,7 +935,7 @@ describe("SSHConnectionManager regressions", () => {
       client: { cached: true },
       close: () => {},
     });
-    manager.openSftp = async () => {
+    manager.transferService.openSftp = async () => {
       openCalls += 1;
       if (openCalls === 1) {
         return {
@@ -968,7 +969,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(fastPutCalls, 1);
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
+      manager.transferService.openSftp = originalOpenSftp;
       (fsForTest as any).readFileSync = originalReadFileSync;
       fsForTest.unlinkSync(tempPath);
     }
@@ -985,7 +986,7 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
+    const originalOpenSftp = manager.transferService.openSftp;
     let sftpEndCalls = 0;
     let fastGetArgs: unknown[] | null = null;
     const tempPath = path.resolve(
@@ -997,7 +998,7 @@ describe("SSHConnectionManager regressions", () => {
       client: { cached: true },
       close: () => {},
     });
-    manager.openSftp = async () => ({
+    manager.transferService.openSftp = async () => ({
       end: () => {
         sftpEndCalls += 1;
       },
@@ -1033,7 +1034,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(sftpEndCalls, 1);
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
+      manager.transferService.openSftp = originalOpenSftp;
       if (fsForTest.existsSync(tempPath)) {
         fsForTest.unlinkSync(tempPath);
       }
@@ -1041,9 +1042,9 @@ describe("SSHConnectionManager regressions", () => {
   });
 
   it("should reject sftpMkdirRecursive on a connection-shaped mkdir error", async () => {
-    const originalOpenSftp = manager.openSftp;
+    const originalOpenSftp = manager.transferService.openSftp;
     let sftpEndCalls = 0;
-    manager.openSftp = async () => ({
+    manager.transferService.openSftp = async () => ({
       end: () => {
         sftpEndCalls += 1;
       },
@@ -1055,7 +1056,7 @@ describe("SSHConnectionManager regressions", () => {
 
     try {
       await assert.rejects(
-        () => manager.sftpMkdirRecursive({}, "/tmp/a/b"),
+        () => manager.transferService.sftpMkdirRecursive({}, "/tmp/a/b"),
         (err: Error) =>
           err instanceof ToolError &&
           err.code === "SSH_CONNECTION_FAILED" &&
@@ -1067,15 +1068,15 @@ describe("SSHConnectionManager regressions", () => {
         "sftp channel must be closed after a mkdir failure",
       );
     } finally {
-      manager.openSftp = originalOpenSftp;
+      manager.transferService.openSftp = originalOpenSftp;
     }
   });
 
   it("should tolerate existing-directory mkdir errors and walk the full path", async () => {
-    const originalOpenSftp = manager.openSftp;
+    const originalOpenSftp = manager.transferService.openSftp;
     const attempted: string[] = [];
     let sftpEndCalls = 0;
-    manager.openSftp = async () => ({
+    manager.transferService.openSftp = async () => ({
       end: () => {
         sftpEndCalls += 1;
       },
@@ -1087,18 +1088,18 @@ describe("SSHConnectionManager regressions", () => {
     });
 
     try {
-      await manager.sftpMkdirRecursive({}, "/tmp/a/b");
+      await manager.transferService.sftpMkdirRecursive({}, "/tmp/a/b");
       assert.deepStrictEqual(attempted, ["/tmp", "/tmp/a", "/tmp/a/b"]);
       assert.strictEqual(sftpEndCalls, 1);
     } finally {
-      manager.openSftp = originalOpenSftp;
+      manager.transferService.openSftp = originalOpenSftp;
     }
   });
 
   it("should reject a stalled fast SFTP upload via the inactivity timeout", async () => {
-    const originalOpenSftp = manager.openSftp;
+    const originalOpenSftp = manager.transferService.openSftp;
     let sftpEndCalls = 0;
-    manager.openSftp = async () => ({
+    manager.transferService.openSftp = async () => ({
       end: () => {
         sftpEndCalls += 1;
       },
@@ -1110,7 +1111,7 @@ describe("SSHConnectionManager regressions", () => {
     try {
       await assert.rejects(
         () =>
-          manager.sftpFastPut({}, "/local/file", "/tmp/file", {}, 40),
+          manager.transferService.sftpFastPut({}, "/local/file", "/tmp/file", {}, 40),
         (err: Error) =>
           err instanceof ToolError &&
           err.code === "SSH_CONNECTION_FAILED" &&
@@ -1121,13 +1122,13 @@ describe("SSHConnectionManager regressions", () => {
         "sftp channel must be closed when a stalled transfer is aborted",
       );
     } finally {
-      manager.openSftp = originalOpenSftp;
+      manager.transferService.openSftp = originalOpenSftp;
     }
   });
 
   it("should reset the fast-transfer inactivity timer while progress is reported", async () => {
-    const originalOpenSftp = manager.openSftp;
-    manager.openSftp = async () => ({
+    const originalOpenSftp = manager.transferService.openSftp;
+    manager.transferService.openSftp = async () => ({
       end: () => {},
       fastPut: (
         _localPath: string,
@@ -1150,9 +1151,9 @@ describe("SSHConnectionManager regressions", () => {
     });
 
     try {
-      await manager.sftpFastPut({}, "/local/file", "/tmp/file", {}, 40);
+      await manager.transferService.sftpFastPut({}, "/local/file", "/tmp/file", {}, 40);
     } finally {
-      manager.openSftp = originalOpenSftp;
+      manager.transferService.openSftp = originalOpenSftp;
     }
   });
 
@@ -1167,9 +1168,9 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
-    const originalSftpStat = manager.sftpStat;
-    const originalRemoteMd5 = manager.remoteMd5;
+    const originalOpenSftp = manager.transferService.openSftp;
+    const originalSftpStat = manager.transferService.sftpStat;
+    const originalRemoteMd5 = manager.transferService.remoteMd5;
     let acquireCalls = 0;
     let closeCalls = 0;
 
@@ -1182,9 +1183,9 @@ describe("SSHConnectionManager regressions", () => {
         },
       };
     };
-    manager.openSftp = async () => ({ end: () => {} });
-    manager.sftpStat = async () => ({ size: 100 });
-    manager.remoteMd5 = async () => "abc123";
+    manager.transferService.openSftp = async () => ({ end: () => {} });
+    manager.transferService.sftpStat = async () => ({ size: 100 });
+    manager.transferService.remoteMd5 = async () => "abc123";
 
     try {
       const result = await manager.transferBetweenServers(
@@ -1199,9 +1200,9 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(closeCalls, 1, "self-relay must close the client once");
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
-      manager.sftpStat = originalSftpStat;
-      manager.remoteMd5 = originalRemoteMd5;
+      manager.transferService.openSftp = originalOpenSftp;
+      manager.transferService.sftpStat = originalSftpStat;
+      manager.transferService.remoteMd5 = originalRemoteMd5;
     }
   });
 
@@ -1216,7 +1217,7 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
+    const originalOpenSftp = manager.transferService.openSftp;
     const originalCreateWriteStream = (fsForTest as any).createWriteStream;
     let sftpEndCalls = 0;
     let readUnpipeCalls = 0;
@@ -1231,7 +1232,7 @@ describe("SSHConnectionManager regressions", () => {
       client: { cached: true },
       close: () => {},
     });
-    manager.openSftp = async () => ({
+    manager.transferService.openSftp = async () => ({
       end: () => {
         sftpEndCalls += 1;
       },
@@ -1269,7 +1270,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(sftpEndCalls, 1);
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
+      manager.transferService.openSftp = originalOpenSftp;
       (fsForTest as any).createWriteStream = originalCreateWriteStream;
       if (fsForTest.existsSync(tempPath)) {
         fsForTest.unlinkSync(tempPath);
@@ -1346,7 +1347,7 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
+    const originalOpenSftp = manager.transferService.openSftp;
     let openSftpCalls = 0;
     let sftpEndCalls = 0;
     const tempPath = path.resolve(
@@ -1359,7 +1360,7 @@ describe("SSHConnectionManager regressions", () => {
       client: { cached: true },
       close: () => {},
     });
-    manager.openSftp = async () => {
+    manager.transferService.openSftp = async () => {
       openSftpCalls += 1;
       return {
         end: () => {
@@ -1395,7 +1396,7 @@ describe("SSHConnectionManager regressions", () => {
       );
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
+      manager.transferService.openSftp = originalOpenSftp;
       if (fsForTest.existsSync(tempPath)) {
         fsForTest.unlinkSync(tempPath);
       }
@@ -1413,7 +1414,7 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
+    const originalOpenSftp = manager.transferService.openSftp;
     let closeCalls = 0;
     let fastPutCalls = 0;
     const tempPath = path.resolve(
@@ -1431,7 +1432,7 @@ describe("SSHConnectionManager regressions", () => {
         },
       };
     };
-    manager.openSftp = async () => ({
+    manager.transferService.openSftp = async () => ({
       end: () => {},
       fastPut: (
         _localPath: string,
@@ -1455,7 +1456,7 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(closeCalls, 1, "one-shot fast SFTP clients must close after use");
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
+      manager.transferService.openSftp = originalOpenSftp;
       fsForTest.unlinkSync(tempPath);
     }
   });
@@ -1477,8 +1478,8 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
-    const originalSftpStat = manager.sftpStat;
+    const originalOpenSftp = manager.transferService.openSftp;
+    const originalSftpStat = manager.transferService.sftpStat;
     let closeCalls = 0;
     const acquired: string[] = [];
 
@@ -1499,7 +1500,7 @@ describe("SSHConnectionManager regressions", () => {
     };
     const source = Buffer.from("payload");
     const destination = Buffer.alloc(source.length);
-    manager.openSftp = async (_client: unknown, label: string) => {
+    manager.transferService.openSftp = async (_client: unknown, label: string) => {
       if (label === "source") {
         return {
           end: () => {},
@@ -1521,7 +1522,7 @@ describe("SSHConnectionManager regressions", () => {
         close: (_handle: Buffer, callback: (error?: Error) => void) => callback(),
       } as any;
     };
-    manager.sftpStat = async () => ({ size: 7 });
+    manager.transferService.sftpStat = async () => ({ size: 7 });
 
     try {
       const result = await manager.transferBetweenServers(
@@ -1544,8 +1545,8 @@ describe("SSHConnectionManager regressions", () => {
       assert.deepStrictEqual(destination, source);
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
-      manager.sftpStat = originalSftpStat;
+      manager.transferService.openSftp = originalOpenSftp;
+      manager.transferService.sftpStat = originalSftpStat;
     }
   });
 
@@ -1566,8 +1567,8 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
-    const originalSftpStat = manager.sftpStat;
+    const originalOpenSftp = manager.transferService.openSftp;
+    const originalSftpStat = manager.transferService.sftpStat;
     let sourceEndCalls = 0;
     let destEndCalls = 0;
     let sourceCloseCalls = 0;
@@ -1577,8 +1578,8 @@ describe("SSHConnectionManager regressions", () => {
       client: { key },
       close: () => {},
     });
-    manager.sftpStat = async () => ({ size: 7 });
-    manager.openSftp = async (_client: unknown, label: string) => {
+    manager.transferService.sftpStat = async () => ({ size: 7 });
+    manager.transferService.openSftp = async (_client: unknown, label: string) => {
       if (label === "source") {
         return {
           end: () => {
@@ -1628,8 +1629,8 @@ describe("SSHConnectionManager regressions", () => {
       assert.ok(destCloseCalls >= 1, "destination file handle must be closed after a failed relay");
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
-      manager.sftpStat = originalSftpStat;
+      manager.transferService.openSftp = originalOpenSftp;
+      manager.transferService.sftpStat = originalSftpStat;
     }
   });
 
@@ -1650,8 +1651,8 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
-    const originalSftpStat = manager.sftpStat;
+    const originalOpenSftp = manager.transferService.openSftp;
+    const originalSftpStat = manager.transferService.sftpStat;
     const source = Buffer.from("abcdefgh");
     const destination = Buffer.alloc(source.length);
     const readOffsets: number[] = [];
@@ -1662,8 +1663,8 @@ describe("SSHConnectionManager regressions", () => {
       client: { key },
       close: () => {},
     });
-    manager.sftpStat = async () => ({ size: source.length });
-    manager.openSftp = async (_client: unknown, label: string) => {
+    manager.transferService.sftpStat = async () => ({ size: source.length });
+    manager.transferService.openSftp = async (_client: unknown, label: string) => {
       if (label === "source") {
         return {
           end: () => {},
@@ -1719,8 +1720,8 @@ describe("SSHConnectionManager regressions", () => {
       assert.deepStrictEqual(destination, source);
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
-      manager.sftpStat = originalSftpStat;
+      manager.transferService.openSftp = originalOpenSftp;
+      manager.transferService.sftpStat = originalSftpStat;
     }
   });
 
@@ -1741,8 +1742,8 @@ describe("SSHConnectionManager regressions", () => {
     );
 
     const originalAcquireSshClient = manager.pool.acquireSshClient;
-    const originalOpenSftp = manager.openSftp;
-    const originalSftpStat = manager.sftpStat;
+    const originalOpenSftp = manager.transferService.openSftp;
+    const originalSftpStat = manager.transferService.sftpStat;
     let openFileCalls = 0;
     let sftpEndCalls = 0;
 
@@ -1750,8 +1751,8 @@ describe("SSHConnectionManager regressions", () => {
       client: { key },
       close: () => {},
     });
-    manager.sftpStat = async () => ({ size: 1 });
-    manager.openSftp = async () => ({
+    manager.transferService.sftpStat = async () => ({ size: 1 });
+    manager.transferService.openSftp = async () => ({
       end: () => {
         sftpEndCalls += 1;
       },
@@ -1775,8 +1776,8 @@ describe("SSHConnectionManager regressions", () => {
       assert.strictEqual(sftpEndCalls, 2, "both opened SFTP sessions must close after option validation fails");
     } finally {
       manager.pool.acquireSshClient = originalAcquireSshClient;
-      manager.openSftp = originalOpenSftp;
-      manager.sftpStat = originalSftpStat;
+      manager.transferService.openSftp = originalOpenSftp;
+      manager.transferService.sftpStat = originalSftpStat;
     }
   });
 
@@ -3367,8 +3368,9 @@ describe("SFTP path validators", () => {
 });
 
 describe("Upload CRLF auto-fix", () => {
-  // Access the private static helper via 'any' for testing.
-  const helper = (SSHConnectionManager as any).maybeFixShellScriptLineEndings as (
+  // Access the private static helper via 'any' for testing. PLAN.MD P0-04
+  // moved this from SSHConnectionManager onto TransferService.
+  const helper = (TransferService as any).maybeFixShellScriptLineEndings as (
     localPath: string,
     buffer: Buffer,
   ) => { buffer: Buffer; fixed: boolean; replacedCount: number };
@@ -3475,12 +3477,12 @@ describe("Upload skip-if-identical", () => {
 
     // Stub: ensureConnected returns a sentinel client; sftp ops return identical bytes
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => ({ size: Buffer.byteLength("hello world") });
-    manager.sftpReadBuffer = async () => Buffer.from("hello world", "utf8");
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => ({ size: Buffer.byteLength("hello world") });
+    manager.transferService.sftpReadBuffer = async () => Buffer.from("hello world", "utf8");
 
     let writeCalled = false;
-    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+    manager.transferService.sftpWriteBuffer = async () => { writeCalled = true; };
 
     const result = await manager.upload(local, "/tmp/file.txt", "dev");
     assert.match(result, /Upload skipped/);
@@ -3494,12 +3496,12 @@ describe("Upload skip-if-identical", () => {
     const local = writeLocal(Buffer.from("hello world", "utf8"));
 
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => ({ size: Buffer.byteLength("hello world") });
-    manager.sftpReadBuffer = async () => Buffer.from("hello world", "utf8");
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => ({ size: Buffer.byteLength("hello world") });
+    manager.transferService.sftpReadBuffer = async () => Buffer.from("hello world", "utf8");
 
     let writeCalled = false;
-    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+    manager.transferService.sftpWriteBuffer = async () => { writeCalled = true; };
 
     const result = await manager.upload(local, "/tmp/file.txt", "dev", { skipIfIdentical: false });
     assert.match(result, /File uploaded successfully/);
@@ -3512,11 +3514,11 @@ describe("Upload skip-if-identical", () => {
     const local = writeLocal(Buffer.from("payload", "utf8"));
 
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => { throw new ToolError("SFTP_ERROR", "no such file", false); };
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => { throw new ToolError("SFTP_ERROR", "no such file", false); };
 
     let writeCalled = false;
-    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+    manager.transferService.sftpWriteBuffer = async () => { writeCalled = true; };
 
     const result = await manager.upload(local, "/tmp/file.txt", "dev");
     assert.match(result, /File uploaded successfully/);
@@ -3529,11 +3531,11 @@ describe("Upload skip-if-identical", () => {
     const local = writeLocal(Buffer.from("hello", "utf8"));
 
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => ({ size: 999 });
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => ({ size: 999 });
 
     let writeCalled = false;
-    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+    manager.transferService.sftpWriteBuffer = async () => { writeCalled = true; };
 
     const result = await manager.upload(local, "/tmp/file.txt", "dev");
     assert.match(result, /File uploaded successfully/);
@@ -3546,12 +3548,12 @@ describe("Upload skip-if-identical", () => {
     const local = writeLocal(Buffer.from("hello", "utf8"));
 
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => ({ size: 5 });
-    manager.sftpReadBuffer = async () => Buffer.from("world", "utf8");
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => ({ size: 5 });
+    manager.transferService.sftpReadBuffer = async () => Buffer.from("world", "utf8");
 
     let writeCalled = false;
-    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+    manager.transferService.sftpWriteBuffer = async () => { writeCalled = true; };
 
     const result = await manager.upload(local, "/tmp/file.txt", "dev");
     assert.match(result, /File uploaded successfully/);
@@ -3564,11 +3566,11 @@ describe("Upload skip-if-identical", () => {
     const local = writeLocal(Buffer.from("#!/bin/sh\r\necho hi\r\n", "utf8"), ".sh");
 
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => { throw new ToolError("SFTP_ERROR", "missing", false); };
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => { throw new ToolError("SFTP_ERROR", "missing", false); };
 
     let written: Buffer | null = null;
-    manager.sftpWriteBuffer = async (_c: unknown, _p: string, payload: Buffer) => { written = payload; };
+    manager.transferService.sftpWriteBuffer = async (_c: unknown, _p: string, payload: Buffer) => { written = payload; };
 
     const result = await manager.upload(local, "/tmp/file.sh", "dev");
     assert.match(result, /CRLF.{0,3}LF auto-fix/);
@@ -3637,12 +3639,12 @@ describe("Upload shell-script line-ending-agnostic compare", () => {
     const remoteRaw = Buffer.from("#!/bin/sh\r\necho hi\r\n", "utf8");
 
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => ({ size: remoteRaw.length });
-    manager.sftpReadBuffer = async () => remoteRaw;
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => ({ size: remoteRaw.length });
+    manager.transferService.sftpReadBuffer = async () => remoteRaw;
 
     let writeCalled = false;
-    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+    manager.transferService.sftpWriteBuffer = async () => { writeCalled = true; };
 
     const result = await manager.upload(local, "/tmp/run.sh", "dev");
     assert.match(result, /Upload skipped/);
@@ -3658,12 +3660,12 @@ describe("Upload shell-script line-ending-agnostic compare", () => {
     const remoteRaw = Buffer.from("#!/bin/sh\necho hi\n", "utf8");
 
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => ({ size: remoteRaw.length });
-    manager.sftpReadBuffer = async () => remoteRaw;
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => ({ size: remoteRaw.length });
+    manager.transferService.sftpReadBuffer = async () => remoteRaw;
 
     let writeCalled = false;
-    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+    manager.transferService.sftpWriteBuffer = async () => { writeCalled = true; };
 
     const result = await manager.upload(local, "/tmp/run.sh", "dev");
     assert.match(result, /Upload skipped/);
@@ -3679,12 +3681,12 @@ describe("Upload shell-script line-ending-agnostic compare", () => {
     const remoteRaw = Buffer.from("#!/bin/sh\r\necho BYE\r\n", "utf8"); // different content
 
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => ({ size: remoteRaw.length });
-    manager.sftpReadBuffer = async () => remoteRaw;
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => ({ size: remoteRaw.length });
+    manager.transferService.sftpReadBuffer = async () => remoteRaw;
 
     let writeCalled = false;
-    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+    manager.transferService.sftpWriteBuffer = async () => { writeCalled = true; };
 
     const result = await manager.upload(local, "/tmp/run.sh", "dev");
     assert.match(result, /File uploaded successfully/);
@@ -3699,12 +3701,12 @@ describe("Upload shell-script line-ending-agnostic compare", () => {
     const remoteRaw = Buffer.from("a\r\nb\r\n", "utf8");
 
     manager.pool.ensureConnected = async () => ({}) as any;
-    manager.openSftp = async () => ({ end: () => {} }) as any;
-    manager.sftpStat = async () => ({ size: remoteRaw.length });
-    manager.sftpReadBuffer = async () => remoteRaw;
+    manager.transferService.openSftp = async () => ({ end: () => {} }) as any;
+    manager.transferService.sftpStat = async () => ({ size: remoteRaw.length });
+    manager.transferService.sftpReadBuffer = async () => remoteRaw;
 
     let writeCalled = false;
-    manager.sftpWriteBuffer = async () => { writeCalled = true; };
+    manager.transferService.sftpWriteBuffer = async () => { writeCalled = true; };
 
     const result = await manager.upload(local, "/tmp/file.txt", "dev");
     // Sizes differ (4 vs 6), so we should re-upload

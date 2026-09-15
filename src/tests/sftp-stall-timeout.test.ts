@@ -115,7 +115,7 @@ describe("sftpWriteBuffer stall watchdog", () => {
 
     const start = Date.now();
     await assert.rejects(
-      manager.sftpWriteBuffer(client, "/remote/f", Buffer.alloc(4096), STALL_MS),
+      manager.transferService.sftpWriteBuffer(client, "/remote/f", Buffer.alloc(4096), STALL_MS),
       (err: any) =>
         err?.code === "SSH_CONNECTION_FAILED" &&
         err?.retriable === true &&
@@ -129,7 +129,7 @@ describe("sftpWriteBuffer stall watchdog", () => {
     const sftp = fakeSftp({ createWriteStream: () => ws });
     const client = fakeClient(sftp);
 
-    await manager.sftpWriteBuffer(client, "/remote/f", Buffer.alloc(4096), STALL_MS);
+    await manager.transferService.sftpWriteBuffer(client, "/remote/f", Buffer.alloc(4096), STALL_MS);
   });
 });
 
@@ -143,7 +143,7 @@ describe("sftpReadBuffer stall watchdog", () => {
 
     const start = Date.now();
     await assert.rejects(
-      manager.sftpReadBuffer(client, "/remote/f", 1024, STALL_MS),
+      manager.transferService.sftpReadBuffer(client, "/remote/f", 1024, STALL_MS),
       (err: any) =>
         err?.code === "SSH_CONNECTION_FAILED" &&
         err?.retriable === true &&
@@ -160,7 +160,7 @@ describe("sftpReadBuffer stall watchdog", () => {
     });
     const client = fakeClient(sftp);
 
-    const result: Buffer = await manager.sftpReadBuffer(
+    const result: Buffer = await manager.transferService.sftpReadBuffer(
       client,
       "/remote/f",
       payload.length,
@@ -179,7 +179,7 @@ describe("pipeWithInactivityTimeout watchdog", () => {
 
     const start = Date.now();
     await assert.rejects(
-      manager.pipeWithInactivityTimeout(
+      manager.transferService.pipeWithInactivityTimeout(
         rs,
         ws,
         STALL_MS,
@@ -196,7 +196,7 @@ describe("pipeWithInactivityTimeout watchdog", () => {
   it("resolves when the write side finishes", async () => {
     const rs = new HealthyReadStream([Buffer.from("a")]);
     const ws = new HealthyWriteStream();
-    const p = manager.pipeWithInactivityTimeout(
+    const p = manager.transferService.pipeWithInactivityTimeout(
       rs,
       ws,
       STALL_MS,
@@ -228,7 +228,7 @@ describe("runWithInactivityTimeout progress coalescing", () => {
     };
 
     try {
-      await manager.runWithInactivityTimeout(
+      await manager.transferService.runWithInactivityTimeout(
         (onProgress: () => void) =>
           new Promise<void>((resolve) => {
             // ssh2 calls step once per acknowledged chunk. A large transfer can

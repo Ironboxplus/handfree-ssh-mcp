@@ -9,6 +9,7 @@ import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
  */
 export function registerUploadTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
+  const transferService = sshManager.getTransferService();
 
   server.tool(
     "upload",
@@ -30,7 +31,7 @@ export function registerUploadTool(server: McpServer): void {
     async ({ localPath, remotePath, connectionName, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize }) => {
       try {
         const resolvedName = sshManager.resolveServer(connectionName);
-        const result = await sshManager.upload(localPath, remotePath, resolvedName, {
+        const result = await transferService.upload(localPath, remotePath, resolvedName, {
           skipIfIdentical: skipIfIdentical !== false,
           reuseConnection,
           timeout,

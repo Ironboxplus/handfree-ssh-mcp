@@ -15,6 +15,7 @@ import { formatToolErrorResponse, ToolError, toToolError } from "../utils/tool-e
  */
 export function registerTransferTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
+  const transferService = sshManager.getTransferService();
 
   server.tool(
     "transfer",
@@ -118,7 +119,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
           }
           const relayOptions = { reuseConnection, timeout, vvv, sftpConcurrency, chunkSize };
           const result = archive
-            ? await sshManager.transferArchiveBetweenServers(
+            ? await transferService.transferArchiveBetweenServers(
                 sourceServer,
                 sourceRemotePath,
                 destServer,
@@ -126,7 +127,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
                 compression,
                 relayOptions,
               )
-            : await sshManager.transferBetweenServers(
+            : await transferService.transferBetweenServers(
                 sourceServer,
                 sourceRemotePath,
                 destServer,
@@ -159,17 +160,17 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
 
         if (archive) {
           const result = mode === "upload"
-            ? await sshManager.uploadArchive(localPath, remotePath, resolvedName, compression, sftpOptions)
-            : await sshManager.downloadArchive(remotePath, localPath, resolvedName, compression, sftpOptions);
+            ? await transferService.uploadArchive(localPath, remotePath, resolvedName, compression, sftpOptions)
+            : await transferService.downloadArchive(remotePath, localPath, resolvedName, compression, sftpOptions);
           return { content: [{ type: "text", text: result }] };
         }
 
         if (recursive) {
           let files: string[];
           if (mode === "upload") {
-            files = await sshManager.uploadDirectory(localPath, remotePath, resolvedName, uploadOptions);
+            files = await transferService.uploadDirectory(localPath, remotePath, resolvedName, uploadOptions);
           } else {
-            files = await sshManager.downloadDirectory(remotePath, localPath, resolvedName, sftpOptions);
+            files = await transferService.downloadDirectory(remotePath, localPath, resolvedName, sftpOptions);
           }
           const summary = `Recursive ${mode} complete. ${files.length} file(s) transferred.`;
           return {
@@ -179,10 +180,10 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
 
         // Single file
         if (mode === "upload") {
-          const result = await sshManager.upload(localPath, remotePath, resolvedName, uploadOptions);
+          const result = await transferService.upload(localPath, remotePath, resolvedName, uploadOptions);
           return { content: [{ type: "text", text: result }] };
         } else {
-          const result = await sshManager.download(remotePath, localPath, resolvedName, sftpOptions);
+          const result = await transferService.download(remotePath, localPath, resolvedName, sftpOptions);
           return { content: [{ type: "text", text: result }] };
         }
       } catch (error: unknown) {

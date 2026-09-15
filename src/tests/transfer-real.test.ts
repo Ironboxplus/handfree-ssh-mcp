@@ -203,7 +203,7 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     const privateManager = manager as any;
     const tmpRoot = fs.realpathSync(os.tmpdir());
     const cwdRoot = fs.realpathSync(process.cwd());
-    const work = privateManager.createLocalArchiveWorkspace("none") as { directory: string; archivePath: string };
+    const work = privateManager.transferService.createLocalArchiveWorkspace("none") as { directory: string; archivePath: string };
     try {
       const resolvedDirectory = fs.realpathSync(work.directory);
       assert.ok(
@@ -222,7 +222,7 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
       // suite's disableSftpPathPolicy server config.
       assert.doesNotThrow(() => privateManager.validateLocalPath(work.archivePath));
     } finally {
-      privateManager.cleanupLocalArchiveWorkspace(work.directory);
+      privateManager.transferService.cleanupLocalArchiveWorkspace(work.directory);
     }
   });
 
@@ -234,24 +234,24 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     writeFixtureTree(input, 6);
 
     for (const compression of ["none", "gzip", "bzip2", "xz", "zstd"] satisfies ArchiveCompression[]) {
-      const work = privateManager.createLocalArchiveWorkspace(compression) as { directory: string; archivePath: string };
+      const work = privateManager.transferService.createLocalArchiveWorkspace(compression) as { directory: string; archivePath: string };
       const output = path.join(localRoot, `white-box-output-${compression}`);
       fs.mkdirSync(output, { recursive: true });
       try {
-        await privateManager.runLocalTar(
-          privateManager.archiveCreateArgs(work.archivePath, input, compression, path),
+        await privateManager.transferService.runLocalTar(
+          privateManager.transferService.archiveCreateArgs(work.archivePath, input, compression, path),
           `white-box create ${compression}`,
           "LOCAL_FILE_READ_FAILED",
         );
         assert.ok(fs.statSync(work.archivePath).size > 0, `${compression} archive should contain real bytes`);
-        await privateManager.runLocalTar(
-          privateManager.archiveExtractArgs(work.archivePath, output, compression),
+        await privateManager.transferService.runLocalTar(
+          privateManager.transferService.archiveExtractArgs(work.archivePath, output, compression),
           `white-box extract ${compression}`,
           "LOCAL_FILE_WRITE_FAILED",
         );
         assertTreeEqual(path.join(output, path.basename(input)), input);
       } finally {
-        privateManager.cleanupLocalArchiveWorkspace(work.directory);
+        privateManager.transferService.cleanupLocalArchiveWorkspace(work.directory);
       }
     }
   });
@@ -277,7 +277,7 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
       { sourceSize: 999_999, chunkSize: 1, concurrency: 1, expected: 1 },
     ];
     for (const { sourceSize, chunkSize, concurrency, expected } of cases) {
-      const actual = privateManager.resolveRelayWorkerCount(sourceSize, chunkSize, concurrency);
+      const actual = privateManager.transferService.resolveRelayWorkerCount(sourceSize, chunkSize, concurrency);
       assert.equal(
         actual,
         expected,
