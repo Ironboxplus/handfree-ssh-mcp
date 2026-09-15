@@ -927,13 +927,40 @@ P1-03a 相对 P1-01/P1-02 的依赖不成立，理由：
 
 ### P1-04 Striped SFTP download
 
-- [ ] 先实现多连接 download，因为本地 positional write 的兼容性可控。
-- [ ] 预分配本地 temp 文件；每个 stream 使用独立 SSH/SFTP channel 或 connection 拉取不重叠区间。
-- [ ] 并发 positional write；完成后 size/hash 验证并原子 rename。
-- [ ] 总 buffer 受 `maxBufferBytes` 硬限制。
-- [ ] 任一 worker 失败即取消其余 worker并清理 temp；连接错误不污染健康连接池。
+**P1-04 拆分记录 — 2026-09-15，Rev.4（复核者写入，不由执行者自行认定）**
 
-- [ ] **P1-04-A1**：1 GiB 随机文件在 50 ms/1 Gbps netem 下，striped 相对同场单 channel baseline 至少 1.8×，或达到整形带宽 70% 以上；二者满足其一且 SHA-256 相同。
+本任务拆为 **P1-04a（正确性）** 与 **P1-04b（性能证明）** 两步交付，理由是二者所需的验证环境根本不同：
+
+- **P1-04a = 下方全部实现条目**，验收在 Windows 进程内真实 ssh2/SFTP 服务器上完成：真实多 channel、分片区间不重叠、并发定位写、SHA-256 一致、`maxBufferBytes` 真实生效、任一 worker 失败取消其余并清理 temp、原子 rename。这些全是**正确性**属性，与链路延迟无关，进程内可以真实验证。
+- **P1-04b = P1-04-A1 的性能数值门**，必须在 `.88` 的 Docker + `tc` netem 环境真跑。进程内服务器 RTT 近乎为零，分片在那里**结构上不可能**显示任何收益；在该环境下报告 1.8× 等同于伪造结果，违反 §7.2。
+
+**边界**：P1-04a 通过**不代表** P1-04 通过。PHASE-1-GATE 仍要求 P1-04-A1 的真实数值门（见 §8.2）。在 P1-04b 真跑出数字之前，README/工具描述**不得**声称任何加速倍数，只能描述行为（「多通道分片下载」），不得给出性能承诺。
+
+依赖说明：P1-04a 不依赖 P1-01（TransferMetrics）——其并发与分片证据来自测试服务器的真实计数器，非产品内 metrics；也不依赖 P1-02（`src/fspath/`）——本地落盘走既有 `validateLocalPath` 加 temp + 原子 rename，不新增路径语义。P1-04b 依赖 `.88` lab（P0-02）与 §8.2 基准方法，二者已具备。
+
+- [x] 先实现多连接 download，因为本地 positional write 的兼容性可控。（P1-04a：`TransferService.downloadStriped`/`runStripedReadWorkers`，`src/services/transfer-service.ts`；`download`/`transfer` 新增 `striped`（默认 false，不改变现有 fast/buffered 行为）、`stripeCount`（默认 4，上限 8，复用 `MAX_RECURSIVE_FILE_CONCURRENCY` 的 MaxSessions 余量推理）、`chunkSize`、`maxBufferBytes`。）
+- [x] 预分配本地 temp 文件；每个 stream 使用独立 SSH/SFTP channel 或 connection 拉取不重叠区间。（`fs.ftruncateSync` 预分配；每个 stripe worker 各自 `openSftp` 一个 channel；区间来自纯函数 `computeDownloadStripeRanges`，白盒穷举 + 灰盒用服务器真实 READ 请求计数验证不重叠且精确覆盖全文件——见 `src/tests/download-striped-real.test.ts`。）
+- [x] 并发 positional write；完成后 size/hash 验证并原子 rename。（`writeLocalPositional` 用带 offset 的 `fs.write`；完成后校验本地 temp 文件大小，并在远端有 `md5sum` 时尽力校验 MD5（与 `transferBetweenServers` 现有校验一致），再 `fs.renameSync` 到目标路径。黑盒用真实文件 SHA-256 比对验证：跨 stripe 边界的非整除大小、小于一个 stripe 的文件、空文件均通过。）
+- [x] 总 buffer 受 `maxBufferBytes` 硬限制。（`createStripeTransferOptions` 在开任何 channel 之前校验 `stripeCount * chunkSize <= maxBufferBytes`（默认 64 MiB），超限即 `INVALID_CONFIGURATION`，真实 MCP 调用测试覆盖。）
+- [x] 任一 worker 失败即取消其余 worker并清理 temp；连接错误不污染健康连接池。（真实 SFTP 服务器按请求计数注入协议级 READ 失败，证明健康 worker 被真实 abort 取消、temp 文件被删除、目标路径未被创建；随后同一连接上的正常 download 仍然成功（未连接错误不会走 `isConnectionError` 强制断连重连路径）。）
+
+**复核者独立验证（2026-09-15）**：自行重跑 `tsc --noEmit` 干净、`npm test` 445/445、`test:package` exit 0；确认 `characterization-legacy-tools.test.ts`/`command-validation.test.ts`/`tools.test.ts` 的 diff 为空（既有断言未被改动以迁就新代码），`src/tests/` 下只有 helper 与新测试文件变动。
+
+对三条关键断言做变异测试（均为执行者自己未验的项），确认具备回归捕获能力：
+
+| 注入的缺陷 | 结果 |
+|---|---|
+| 每个 chunk 都写到所属 stripe 的**起始** offset（破坏定位写） | 黑盒 SHA-256 + 2 个灰盒用例转红 |
+| stripe worker 改为串行链式执行 | 灰盒「真实并发 channel 峰值」用例转红 |
+| 各 stripe 区间互相重叠 1 字节（**内容仍然正确**，重叠处字节相同） | 白盒穷举 + 灰盒「服务器真实收到的 READ 请求不重叠」用例转红 |
+
+第三条特别值得记录：该缺陷不会造成任何数据损坏，SHA-256 比对无法发现它。灰盒断言直接检查**服务器实际收到的 READ 请求**（线级事实，而非客户端自己的记账）才抓得住。这正是灰盒相对黑盒的价值所在。
+
+执行者如实报告了一处未达标项：**本任务未按 red-first 严格 TDD 完成**（实现与测试同写，首次运行即全绿），其自行补做了 2 项变异测试作为补偿。复核者认可该补偿措施并额外补做上述 3 项，但记录在案：TDD 顺序要求未被满足。
+
+已知行为（非缺陷，已文档化）：`striped=true` 用于 upload/relay 时被接受但忽略，工具描述中明确写有「Download only... Accepted but ignored for upload and relay」，与既有 `fast` 在 relay 模式下的先例一致。因其有明确文档，不属于今日修复的 `fast=` 默认值那类「文档与实际相反」的问题。
+
+- [ ] **P1-04-A1**：1 GiB 随机文件在 50 ms/1 Gbps netem 下，striped 相对同场单 channel baseline 至少 1.8×，或达到整形带宽 70% 以上；二者满足其一且 SHA-256 相同。**未验证 —— 这是 P1-04b，需要在 `.88` 的 Docker + `tc` netem lab 上真跑；进程内测试服务器 RTT 近乎为零，结构上无法产生任何真实加速数据，本轮（P1-04a）未做、也不得声称。**
 
 ### P1-05 Capability-gated striped upload
 

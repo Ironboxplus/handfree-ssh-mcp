@@ -23,9 +23,12 @@ export function registerDownloadTool(server: McpServer): void {
       vvv: z.boolean().optional().describe("Default false. Append bounded SSH/SFTP debug output. For fresh ssh2 handshake logs, also set reuseConnection=false."),
       fast: z.boolean().optional().describe("Default true. Use ssh2 fastGet for a single-file download, which performs parallel SFTP reads for better throughput. Set false for the buffered compatibility path."),
       sftpConcurrency: z.number().int().positive().optional().describe("Only used when fast=true. Number of concurrent SFTP chunks for ssh2 fastGet; omitted uses ssh2's default."),
-      chunkSize: z.number().int().positive().optional().describe("Only used when fast=true. Chunk size in bytes for ssh2 fastGet; omitted uses ssh2's default."),
+      chunkSize: z.number().int().positive().optional().describe("Only used when fast=true, or when striped=true (per-stripe read/write chunk bytes; default 262144). Omitted uses the relevant mode's default."),
+      striped: z.boolean().optional().describe("Default false. Split the download into stripeCount non-overlapping byte ranges pulled concurrently over separate SFTP channels into a preallocated local temp file, verified and atomically renamed into place when complete. Takes priority over fast when both are set."),
+      stripeCount: z.number().int().positive().optional().describe("Only used when striped=true. Number of concurrent byte-range channels. Default 4, maximum 8 (same OpenSSH MaxSessions headroom as fileConcurrency)."),
+      maxBufferBytes: z.number().int().positive().optional().describe("Only used when striped=true. Hard cap in bytes on stripeCount * chunkSize, the total data ever buffered in MCP-host memory at once. Default 67108864 (64 MiB)."),
     },
-    async ({ remotePath, localPath, connectionName, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize }) => {
+    async ({ remotePath, localPath, connectionName, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, striped, stripeCount, maxBufferBytes }) => {
       try {
         const resolvedName = sshManager.resolveServer(connectionName);
         const result = await transferService.download(remotePath, localPath, resolvedName, {
@@ -35,6 +38,9 @@ export function registerDownloadTool(server: McpServer): void {
           fast: fast !== false,
           sftpConcurrency,
           chunkSize,
+          ...(striped === undefined ? {} : { striped }),
+          ...(stripeCount === undefined ? {} : { stripeCount }),
+          ...(maxBufferBytes === undefined ? {} : { maxBufferBytes }),
         });
         return {
           content: [{ type: "text", text: result }],

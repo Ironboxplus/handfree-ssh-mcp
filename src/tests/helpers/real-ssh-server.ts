@@ -33,6 +33,13 @@ export interface RealSshServerStats {
   // requested" as a real synchronization signal, instead of guessing at a
   // wall-clock sleep duration that would be flaky under system load.
   openDirRequests: number;
+  // PLAN.MD P1-04a (striped download): every real READ request's (offset,
+  // length), in receipt order, across every file the server has served
+  // since the last resetReadLog(). Lets a grey-box test assert on the
+  // ranges the client actually requested -- not on the client's own
+  // bookkeeping -- to prove striped download's ranges are non-overlapping
+  // and exactly cover the file.
+  readRequests: Array<{ offset: number; length: number }>;
 }
 
 const { Server } = ssh2;
@@ -103,11 +110,21 @@ export class RealSshTestServer {
     activeReaddirs: 0,
     maxActiveReaddirs: 0,
     openDirRequests: 0,
+    readRequests: [],
   };
 
   public port = 0;
   private readonly server: InstanceType<typeof Server>;
   private readonly clients = new Set<any>();
+  // PLAN.MD P1-04a (striped download failure/cleanup test): once set, every
+  // real READ request received AFTER the configured count gets a genuine
+  // SFTP protocol-level failure response instead of real data -- a real
+  // server-side error over the real SFTP channel, not a stub of the ssh2
+  // client. Deterministic on request count rather than wall-clock timing,
+  // so a mid-transfer failure with some workers already making real
+  // progress (and others then genuinely cancelled) is reproducible without
+  // any sleep/poll race.
+  private failReadsAfterCount: number | null = null;
 
   public constructor(
     public readonly rootDirectory: string,
@@ -121,6 +138,13 @@ export class RealSshTestServer {
     // makes the overlap observable and non-flaky. Zero by default so every
     // other test's behavior is unchanged.
     private readonly readdirResponseDelayMs = 0,
+    // PLAN.MD P1-04a (striped download): a real, injected per-READ delay,
+    // same rationale as readdirResponseDelayMs above -- local disk reads
+    // otherwise resolve too fast for genuinely concurrent stripe channels
+    // to reliably overlap in wall-clock terms. Zero by default so every
+    // other test's behavior (including reads outside this suite) is
+    // unchanged.
+    private readonly readResponseDelayMs = 0,
   ) {
     const { privateKey } = generateKeyPairSync("rsa", {
       modulusLength: 2048,
@@ -211,6 +235,31 @@ export class RealSshTestServer {
     this.stats.maxActiveReaddirs = this.stats.activeReaddirs;
   }
 
+  /**
+   * Clear the accumulated READ request log. Call immediately before the
+   * transfer under test so its range-coverage assertions cannot be
+   * satisfied by an earlier test's READ requests against this shared
+   * server. See resetChannelPeak() for the same reasoning.
+   */
+  public resetReadLog(): void {
+    this.stats.readRequests.length = 0;
+  }
+
+  /**
+   * From the (count+1)-th real READ request onward (counting from the
+   * current resetReadLog() baseline), respond with a genuine SFTP
+   * STATUS_CODE.FAILURE instead of real data. Lets a test let some stripe
+   * workers make genuine progress before a real, protocol-level failure
+   * hits -- deterministic on request count, not timing.
+   */
+  public injectReadFailureAfter(count: number): void {
+    this.failReadsAfterCount = count;
+  }
+
+  public clearReadFailureInjection(): void {
+    this.failReadsAfterCount = null;
+  }
+
   public toLocalPath(remotePath: string): string {
     if (!remotePath.startsWith("/")) throw new Error(`Remote path is not absolute: ${remotePath}`);
     const components = remotePath.split("/").filter(Boolean);
@@ -277,13 +326,21 @@ export class RealSshTestServer {
     });
     sftp.on("READ", (requestId: number, handle: Buffer, offset: number, length: number) => {
       trace("READ", `offset=${offset} length=${length}`);
+      this.stats.readRequests.push({ offset, length });
+      if (this.failReadsAfterCount !== null && this.stats.readRequests.length > this.failReadsAfterCount) {
+        return sftp.status(requestId, STATUS_CODE.FAILURE, "injected read failure (test)");
+      }
       const state = lookupHandle(handle);
       if (!state || state.kind !== "file") return sftp.status(requestId, STATUS_CODE.FAILURE);
       const buffer = Buffer.alloc(length);
-      fs.read(state.fd, buffer, 0, length, offset, (error, bytesRead) => {
+      const respond = (error: NodeJS.ErrnoException | null, bytesRead: number): void => {
         if (error) return fail(requestId, error);
         if (bytesRead === 0) return sftp.status(requestId, STATUS_CODE.EOF);
         sftp.data(requestId, buffer.subarray(0, bytesRead));
+      };
+      fs.read(state.fd, buffer, 0, length, offset, (error, bytesRead) => {
+        if (this.readResponseDelayMs > 0) setTimeout(() => respond(error, bytesRead), this.readResponseDelayMs);
+        else respond(error, bytesRead);
       });
     });
     sftp.on("WRITE", (requestId: number, handle: Buffer, offset: number, data: Buffer) => {

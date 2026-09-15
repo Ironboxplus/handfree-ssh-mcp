@@ -44,6 +44,17 @@ export type SftpOptions = {
   sftpConcurrency?: number;
   chunkSize?: number;
   fileConcurrency?: number;
+  /**
+   * PLAN.MD P1-04a: opt-in multi-channel striped single-file download.
+   * Default false/omitted preserves the existing fast/buffered download
+   * behavior exactly. Download only -- striped upload is P1-05 and not
+   * implemented by this option.
+   */
+  striped?: boolean;
+  /** Only used when striped=true. Number of concurrent byte-range workers. Default 4, capped like fileConcurrency. */
+  stripeCount?: number;
+  /** Only used when striped=true. Hard cap (bytes) on stripeCount * chunkSize, the total data ever buffered in MCP-host memory at once. */
+  maxBufferBytes?: number;
 };
 
 export type ArchiveCompression = "none" | "gzip" | "bzip2" | "xz" | "zstd";
@@ -359,6 +370,22 @@ export class TransferService {
   private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = 8;
   private static readonly ARCHIVE_ERROR_OUTPUT_BYTES = 16 * 1024;
 
+  // PLAN.MD P1-04a: striped (multi-channel) single-file download. Each
+  // stripe worker opens its own SFTP channel on the shared connection, plus
+  // one short-lived channel for the initial stat -- the same MaxSessions
+  // headroom reasoning as MAX_RECURSIVE_FILE_CONCURRENCY above, so the cap
+  // is shared with it rather than re-derived.
+  private static readonly DEFAULT_STRIPE_COUNT = 4;
+  private static readonly MAX_STRIPE_COUNT = TransferService.MAX_RECURSIVE_FILE_CONCURRENCY;
+  // Per-worker read/write chunk inside its own byte range: bounds how much
+  // of one stripe is ever held in memory at a time, matching
+  // SFTP_WRITE_CHUNK_BYTES's role for the buffered upload/download path.
+  private static readonly DEFAULT_STRIPE_CHUNK_BYTES = 256 * 1024;
+  // Hard cap on stripeCount * chunkSize (see createStripeTransferOptions),
+  // same bound and reasoning as MAX_RELAY_PREFETCH_BYTES: a large file must
+  // never be buffered whole in MCP-host memory.
+  private static readonly DEFAULT_STRIPE_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
   // upload() returns a human-readable string, and uploadBatch() has to
   // classify each file's outcome from it (the single-file return shape is
   // frozen by the legacy characterization tests, so it cannot become a
@@ -464,6 +491,36 @@ export class TransferService {
    */
   private resolveRelayWorkerCount(sourceSize: number, chunkSize: number, concurrency: number): number {
     return Math.min(concurrency, Math.ceil(sourceSize / chunkSize));
+  }
+
+  /**
+   * Pure: split a `totalSize`-byte file into up to `stripeCount` contiguous,
+   * non-overlapping byte ranges for striped download (PLAN.MD P1-04a).
+   * Never produces more ranges than there are bytes -- a 3-byte file with
+   * stripeCount=8 yields 3 single-byte ranges, not 8 with five empty ones --
+   * and any leftover bytes from an uneven division are spread one-per-range
+   * across the first ranges rather than dumped entirely onto the last one,
+   * so every range's length is within 1 byte of every other. Ranges are
+   * returned in file order and their lengths always sum to exactly
+   * totalSize. A zero-byte file yields no ranges at all: callers create an
+   * empty file directly instead of starting zero-length stripe workers.
+   */
+  private computeDownloadStripeRanges(
+    totalSize: number,
+    stripeCount: number,
+  ): Array<{ offset: number; length: number }> {
+    if (totalSize <= 0) return [];
+    const count = Math.max(1, Math.min(stripeCount, totalSize));
+    const base = Math.floor(totalSize / count);
+    const remainder = totalSize - base * count;
+    const ranges: Array<{ offset: number; length: number }> = [];
+    let offset = 0;
+    for (let index = 0; index < count; index += 1) {
+      const length = base + (index < remainder ? 1 : 0);
+      ranges.push({ offset, length });
+      offset += length;
+    }
+    return ranges;
   }
 
   private sftpOpenFile(
@@ -796,6 +853,49 @@ export class TransferService {
       );
     }
     return concurrency;
+  }
+
+  /**
+   * Striped download channel count (PLAN.MD P1-04a): same MaxSessions-
+   * headroom reasoning as resolveRecursiveFileConcurrency above, since each
+   * stripe worker likewise opens its own SFTP channel on the shared
+   * connection.
+   */
+  private resolveStripeCount(options?: SftpOptions): number {
+    const requested = this.optionalPositiveInteger(options?.stripeCount, "stripeCount");
+    const count = requested ?? TransferService.DEFAULT_STRIPE_COUNT;
+    if (count > TransferService.MAX_STRIPE_COUNT) {
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `stripeCount must not exceed ${TransferService.MAX_STRIPE_COUNT}`,
+        false,
+      );
+    }
+    return count;
+  }
+
+  /**
+   * Resolve and validate a striped download's channel count and per-worker
+   * chunk size against the hard maxBufferBytes cap, BEFORE any SFTP channel
+   * is opened -- same ordering rationale as createRelayTransferOptions.
+   */
+  private createStripeTransferOptions(options?: SftpOptions): { stripeCount: number; chunkSize: number } {
+    const stripeCount = this.resolveStripeCount(options);
+    const chunkSize = this.optionalPositiveInteger(options?.chunkSize, "chunkSize") ??
+      TransferService.DEFAULT_STRIPE_CHUNK_BYTES;
+    const maxBufferBytes = this.optionalPositiveInteger(options?.maxBufferBytes, "maxBufferBytes") ??
+      TransferService.DEFAULT_STRIPE_MAX_BUFFER_BYTES;
+    const bufferNeeded = stripeCount * chunkSize;
+
+    if (!Number.isSafeInteger(bufferNeeded) || bufferNeeded > maxBufferBytes) {
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `striped download buffer window is too large (${stripeCount} x ${chunkSize} bytes; max ${maxBufferBytes} bytes)`,
+        false,
+      );
+    }
+
+    return { stripeCount, chunkSize };
   }
 
   /**
@@ -1699,6 +1799,266 @@ export class TransferService {
   }
 
   /**
+   * Positional write into an already-open local file descriptor. Multiple
+   * stripe workers call this concurrently with disjoint (offset, length)
+   * ranges -- passing an explicit position makes each call independent of
+   * the fd's shared cursor, so concurrent calls never race or overwrite
+   * each other's bytes.
+   */
+  private writeLocalPositional(fd: number, chunk: Buffer, offset: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      fs.write(fd, chunk, 0, chunk.length, offset, (error) => {
+        if (error) {
+          reject(new ToolError(
+            "LOCAL_FILE_WRITE_FAILED",
+            `Failed to write striped download data at offset ${offset}: ${error.message}`,
+            false,
+          ));
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  /** Streaming MD5 of a local file, without buffering it whole. */
+  private localFileMd5(localPath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash("md5");
+      const stream = fs.createReadStream(localPath);
+      stream.on("data", (chunk: string | Buffer) => hash.update(chunk));
+      stream.on("end", () => resolve(hash.digest("hex")));
+      stream.on("error", reject);
+    });
+  }
+
+  /**
+   * Temp path for a striped download's local file, alongside the final
+   * destination so the closing rename is same-volume (and therefore
+   * atomic). Dot-prefixed and PID/random-suffixed so concurrent striped
+   * downloads to the same directory never collide.
+   */
+  private stripeTempFilePath(localPath: string): string {
+    const directory = path.dirname(localPath);
+    const base = path.basename(localPath);
+    const unique = crypto.randomBytes(6).toString("hex");
+    return path.join(directory, `.${base}.striped-${process.pid}-${unique}.tmp`);
+  }
+
+  /**
+   * PLAN.MD P1-04a: pull each byte range in `ranges` over its own SFTP
+   * channel, positionally writing straight into `fd`. Follows the same
+   * fire-and-forget-worker-with-shared-`settled`-flag shape as
+   * relayWithPrefetchWindow above (not Promise.all): a worker that fails
+   * calls `fail()` internally instead of letting its async function reject,
+   * so no worker's promise ever rejects after the pool has already settled
+   * -- avoiding unhandled rejections from workers still winding down after
+   * the first failure. On any failure or stall, `abort()` ends every
+   * currently-open stripe channel, which fails their in-flight read/write
+   * and lets each worker's own cleanup run; the shared `client` connection
+   * itself is never touched here; a connection-shaped error is left for
+   * download()'s existing pool-health handling.
+   */
+  private async runStripedReadWorkers(
+    client: Client,
+    remotePath: string,
+    fd: number,
+    ranges: ReadonlyArray<{ offset: number; length: number }>,
+    chunkSize: number,
+    timeout: number | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<void> {
+    const openSftps = new Set<SFTPWrapper>();
+
+    const abort = () => {
+      for (const sftp of openSftps) {
+        try {
+          sftp.end();
+        } catch {
+          // Ignore a channel that is already gone.
+        }
+      }
+    };
+
+    await this.runWithInactivityTimeout<void>(
+      (onProgress) =>
+        new Promise<void>((resolve, reject) => {
+          let settled = false;
+          let workersRemaining = ranges.length;
+
+          const fail = (error: Error) => {
+            if (settled) return;
+            settled = true;
+            abort();
+            reject(error);
+          };
+
+          const runWorker = async (range: { offset: number; length: number }, index: number): Promise<void> => {
+            let sftp: SFTPWrapper | null = null;
+            let handle: Buffer | null = null;
+            try {
+              sftp = await this.openSftp(client, `stripe-${index}`, timeout, debug);
+              if (settled) {
+                sftp.end();
+                return;
+              }
+              openSftps.add(sftp);
+              handle = await this.sftpOpenFile(
+                sftp,
+                remotePath,
+                "r",
+                (error) => this.makeSftpError(`Striped read open error (stripe ${index})`, error),
+              );
+              let received = 0;
+              while (received < range.length) {
+                if (settled) return;
+                const wantLength = Math.min(chunkSize, range.length - received);
+                const readOffset = range.offset + received;
+                const chunk = await this.sftpReadRelayChunk(sftp, handle, readOffset, wantLength);
+                onProgress();
+                if (settled) return;
+                await this.writeLocalPositional(fd, chunk, readOffset);
+                onProgress();
+                received += wantLength;
+              }
+            } catch (error) {
+              fail(error as Error);
+              return;
+            } finally {
+              if (handle && sftp) {
+                try {
+                  await this.sftpCloseFile(sftp, handle);
+                } catch {
+                  // Ignore cleanup errors after the original outcome.
+                }
+              }
+              if (sftp) {
+                openSftps.delete(sftp);
+                try {
+                  sftp.end();
+                } catch {
+                  // Ignore a channel that is already gone.
+                }
+              }
+            }
+
+            workersRemaining -= 1;
+            if (workersRemaining === 0 && !settled) {
+              settled = true;
+              resolve();
+            }
+          };
+
+          for (let index = 0; index < ranges.length; index += 1) {
+            void runWorker(ranges[index], index);
+          }
+        }),
+      this.transferStallTimeout(timeout),
+      `striped download ${remotePath}`,
+      debug,
+      abort,
+    );
+  }
+
+  /**
+   * PLAN.MD P1-04a: multi-channel striped single-file download. Splits the
+   * remote file into non-overlapping byte ranges (computeDownloadStripeRanges),
+   * pulls each range concurrently over its own SFTP channel into a
+   * preallocated local temp file via positional writes, verifies size (and
+   * MD5 when the remote exposes md5sum, best-effort like every other
+   * verification path in this service), then atomically renames the temp
+   * file into place. Any failure -- a worker's or verification's -- deletes
+   * the temp file before the error propagates; the destination path is
+   * never touched until the rename, so a failed striped download never
+   * leaves a partial file at localPath.
+   */
+  private async downloadStriped(
+    client: Client,
+    remotePath: string,
+    localPath: string,
+    options: SftpOptions | undefined,
+    timeout: number | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<void> {
+    const { stripeCount, chunkSize } = this.createStripeTransferOptions(options);
+
+    // One extra short-lived channel for the initial stat -- the same
+    // accounting MAX_RECURSIVE_FILE_CONCURRENCY already budgets headroom
+    // for with its own briefly-held mkdir channel.
+    const statSftp = await this.openSftp(client, "stripe-stat", timeout, debug);
+    let remoteSize: number;
+    try {
+      remoteSize = (await this.sftpStat(statSftp, remotePath, "source")).size;
+    } finally {
+      try {
+        statSftp.end();
+      } catch {
+        // Ignore late SFTP cleanup errors.
+      }
+    }
+
+    const ranges = this.computeDownloadStripeRanges(remoteSize, stripeCount);
+    const tempPath = this.stripeTempFilePath(localPath);
+    let fd: number | null = null;
+
+    const cleanupTempFile = () => {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Already closed.
+        }
+        fd = null;
+      }
+      try {
+        fs.unlinkSync(tempPath);
+      } catch {
+        // Already gone.
+      }
+    };
+
+    try {
+      fd = fs.openSync(tempPath, "w");
+      fs.ftruncateSync(fd, remoteSize); // Preallocate: fix the final size up front.
+
+      if (ranges.length > 0) {
+        await this.runStripedReadWorkers(client, remotePath, fd, ranges, chunkSize, timeout, debug);
+      }
+
+      fs.closeSync(fd);
+      fd = null;
+
+      const localSize = fs.statSync(tempPath).size;
+      if (localSize !== remoteSize) {
+        throw new ToolError(
+          "SFTP_ERROR",
+          `Striped download verification failed: size mismatch (remote=${remoteSize} bytes, local=${localSize} bytes)`,
+          true,
+        );
+      }
+
+      // Best-effort MD5 verification: only enforced when the remote exposes
+      // md5sum, matching transferBetweenServers's own post-transfer check.
+      const remoteHash = await this.remoteMd5(client, remotePath).catch(() => null);
+      if (remoteHash) {
+        const localHash = await this.localFileMd5(tempPath);
+        if (localHash !== remoteHash) {
+          throw new ToolError(
+            "SFTP_ERROR",
+            `Striped download verification failed: MD5 mismatch (remote=${remoteHash}, local=${localHash})`,
+            true,
+          );
+        }
+      }
+
+      fs.renameSync(tempPath, localPath);
+    } catch (error) {
+      cleanupTempFile();
+      throw error;
+    }
+  }
+
+  /**
    * Download file
    */
   public async download(
@@ -1721,6 +2081,21 @@ export class TransferService {
         debug,
         purpose: "sftp",
       });
+
+      if (options?.striped === true) {
+        await this.downloadStriped(
+          connection.client,
+          validatedRemotePath,
+          validatedLocalPath,
+          options,
+          options?.timeout,
+          debug,
+        );
+        return appendDebugOutput(
+          "File downloaded successfully via striped multi-channel SFTP",
+          debugCollector,
+        );
+      }
 
       if (options?.fast === true) {
         await this.sftpFastGet(

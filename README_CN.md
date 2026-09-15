@@ -24,8 +24,8 @@ handfree-ssh-mcp 使 AI 助手能够通过标准化的 MCP 接口执行远程 SS
 | execute-command | 在远程服务器执行 SSH 命令并获取结果 |
 | execute-command-stream | 执行命令并获取实时流式输出 |
 | upload | 上传本地文件到远程服务器；`localPath` 也可传数组以批量上传多个文件到同一个远程目录（见下方"批量上传"） |
-| download | 从远程服务器下载文件 |
-| transfer | 上传、下载或在两台远端服务器之间 relay；支持碎文件并发、批量上传（`localPath` 数组）、临时 tar 打包、可选压缩和分块预取 |
+| download | 从远程服务器下载文件；支持 `striped` 多通道分片下载（见下方"多通道分片下载"） |
+| transfer | 上传、下载或在两台远端服务器之间 relay；支持碎文件并发、批量上传（`localPath` 数组）、临时 tar 打包、可选压缩、多通道分片下载和分块预取 |
 | list-servers | 列出所有可用的 SSH 服务器配置 |
 
 ## 📚 使用方法
@@ -158,6 +158,10 @@ servers:
 - 每个文件仍然复用现有单文件上传逻辑：skip-if-identical、`.sh`/`.bash`/`.zsh` 的 CRLF 修正、`fast`、路径策略校验全部自动继承，不重新实现。
 - 数组入参返回结构化 JSON（`{ results, total, uploadedCount, skippedCount, failedCount, crlfFixedCount }`），而不是单文件时的纯文本结果。
 - 本轮 `archive: true` 不支持与数组 `localPath` 同时使用；`download`/`relay` 暂不支持数组形式的 `localPath`。
+
+### 🧵 多通道分片下载（`striped`）
+
+`download` 与 `transfer mode=download` 支持 `striped: true`（默认 `false`，不开启时单文件下载行为与之前完全一致）：将同一个远程文件切分为 `stripeCount`（默认 4，上限 8，与 `fileConcurrency` 相同的 OpenSSH `MaxSessions` 余量考量）个不重叠的字节区间，每个区间各自使用独立的 SFTP channel 并发拉取，通过定位写（positional write）直接写入本地预分配的 temp 文件，各区间完成顺序互不影响。`chunkSize`（默认 262144 字节）限制单个区间一次读入内存的字节数，`maxBufferBytes`（默认 64 MiB）硬性限制 `stripeCount * chunkSize`，即任意时刻 MCP 进程内存中缓冲的数据总量上限——大文件不会被整个装入内存。全部区间写完后先校验本地 temp 文件大小（远端暴露 `md5sum` 时还会尽力校验 MD5），通过后才原子 rename 到目标路径；任一分片失败或校验失败都会删除 temp 文件，从不触碰最终目标路径。同时设置 `fast` 时 `striped` 优先生效。该开关只改变字节的搬运方式，不改变工具的返回内容。
 
 ## 🛡️ 安全注意事项
 

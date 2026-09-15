@@ -175,7 +175,18 @@ Parameters:
   fast            (boolean, optional)  Default false. Use ssh2 fastGet for
                   single-file download throughput. Not multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
-  chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
+  chunkSize       (number, optional)   Only with fast=true, or with striped=true
+                  (per-stripe chunk bytes; default 262144).
+  striped         (boolean, optional)  Default false. Split into stripeCount
+                  non-overlapping byte ranges pulled concurrently over separate
+                  SFTP channels into a preallocated local temp file, then
+                  verified (size, and MD5 when the remote has md5sum) and
+                  atomically renamed into place. Takes priority over fast.
+  stripeCount     (number, optional)   Only with striped=true. Concurrent
+                  byte-range channels. Default 4, maximum 8.
+  maxBufferBytes  (number, optional)   Only with striped=true. Hard cap on
+                  stripeCount * chunkSize, the data ever buffered in MCP-host
+                  memory at once. Default 67108864 (64 MiB).
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -184,7 +195,9 @@ connectionName rule:
 Example:
   download { remotePath: "/var/log/app.log", localPath: "app.log" }
   download { remotePath: "/tmp/big.bin", localPath: "big.bin", fast: true,
-             sftpConcurrency: 32, chunkSize: 131072 }`,
+             sftpConcurrency: 32, chunkSize: 131072 }
+  download { remotePath: "/tmp/huge.bin", localPath: "huge.bin", striped: true,
+             stripeCount: 4 }`,
 
   "transfer": `transfer — Move files between hosts (single/recursive/cross-server).
 
@@ -212,7 +225,19 @@ Parameters for upload / download:
                   use ssh2 fastPut/fastGet for each single file. Directory
                   recursion stays sequential; no multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
-  chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
+  chunkSize       (number, optional)   Only with fast=true, or with striped=true
+                  (per-stripe chunk bytes; default 262144).
+  striped         (boolean, optional)  Download only. Default false. Split the
+                  download into stripeCount non-overlapping byte ranges pulled
+                  concurrently over separate SFTP channels into a preallocated
+                  local temp file, verified (size, and MD5 when the remote has
+                  md5sum) and atomically renamed into place. Takes priority
+                  over fast. Accepted but ignored for upload and relay.
+  stripeCount     (number, optional)   Download with striped=true only.
+                  Concurrent byte-range channels. Default 4, maximum 8.
+  maxBufferBytes  (number, optional)   Download with striped=true only. Hard
+                  cap on stripeCount * chunkSize, the data ever buffered in
+                  MCP-host memory at once. Default 67108864 (64 MiB).
   fileConcurrency (number, optional)   Recursive or batch upload only: independent
                   files transferred in parallel. Default 4, maximum 8. Each
                   parallel file opens its own SFTP channel on the same SSH
@@ -258,6 +283,8 @@ connectionName rule (upload/download):
 Examples:
   transfer { mode: "upload", localPath: "dist/", remotePath: "/opt/app/dist", recursive: true }
   transfer { mode: "upload", localPath: ["a/config.yaml", "b/settings.json"], remotePath: "/etc/app" }
+  transfer { mode: "download", localPath: "huge.bin", remotePath: "/data/huge.bin",
+             striped: true, stripeCount: 4 }
   transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/var/log/app.log",
              destServer: "backup", destRemotePath: "/backup/app.log" }`,
 

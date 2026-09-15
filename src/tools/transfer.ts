@@ -88,7 +88,16 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         "Upload/download: only used when fast=true. Relay: number of concurrent prefetched source chunks, default 64. The relay window is bounded to 64 MiB.",
       ),
       chunkSize: z.number().int().positive().optional().describe(
-        "Upload/download: only used when fast=true. Relay: bytes per prefetched source chunk, default 32768. The relay window is bounded to 64 MiB.",
+        "Upload/download: only used when fast=true, or when striped=true (per-stripe read/write chunk bytes; default 262144). Relay: bytes per prefetched source chunk, default 32768. The relay window is bounded to 64 MiB.",
+      ),
+      striped: z.boolean().optional().describe(
+        "Download only. Default false. Split the download into stripeCount non-overlapping byte ranges pulled concurrently over separate SFTP channels into a preallocated local temp file, verified and atomically renamed into place when complete. Takes priority over fast when both are set. Accepted but ignored for upload and relay.",
+      ),
+      stripeCount: z.number().int().positive().optional().describe(
+        "Download with striped=true only. Number of concurrent byte-range channels. Default 4, maximum 8 (same OpenSSH MaxSessions headroom as fileConcurrency).",
+      ),
+      maxBufferBytes: z.number().int().positive().optional().describe(
+        "Download with striped=true only. Hard cap in bytes on stripeCount * chunkSize, the total data ever buffered in MCP-host memory at once. Default 67108864 (64 MiB).",
       ),
       fileConcurrency: z.number().int().positive().optional().describe(
         "Recursive upload/download only: maximum independent files transferred in parallel. Default 4, maximum 8. Each file transferred in parallel opens its own SFTP channel on the same SSH connection, and the cap is kept under OpenSSH's common default MaxSessions=10 so it does not reliably fail against a default-configured remote sshd. This improves directory trees with many small files without creating an archive.",
@@ -151,7 +160,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         }
 
         // upload or download
-        const { remotePath, connectionName, recursive, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, fileConcurrency } = params;
+        const { remotePath, connectionName, recursive, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, fileConcurrency, striped, stripeCount, maxBufferBytes } = params;
         if (!localPath || !remotePath) {
           return {
             content: [{ type: "text", text: `${mode} mode requires: localPath, remotePath` }],
@@ -187,6 +196,9 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
           sftpConcurrency,
           chunkSize,
           ...(fileConcurrency === undefined ? {} : { fileConcurrency }),
+          ...(striped === undefined ? {} : { striped }),
+          ...(stripeCount === undefined ? {} : { stripeCount }),
+          ...(maxBufferBytes === undefined ? {} : { maxBufferBytes }),
         };
         const uploadOptions = { skipIfIdentical: skipIfIdentical !== false, ...sftpOptions };
 
