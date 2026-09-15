@@ -39,8 +39,11 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
       mode: z.enum(["upload", "download", "relay"]).describe(
         "'upload' pushes local → remote. 'download' pulls remote → local. 'relay' copies remote-A → remote-B through the MCP host.",
       ),
-      localPath: z.string().optional().describe(
-        "(upload/download only) Path on the MCP host. Must be inside the MCP working directory or one of the server's allowedLocalDirectories.",
+      localPath: z.union([
+        z.string(),
+        z.array(z.string()),
+      ]).optional().describe(
+        "(upload/download only) Path on the MCP host. Upload only: an array batch-uploads multiple independent files to the same remotePath directory, each landing at remotePath/<basename> (basename collisions or repeated paths fail the whole call before anything is written remotely; max 1000 entries; not combinable with archive=true; returns structured JSON instead of the plain-text single-file result). Must be inside the MCP working directory or one of the server's allowedLocalDirectories.",
       ),
       remotePath: z.string().optional().describe(
         "(upload/download only) Absolute POSIX path on the remote server. Any path is allowed by default; restricted to allowedRemoteDirectories only if the server configures that list — call show-whitelist to check.",
@@ -96,14 +99,24 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
       archiveCompression: z.enum(["none", "gzip", "bzip2", "xz", "zstd"]).optional().describe(
         "Only used when archive=true. Compression for the temporary tar; default none. Requires compatible tar/compressor support on every remote endpoint that packs or extracts the archive.",
       ),
+      onError: z.enum(["abort", "continue"]).optional().describe(
+        "Batch upload only (mode=upload with array localPath). Default 'abort': stop scheduling new files once one fails, drain in-flight ones, then report. 'continue': attempt every file regardless of earlier failures. Both modes report a per-file uploaded/skipped/failed status.",
+      ),
     },
     async (params) => {
       try {
-        const { mode, archive, archiveCompression } = params;
+        const { mode, archive, archiveCompression, localPath, onError } = params;
         if (!archive && archiveCompression !== undefined) {
           throw new ToolError(
             "INVALID_CONFIGURATION",
             "archiveCompression requires archive=true",
+            false,
+          );
+        }
+        if (archive && Array.isArray(localPath)) {
+          throw new ToolError(
+            "INVALID_CONFIGURATION",
+            "archive=true is not supported with a batch (array) localPath",
             false,
           );
         }
@@ -138,12 +151,31 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         }
 
         // upload or download
-        const { localPath, remotePath, connectionName, recursive, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, fileConcurrency } = params;
+        const { remotePath, connectionName, recursive, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, fileConcurrency } = params;
         if (!localPath || !remotePath) {
           return {
             content: [{ type: "text", text: `${mode} mode requires: localPath, remotePath` }],
             isError: true,
           };
+        }
+
+        if (Array.isArray(localPath)) {
+          // §5.7: batch (array localPath) is upload-only this round; download
+          // and relay array forms are explicitly out of scope.
+          if (mode !== "upload") {
+            throw new ToolError(
+              "INVALID_CONFIGURATION",
+              `Batch (array) localPath is only supported for mode="upload", not mode="${mode}"`,
+              false,
+            );
+          }
+          if (recursive) {
+            throw new ToolError(
+              "INVALID_CONFIGURATION",
+              "recursive=true is not supported with a batch (array) localPath",
+              false,
+            );
+          }
         }
 
         const resolvedName = sshManager.resolveServer(connectionName);
@@ -157,6 +189,14 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
           ...(fileConcurrency === undefined ? {} : { fileConcurrency }),
         };
         const uploadOptions = { skipIfIdentical: skipIfIdentical !== false, ...sftpOptions };
+
+        if (Array.isArray(localPath)) {
+          const batchResult = await transferService.uploadBatch(localPath, remotePath, resolvedName, {
+            ...uploadOptions,
+            onError,
+          });
+          return { content: [{ type: "text", text: JSON.stringify(batchResult) }] };
+        }
 
         if (archive) {
           const result = mode === "upload"

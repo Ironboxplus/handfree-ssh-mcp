@@ -109,12 +109,15 @@ Examples:
   close-connection { connectionName: "scnet" }
   close-connection { connectionName: "dcu" }`,
 
-  "upload": `upload — Upload a single local file to a remote server over SFTP.
+  "upload": `upload — Upload a local file, or a batch of local files, to a remote server over SFTP.
 
 Parameters:
-  localPath       (string, required)   File path on the MCP host.
-                  Must be inside the MCP working directory.
+  localPath       (string | string[], required)  File path on the MCP host,
+                  or an array of paths for batch upload. Must be inside the
+                  MCP working directory.
   remotePath      (string, required)   Destination path on the remote server.
+                  Batch mode (array localPath): this must be a directory;
+                  each source lands at remotePath/<basename>.
   connectionName  (string, see below)  Target server name from list-servers.
   skipIfIdentical (boolean, optional)  Default true. Skip when remote matches.
   reuseConnection (boolean, optional)  Default true. Set false after timeout
@@ -127,15 +130,36 @@ Parameters:
                   single-file upload throughput. Not multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
+  onError         (string, optional)   Batch mode only. "abort" (default): stop
+                  scheduling new files once one fails, drain in-flight ones.
+                  "continue": attempt every file regardless of earlier failures.
+                  Both report a per-file uploaded/skipped/failed status.
+  fileConcurrency (number, optional)   Batch mode only. Independent files
+                  uploaded in parallel. Default 4, maximum 8.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
   • If multiple servers are enabled → REQUIRED.
 
+Batch mode (array localPath):
+  • remotePath must be a directory; each source lands at remotePath/<basename>.
+  • Basename collisions across sources, or the same path repeated in the
+    array, fail the whole call with BATCH_TARGET_COLLISION before anything
+    is written remotely — never silently deduplicated.
+  • Empty array → INVALID_CONFIGURATION. Over 1000 entries → BATCH_TOO_LARGE.
+  • Every file still goes through the normal single-file rules: skip-if-
+    identical, CRLF→LF fix for .sh/.bash/.zsh, fast, and path policy.
+  • Returns structured JSON: { results: [...], total, uploadedCount,
+    skippedCount, failedCount, crlfFixedCount }. A single string localPath
+    keeps the original plain-text response, unchanged.
+  • archive is not available for batch mode in this delivery round.
+
 Example:
   upload { localPath: "data.csv", remotePath: "/tmp/data.csv" }
   upload { localPath: "big.bin", remotePath: "/tmp/big.bin", fast: true,
-           sftpConcurrency: 32, chunkSize: 131072 }`,
+           sftpConcurrency: 32, chunkSize: 131072 }
+  upload { localPath: ["a/config.yaml", "b/settings.json"], remotePath: "/etc/app" }
+  upload { localPath: ["1.csv", "2.csv", "3.csv"], remotePath: "/data", onError: "continue" }`,
 
   "download": `download — Download a single file from a remote server over SFTP.
 
@@ -174,10 +198,13 @@ Modes:
 
 Parameters for upload / download:
   mode            (string, required)   "upload" or "download"
-  localPath       (string, required)   Path on the MCP host.
+  localPath       (string | string[], required)  Path on the MCP host. Upload
+                  only: an array batch-uploads multiple independent files to
+                  the same remotePath directory (see "Batch upload" below).
   remotePath      (string, required)   Path on the remote server.
   connectionName  (string, see below)  Target server name.
   recursive       (boolean, optional)  True to transfer a whole directory tree.
+                  Not combinable with an array localPath.
   reuseConnection (boolean, optional)  Default true. Set false after timeout.
   timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
@@ -186,11 +213,31 @@ Parameters for upload / download:
                   recursion stays sequential; no multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
-  fileConcurrency (number, optional)   Recursive only: independent files transferred
-                  in parallel. Default 4, maximum 8. Each parallel file opens
-                  its own SFTP channel on the same SSH connection; capped
-                  under OpenSSH's common default MaxSessions=10 so it does not
-                  reliably fail channel-open against a default-configured remote.
+  fileConcurrency (number, optional)   Recursive or batch upload only: independent
+                  files transferred in parallel. Default 4, maximum 8. Each
+                  parallel file opens its own SFTP channel on the same SSH
+                  connection; capped under OpenSSH's common default
+                  MaxSessions=10 so it does not reliably fail channel-open
+                  against a default-configured remote.
+  onError         (string, optional)   Batch upload only (array localPath).
+                  "abort" (default): stop scheduling new files once one fails,
+                  drain in-flight ones. "continue": attempt every file
+                  regardless of earlier failures. Both report a per-file
+                  uploaded/skipped/failed status.
+
+Batch upload (mode="upload" with an array localPath):
+  • remotePath must be a directory; each source lands at remotePath/<basename>.
+  • Basename collisions across sources, or the same path repeated in the
+    array, fail the whole call with BATCH_TARGET_COLLISION before anything
+    is written remotely — never silently deduplicated.
+  • Empty array → INVALID_CONFIGURATION. Over 1000 entries → BATCH_TOO_LARGE.
+  • Every file still goes through the normal single-file rules: skip-if-
+    identical, CRLF→LF fix for .sh/.bash/.zsh, fast, and path policy.
+  • Returns structured JSON: { results: [...], total, uploadedCount,
+    skippedCount, failedCount, crlfFixedCount }. A single string localPath
+    keeps the original plain-text response, unchanged.
+  • Not combinable with archive=true or recursive=true in this delivery round.
+  • download/relay do not support an array localPath in this delivery round.
 
 Parameters for relay:
   mode              (string, required)   "relay"
@@ -210,6 +257,7 @@ connectionName rule (upload/download):
 
 Examples:
   transfer { mode: "upload", localPath: "dist/", remotePath: "/opt/app/dist", recursive: true }
+  transfer { mode: "upload", localPath: ["a/config.yaml", "b/settings.json"], remotePath: "/etc/app" }
   transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/var/log/app.log",
              destServer: "backup", destRemotePath: "/backup/app.log" }`,
 
@@ -231,9 +279,9 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   show-whitelist    Show the active command policy.
   close-connection  Close a cached SSH connection for a server.
   command-status    Poll background status and incremental live output.
-  upload            Upload a single file to a remote server.
+  upload            Upload a single file, or a batch of files, to a remote server.
   download          Download a single file from a remote server.
-  transfer          Move files: single, recursive, or cross-server relay.
+  transfer          Move files: single, recursive, batch upload, or cross-server relay.
   help              Show this help or detailed per-tool usage.
 
 Quick start:

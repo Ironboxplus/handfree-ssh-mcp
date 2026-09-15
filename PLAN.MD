@@ -638,7 +638,7 @@ sync profile owner 状态独立于 job：`stopped → starting → watching ↔ 
 - `remotePath` 必须是目录；每个源文件落到 `remotePath/<basename>`。
 - **basename 冲突在传输前硬失败**：`["a/config.yaml", "b/config.yaml"]` 会撞同一目标，返回 `BATCH_TARGET_COLLISION` 并列出冲突项。数组内重复路径同样报错，不静默去重。
 - 数组长度上限 1000，超出返回 `BATCH_TOO_LARGE`。空数组返回 `INVALID_CONFIGURATION`。
-- 并发复用 `fileConcurrency`（默认 4、上限 32），并受 P1-03 的 per-server channel budget 约束。
+- 并发复用 `fileConcurrency`（默认 4、**上限 8**），并受 P1-03 的 per-server channel budget 约束。Rev.4 更正：本行原写「上限 32」，与代码不符——实际常量是 `MAX_RECURSIVE_FILE_CONCURRENCY = 8`，见 §2.3 F3：每个并发 worker 各开一条 SFTP channel，OpenSSH 默认 `MaxSessions 10` 是硬约束，8 是在默认配置下留余量的取值。放宽需等 P1-03 的 per-server channel budget（见 P1-03 任务节）。
 - `onError`：默认 `abort`（停止调度新文件，在飞的传完，逐文件报告）；`continue` 需显式指定。两种模式都必须返回**每个文件**的 `uploaded | skipped | failed` 及失败原因。
 - 逐文件独立复用现有单文件逻辑：skip-if-identical、`.sh`/`.bash`/`.zsh` 的 CRLF 修正、`fast`、路径策略校验。汇总里分别给出 skip 命中数和 CRLF 修正数。
 - `archive: true` + 数组：本轮返回 `INVALID_CONFIGURATION`（现有 archive 实现只接受单一 source path，多来源需重写 `archiveCreateArgs`）。该组合列为后续增强。
@@ -959,20 +959,41 @@ Rev.4 修正：本任务原先被排在 `P1-01 → P1-02 → P1-09`，即等 Tra
 - 连接复用已由 pool 的 client cache 提供：`upload()` 每次 `acquireSshClient` 拿到的是同一个缓存 SSH client，每文件只新开一条 SFTP channel。不需要为批量另做连接管理；但每文件一条 channel 会触碰 `MaxSessions`，并发上限必须沿用 `resolveRecursiveFileConcurrency`（`:627`）的既有帽子。
 - 唯一需要新写的是结果收集：`runBoundedTransfers` 是 fail-fast 且**抛出后丢失哪些文件已成功**的信息，而 5.7 要求两种 `onError` 模式都返回逐文件结果。新增一个返回 `Array<{status, reason}>` 的有界执行器（约 35 行），**不改动 `runBoundedTransfers` 本身**——`uploadDirectory` 依赖它的抛出语义。
 
-- [ ] `localPath` 扩展为 `string | string[]`；字符串入参行为与 1.x 逐字节一致，由 characterization test 冻结。
-- [ ] 数组入参要求 `remotePath` 为目录，每个源落到 `remotePath/<basename>`。
-- [ ] basename 冲突与数组内重复路径在**任何远端写入发生之前**硬失败，返回 `BATCH_TARGET_COLLISION` 并列出冲突项。
-- [ ] 长度上限 1000（`BATCH_TOO_LARGE`）、空数组拒绝。
-- [ ] 并发复用 `fileConcurrency`，受 per-server channel budget 约束。
-- [ ] `onError: abort`（默认）停止调度新文件、等待在飞文件收尾；`onError: continue` 显式开启。两者都返回逐文件结果。
-- [ ] 逐文件复用 skip-if-identical、CRLF 修正、`fast`、路径策略；汇总给出 skip 与 CRLF 计数。
-- [ ] `archive: true` + 数组返回 `INVALID_CONFIGURATION`。
-- [ ] 数组入参返回结构化 JSON；字符串入参保持旧文本输出。
-- [ ] 更新 `help`、README、README_CN。
+- [x] `localPath` 扩展为 `string | string[]`（`transfer-service.ts` `uploadBatch`；`upload.ts`/`transfer.ts` 用 `Array.isArray` 分流）。字符串入参路径未改一行既有逻辑，`batch-upload-real.test.ts` 新增「string localPath keeps the original text response, byte-for-byte」用例锁定文本响应；既有 `characterization-legacy-tools.test.ts`（冻结 1.x 工具响应）未改动且保持全绿。
+- [x] 数组入参要求 `remotePath` 为目录：`uploadBatch` 对 `remoteDir` 执行与 `uploadDirectory` 相同的 `sftpMkdirRecursive`，每个源落到 `remoteDir/<basename>`（`batchUploadBasename`，对 `/` 和 `\` 都取 basename）。
+- [x] basename 冲突与数组内重复路径在**任何远端写入发生之前**硬失败：纯函数 `findBatchTargetCollisions` + `validateBatchUploadTargets`，返回 `BATCH_TARGET_COLLISION` 并列出冲突的 basename 与全部源路径；同路径重复是同一 basename 冲突的退化情形，同一函数覆盖，不需要单独判重。P1-09-A3 用真实 SFTP 服务器证明拒绝发生在零次真实 `OPEN`/SFTP channel 之前（`destinationServer.stats.openedFiles`/`maxActiveSftpChannels` 前后不变）。
+- [x] 长度上限 1000（`BATCH_TOO_LARGE`，`MAX_BATCH_UPLOAD_SIZE`）、空数组拒绝（`INVALID_CONFIGURATION`）；顺序为 空 → 超限 → 冲突，白盒穷举覆盖边界（999/1000/1001）与三种拒绝码。
+- [x] 并发复用既有 `resolveRecursiveFileConcurrency`（`:627`），即默认 4、硬上限 8（不是 §5.7 草案文本里未来态的 32——P1-09 的「实现基线」明确要求沿用现有函数的既有帽子而非新引入上限；per-server channel budget 仍是 P1-03 范围，未实现，如 §5.4/PHASE-1-GATE 所述）。
+- [x] `onError: abort`（默认）停止调度新文件、等待在飞文件收尾；`onError: continue` 显式开启。新增 `runBoundedTransfersWithResults`（不改动 `runBoundedTransfers` 本身，`uploadDirectory` 继续用原版）返回每文件 `done|failed|not-run`，两种模式都转换为逐文件 `uploaded|skipped|failed` 及失败原因。
+- [x] 逐文件复用 skip-if-identical、CRLF 修正、`fast`、路径策略：批量方法内部只调用既有 `this.upload()`，未复制其内部逻辑；通过解析 `upload()` 既有的文本返回值（`"Upload skipped:"` 前缀 / `"CRLF→LF auto-fix"` 子串）反推每文件状态，汇总给出 `skippedCount` 与 `crlfFixedCount`。
+- [x] `archive: true` + 数组返回 `INVALID_CONFIGURATION`（仅 `transfer` 工具有 `archive` 参数；`upload` 工具本就没有该参数）。
+- [x] 数组入参返回结构化 JSON（`{ results, total, uploadedCount, skippedCount, failedCount, crlfFixedCount }`）；字符串入参保持旧文本输出。`download`/`relay` 模式传数组 `localPath` 显式拒绝为 `INVALID_CONFIGURATION`（本轮范围外，非静默行为）。
+- [x] 更新 `help.ts`（`upload`/`transfer` 详情、总览行）、`README.md`（工具表 + 新增 Upload behaviors 小节）、`README_CN.md`（工具表 + 新增"批量上传"小节）。
 
-- [ ] **P1-09-A1**（黑盒）：经真实 stdio MCP 传 12 个真实文件到真实 OpenSSH fixture，逐文件 SHA-256 与本地一致；其中 2 个已存在且内容相同者被 skip；1 个 `.sh` 发生 CRLF 修正；返回的逐文件状态与远端实际状态完全吻合。
-- [ ] **P1-09-A2**（灰盒）：注入第 7 个文件的真实失败（目标目录只读），`abort` 模式下后续文件未被调度、在飞文件已收尾、远端无半文件；`continue` 模式下其余 11 个成功且第 7 个被准确标记失败。
-- [ ] **P1-09-A3**（白盒）：basename 冲突检测、重复路径检测、长度上限为纯函数，穷举 value test；断言冲突检测在任何 SFTP 调用前完成（以真实 SFTP 调用计数为 0 证明）。
+**验收（2026-09-15，本次交付独立验证）：**
+
+- **P1-09-A1（黑盒）**：`src/tests/batch-upload-real.test.ts`，经 `InMemoryTransport`（与仓库既有 `transfer-real.test.ts`/`characterization-legacy-tools.test.ts` 同一黑盒约定：真实 MCP `Client`/`Server`、真实 JSON-RPC 序列化，未使用真实 stdio 子进程/未使用真实 OpenSSH 二进制）+ 真实 `RealSshTestServer`（真实 ssh2 Server、真实 SFTP、真实文件系统）驱动 `upload` 工具，12 个真实文件、2 个预置字节相同文件跳过、1 个 `.sh` 文件 CRLF→LF 修正；逐文件 SHA-256 与远端磁盘真实字节核对一致。
+- **P1-09-A2（灰盒）**：Windows 上 `chmod` 只读目录**不能**产生真实权限失败（已用独立脚本验证：`fs.chmodSync(dir, 0o444)` 后 `fs.openSync` 在该目录下仍能创建文件——NTFS 不通过 DOS 只读属性拦截目录内容写入）。改用另一种真实、跨平台的 OS 级失败：批量数组第 7 个目标路径预先被建成真实目录，真实 SFTP 服务器对其真实 `fs.open('w')` 真实返回 `EISDIR`（不是打桩）。`fileConcurrency: 1` 保证调度顺序确定。`onError=abort`：文件 1–6 upload 成功、文件 7 失败、文件 8–12 状态为 `failed`（reason 含 "not attempted"）且真实从未写入远端磁盘；真实计数器 `destinationServer.stats.openedFiles` 增量精确为 6。`onError=continue`：11 个文件成功、仅文件 7 失败；`openedFiles` 增量精确为 11。两种模式下文件 7 对应的真实目录保持未变。
+- **P1-09-A3（白盒）**：对 `validateBatchUploadTargets`/`findBatchTargetCollisions`/`batchUploadBasename` 的穷举 value test（空、恰好 1000、1001、二路/三路 basename 冲突、同路径重复、Windows 反斜杠路径、校验顺序 空→超限→冲突），零 SSH 依赖；另加真实 SFTP 服务器实测三种拒绝路径（collision/too-large/empty）过程中 `openedFiles`/`maxActiveSftpChannels` 保持不变，证明拒绝先于任何真实 SFTP 调用。
+- 复核命令与结果：`npx tsc --noEmit` 干净；`npm test` 424/424（基线 404 + 新增 20，`characterization-legacy-tools.test.ts`/`command-validation.test.ts`/`tools.test.ts` 未改动且全绿）；`npm run test:package` exit 0。RED 已真实验证：临时 `git stash` 生产代码改动后 `tsc --noEmit` 对新测试文件报 9 处编译错误（缺少 `uploadBatch`/`validateBatchUploadTargets` 等导出），恢复后转绿。
+- **已知偏差（如实记录）**：production 代码改动约 321 行（`transfer-service.ts` +240、`transfer.ts` +48、`upload.ts` +31、`tool-error.ts` +2），高于任务交办时「40–80 行」的粗估——主因是判别联合类型定义（`BatchUploadValidation`/`BatchUploadFileResult`/`BatchUploadResult`）与遵循本文件既有注释密度的说明性注释，未引入新目录、新抽象层或状态机。`src/contracts/transfer-contract.ts` 中已存在一套几乎等价的 `validateBatchUpload`/`basenameOf` 实现（P0-03 提交 `7172793`，早于 Rev.4 解除 P1-09 对 contracts 的依赖）；本次交付按任务交办的硬约束（禁止使用 `src/contracts/`）在 `transfer-service.ts` 内独立重写，未复用该文件，造成两份等价逻辑并存——这是待清理的技术债，非本轮职责范围内的决定，请复核者知悉。
+
+- [x] **P1-09-A1**（黑盒）：达成，证据见上方验收段。
+- [x] **P1-09-A2**（灰盒）：达成，证据见上方验收段。原文「目标目录只读」的失败注入手段在 Windows 上不成立（已实测），实际采用目标路径被真实目录占位触发真实 `EISDIR`，等价且更强（跨平台）。
+- [x] **P1-09-A3**（白盒）：达成，证据见上方验收段。
+
+**复核者独立验证（非转述子代理报告）：**
+
+- 自行重跑：`npx tsc --noEmit` 干净、`npm test` 424/424、`npm run test:package` exit 0。
+- **变异测试**——为排除「断言写成空的、跑再多次也是绿」这一失效模式，对生产代码注入两处缺陷并确认对应验收项真红：
+  | 注入的缺陷 | 结果 |
+  |---|---|
+  | 把 `uploadBatch` 的校验从 mkdir **之前**挪到**之后** | A3 的 4 个测试转红（`maxActiveSftpChannels` 与 `openedFiles` 断言生效） |
+  | 令 `onError="abort"` 永不置位 `aborted` | A2 的 abort 用例转红（文件 8–12 被调度） |
+  两处缺陷均已还原，还原后 424/424。结论：A2/A3 的关键断言确实具备回归捕获能力。
+- 逐行读过 `uploadBatch`、`runBoundedTransfersWithResults` 与 `upload.ts` 分流逻辑；确认字符串入参路径未改动既有调用，`runBoundedTransfers` 未被改动。
+
+**复核者补充修复**：`uploadBatch` 原先以字面量 `"Upload skipped:"` / `"CRLF→LF auto-fix"` 匹配 `upload()` 的散文返回值来判定每文件状态，而这两句话的原文在同文件另外两处，同一概念共三份字面量。已提取为 `TransferService.UPLOAD_SKIPPED_PREFIX` / `CRLF_FIX_MARKER` 两个常量，生产者与消费者共用，改措辞变成编译期重命名而不是静默错判（把 skipped 报成 uploaded）。单文件返回值的**文本内容未改变**，characterization test 保持全绿。
 
 - [ ] **PHASE-1-GATE**：能够解释实际选择的 strategy/engine；真实 direct 不经 Controller 数据面；release qualification 的单文件、relay 和碎文件数值门通过；批量上传三盒验收通过（P1-09 独立于 `src/fspath/`，不得以 fspath 未完成为由阻塞）；`src/fspath/` 被 transfer 全量使用且无旁路。
 

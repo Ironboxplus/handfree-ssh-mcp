@@ -49,6 +49,114 @@ export type SftpOptions = {
 export type ArchiveCompression = "none" | "gzip" | "bzip2" | "xz" | "zstd";
 
 /**
+ * PLAN.MD §5.7 batch upload contract.
+ */
+export type BatchUploadOnError = "abort" | "continue";
+
+export interface BatchTargetCollision {
+  basename: string;
+  sources: string[];
+}
+
+export type BatchUploadValidation =
+  | { ok: true }
+  | { ok: false; code: "INVALID_CONFIGURATION"; message: string }
+  | { ok: false; code: "BATCH_TOO_LARGE"; message: string }
+  | { ok: false; code: "BATCH_TARGET_COLLISION"; message: string; collisions: BatchTargetCollision[] };
+
+export interface BatchUploadFileResult {
+  localPath: string;
+  remotePath: string;
+  status: "uploaded" | "skipped" | "failed";
+  reason?: string;
+  crlfFixed?: boolean;
+}
+
+export interface BatchUploadResult {
+  results: BatchUploadFileResult[];
+  total: number;
+  uploadedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  crlfFixedCount: number;
+}
+
+/** Internal outcome record for runBoundedTransfersWithResults. */
+type BatchTransferOutcome<R> =
+  | { status: "done"; value: R }
+  | { status: "failed"; error: unknown }
+  | { status: "not-run" };
+
+export const MAX_BATCH_UPLOAD_SIZE = 1000;
+
+/**
+ * The remote filename a batch-upload source lands under: `remoteDir/<basename>`.
+ * Pure. Splits on both `/` and `\` -- `localPath` is a path on the MCP host,
+ * and on this project's own Windows dev machine that means backslash paths
+ * are a real input, not a hypothetical one.
+ */
+export function batchUploadBasename(localPath: string): string {
+  return path.posix.basename(localPath.replace(/\\/g, "/"));
+}
+
+/**
+ * Pure. Every source in the batch whose basename collides with another
+ * source's basename would silently overwrite it under the same remoteDir; an
+ * identical path listed twice is the degenerate case of that same collision
+ * (a basename colliding with itself), so it needs no separate check. Returns
+ * one entry per colliding basename, listing every contributing source path.
+ */
+export function findBatchTargetCollisions(localPaths: readonly string[]): BatchTargetCollision[] {
+  const bySourceBasename = new Map<string, string[]>();
+  for (const localPath of localPaths) {
+    const basename = batchUploadBasename(localPath);
+    const sources = bySourceBasename.get(basename);
+    if (sources) {
+      sources.push(localPath);
+    } else {
+      bySourceBasename.set(basename, [localPath]);
+    }
+  }
+  const collisions: BatchTargetCollision[] = [];
+  for (const [basename, sources] of bySourceBasename) {
+    if (sources.length > 1) {
+      collisions.push({ basename, sources });
+    }
+  }
+  return collisions;
+}
+
+/**
+ * Pure. §5.7's pre-transfer validation, checked in this order: empty ->
+ * too-large -> basename collisions. This must run to completion, and reject
+ * on failure, before any SFTP call is made -- proven by a real SFTP call
+ * count of 0 in P1-09-A3.
+ */
+export function validateBatchUploadTargets(localPaths: readonly string[]): BatchUploadValidation {
+  if (localPaths.length === 0) {
+    return { ok: false, code: "INVALID_CONFIGURATION", message: "localPath array must not be empty" };
+  }
+  if (localPaths.length > MAX_BATCH_UPLOAD_SIZE) {
+    return {
+      ok: false,
+      code: "BATCH_TOO_LARGE",
+      message: `localPath array has ${localPaths.length} entries, exceeding the limit of ${MAX_BATCH_UPLOAD_SIZE}`,
+    };
+  }
+  const collisions = findBatchTargetCollisions(localPaths);
+  if (collisions.length > 0) {
+    return {
+      ok: false,
+      code: "BATCH_TARGET_COLLISION",
+      message: `${collisions.length} basename collision(s) would overwrite each other under remotePath: ` +
+        collisions.map((collision) => `"${collision.basename}" <- [${collision.sources.join(", ")}]`).join("; "),
+      collisions,
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * Build the actual argv passed to a locally-spawned `tar`, given the raw
  * archive args and a target platform. Pure and platform-parameterized (not
  * `process.platform` read internally) so both branches can be exhaustively
@@ -207,6 +315,16 @@ export class TransferService {
   // under the common default instead of assuming operators raised it.
   private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = 8;
   private static readonly ARCHIVE_ERROR_OUTPUT_BYTES = 16 * 1024;
+
+  // upload() returns a human-readable string, and uploadBatch() has to
+  // classify each file's outcome from it (the single-file return shape is
+  // frozen by the legacy characterization tests, so it cannot become a
+  // structured object). Keeping the two discriminating substrings here means
+  // the producer and the consumer cannot drift apart silently: rewording
+  // either message without updating its constant is a compile-time rename,
+  // not a batch result that quietly reports "uploaded" for a skipped file.
+  private static readonly UPLOAD_SKIPPED_PREFIX = "Upload skipped:";
+  private static readonly CRLF_FIX_MARKER = "CRLF→LF auto-fix";
 
   /**
    * Resolve the inactivity window for a data transfer: the caller's timeout if
@@ -673,6 +791,48 @@ export class TransferService {
     }
   }
 
+  /**
+   * PLAN.MD P1-09: like runBoundedTransfers above, but never throws -- every
+   * item gets a recorded outcome instead of the pool unwinding on the first
+   * error. uploadDirectory depends on runBoundedTransfers' fail-fast throw
+   * semantics, so batch upload gets its own bounded executor rather than a
+   * mode flag bolted onto that one.
+   *
+   * onError="abort": once any worker's item fails, no unstarted item is
+   * scheduled afterwards; items already in flight are awaited to completion
+   * (drained) before returning. onError="continue": every item is attempted
+   * regardless of earlier failures.
+   */
+  private async runBoundedTransfersWithResults<T, R>(
+    items: readonly T[],
+    concurrency: number,
+    onError: BatchUploadOnError,
+    worker: (item: T) => Promise<R>,
+  ): Promise<Array<BatchTransferOutcome<R>>> {
+    const outcomes: Array<BatchTransferOutcome<R>> = items.map(() => ({ status: "not-run" }));
+    let nextIndex = 0;
+    let aborted = false;
+
+    const runWorker = async (): Promise<void> => {
+      while (!(onError === "abort" && aborted)) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) return;
+        try {
+          outcomes[index] = { status: "done", value: await worker(items[index]) };
+        } catch (error) {
+          outcomes[index] = { status: "failed", error };
+          if (onError === "abort") aborted = true;
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, items.length) }, () => runWorker()),
+    );
+    return outcomes;
+  }
+
 
 
   private unpipeStream(readStream: unknown, writeStream: unknown): void {
@@ -896,7 +1056,7 @@ export class TransferService {
     }
 
     const crlfNote = crlfFixed.fixed
-      ? ` (CRLF→LF auto-fix: converted ${crlfFixed.replacedCount} line endings to LF before upload because target is a shell script).`
+      ? ` (${TransferService.CRLF_FIX_MARKER}: converted ${crlfFixed.replacedCount} line endings to LF before upload because target is a shell script).`
       : "";
 
     debug?.(`[mcp] sftp upload on [${resolvedName}], reuseConnection=${reuseConnection}`);
@@ -931,7 +1091,7 @@ export class TransferService {
             );
         if (decision.skip) {
           return appendDebugOutput(
-            `Upload skipped: remote file '${validatedRemotePath}' is already identical to local ` +
+            `${TransferService.UPLOAD_SKIPPED_PREFIX} remote file '${validatedRemotePath}' is already identical to local ` +
               `'${validatedLocalPath}' (${decision.reason}).${crlfNote}`,
             debugCollector,
           );
@@ -2400,6 +2560,101 @@ export class TransferService {
       },
     );
     return files.map(({ remotePath }) => remotePath);
+  }
+
+  /**
+   * PLAN.MD §5.7: upload multiple independent local files to the same remote
+   * directory in one call. Each source lands at `remoteDir/<basename>`. This
+   * is uploadDirectory() minus the local directory walk -- every file still
+   * goes through the existing single-file upload() path so skip-if-identical,
+   * CRLF fix, fast, and local/remote path policy are all inherited rather
+   * than reimplemented, via a bounded worker pool that (unlike
+   * runBoundedTransfers) reports a status for every file instead of throwing
+   * on the first failure.
+   */
+  public async uploadBatch(
+    localPaths: string[],
+    remoteDir: string,
+    name?: string,
+    options?: SftpOptions & { skipIfIdentical?: boolean; onError?: BatchUploadOnError },
+  ): Promise<BatchUploadResult> {
+    // Pre-transfer validation: must reject before any remote I/O (P1-09-A3).
+    const validation = validateBatchUploadTargets(localPaths);
+    if (!validation.ok) {
+      throw new ToolError(validation.code, validation.message, false);
+    }
+
+    const resolvedName = name || this.pool.defaultName;
+    const validatedRemoteDir = this.validateRemotePath(remoteDir, resolvedName);
+    const onError: BatchUploadOnError = options?.onError === "continue" ? "continue" : "abort";
+    const fileConcurrency = this.resolveRecursiveFileConcurrency(options);
+    const reuseConnection = options?.reuseConnection !== false;
+
+    // Ensure the destination directory exists, mirroring uploadDirectory's
+    // mkdir step. This is unconditional remote I/O and intentionally happens
+    // after -- never before -- the pure validation above.
+    let connection: AcquiredSshClient | null = null;
+    try {
+      connection = await this.pool.acquireSshClient(resolvedName, {
+        reuseConnection,
+        timeout: options?.timeout,
+        purpose: "sftp",
+      });
+      await this.sftpMkdirRecursive(connection.client, validatedRemoteDir, options?.timeout);
+    } catch (error) {
+      if (reuseConnection && this.pool.isConnectionError(error as Error)) {
+        this.pool.closeClient(resolvedName, true);
+      }
+      throw error;
+    } finally {
+      connection?.close();
+    }
+
+    const items = localPaths.map((localPath) => ({
+      localPath,
+      remotePath: path.posix.join(validatedRemoteDir, batchUploadBasename(localPath)),
+    }));
+
+    const outcomes = await this.runBoundedTransfersWithResults(
+      items,
+      fileConcurrency,
+      onError,
+      ({ localPath, remotePath }) => this.upload(localPath, remotePath, resolvedName, options),
+    );
+
+    const results: BatchUploadFileResult[] = items.map(({ localPath, remotePath }, index) => {
+      const outcome = outcomes[index];
+      if (outcome.status === "done") {
+        if (outcome.value.startsWith(TransferService.UPLOAD_SKIPPED_PREFIX)) {
+          return { localPath, remotePath, status: "skipped" };
+        }
+        return {
+          localPath,
+          remotePath,
+          status: "uploaded",
+          crlfFixed: outcome.value.includes(TransferService.CRLF_FIX_MARKER),
+        };
+      }
+      if (outcome.status === "failed") {
+        const error = outcome.error;
+        return { localPath, remotePath, status: "failed", reason: error instanceof Error ? error.message : String(error) };
+      }
+      return {
+        localPath,
+        remotePath,
+        status: "failed",
+        reason: `not attempted: aborted after an earlier failure (onError=${onError})`,
+      };
+    });
+
+    return {
+      results,
+      total: results.length,
+      uploadedCount: results.filter((result) => result.status === "uploaded").length,
+      skippedCount: results.filter((result) => result.status === "skipped").length,
+      failedCount: results.filter((result) => result.status === "failed").length,
+      crlfFixedCount: results.filter((result) => result.crlfFixed).length,
+    };
   }
 
   /**

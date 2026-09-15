@@ -23,9 +23,9 @@ handfree-ssh-mcp 使 AI 助手能够通过标准化的 MCP 接口执行远程 SS
 |------|------|
 | execute-command | 在远程服务器执行 SSH 命令并获取结果 |
 | execute-command-stream | 执行命令并获取实时流式输出 |
-| upload | 上传本地文件到远程服务器 |
+| upload | 上传本地文件到远程服务器；`localPath` 也可传数组以批量上传多个文件到同一个远程目录（见下方"批量上传"） |
 | download | 从远程服务器下载文件 |
-| transfer | 上传、下载或在两台远端服务器之间 relay；支持碎文件并发、临时 tar 打包、可选压缩和分块预取 |
+| transfer | 上传、下载或在两台远端服务器之间 relay；支持碎文件并发、批量上传（`localPath` 数组）、临时 tar 打包、可选压缩和分块预取 |
 | list-servers | 列出所有可用的 SSH 服务器配置 |
 
 ## 📚 使用方法
@@ -144,6 +144,20 @@ servers:
 - 不使用 tar 的递归传输通过 `fileConcurrency` 并行处理独立文件，默认 4、最大 8。上限收紧是因为每个并发文件都会在同一 SSH 连接上打开各自的 SFTP channel，必须低于远端的 `MaxSessions`（OpenSSH 常见默认值为 10），否则会稳定触发 channel 打开失败。实现会先建立完整目录树，再并发传文件，主要用于降低大量碎文件的逐文件往返开销。
 - 设置 `archive: true` 后，源文件或目录会先自动打包为临时 tar，只传输一个归档文件，到目标目录后自动解包并清理本机及远端临时归档。源 basename 保持不变，无需再设置 `recursive: true`。
 - `archiveCompression` 可选 `none`（默认）、`gzip`、`bzip2`、`xz`、`zstd`。参与打包或解包的 MCP 宿主与远端服务器都必须具备对应的 `tar`/压缩支持。
+
+### 📦 批量上传（`localPath` 传数组）
+
+`upload` 与 `transfer mode=upload` 的 `localPath` 除了单个字符串外，也接受字符串数组，用于一次调用批量上传多个独立文件：
+
+- 传字符串时行为与之前完全一致（纯文本响应），无任何可观察差异。
+- 传数组时，`remotePath` 必须是目录，每个源文件落到 `remotePath/<basename>`。
+- **basename 冲突在任何远端写入之前硬失败**：例如 `["a/config.yaml", "b/config.yaml"]` 会撞同一目标，返回 `BATCH_TARGET_COLLISION` 并列出冲突项；数组内重复路径同样报错，不会被静默去重。
+- 数组长度上限 1000（超出返回 `BATCH_TOO_LARGE`），空数组返回 `INVALID_CONFIGURATION`。
+- 并发复用与递归传输相同的 `fileConcurrency`（默认 4，上限 8）。
+- `onError` 控制失败处理：默认 `"abort"`——一旦某个文件失败就停止调度新文件，等待已在传输中的文件完成；`"continue"` 则无视之前的失败继续尝试每个文件。两种模式都会返回每个文件的 `uploaded` / `skipped` / `failed` 状态及失败原因。
+- 每个文件仍然复用现有单文件上传逻辑：skip-if-identical、`.sh`/`.bash`/`.zsh` 的 CRLF 修正、`fast`、路径策略校验全部自动继承，不重新实现。
+- 数组入参返回结构化 JSON（`{ results, total, uploadedCount, skippedCount, failedCount, crlfFixedCount }`），而不是单文件时的纯文本结果。
+- 本轮 `archive: true` 不支持与数组 `localPath` 同时使用；`download`/`relay` 暂不支持数组形式的 `localPath`。
 
 ## 🛡️ 安全注意事项
 

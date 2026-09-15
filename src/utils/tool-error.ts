@@ -12,6 +12,8 @@ export type ToolErrorCode =
   | "BACKGROUND_COMMAND_NOT_FOUND"
   | "BACKGROUND_COMMAND_STATUS_FAILED"
   | "INVALID_CONFIGURATION"
+  | "BATCH_TOO_LARGE"
+  | "BATCH_TARGET_COLLISION"
   | "UNKNOWN_ERROR";
 
 export class ToolError extends Error {
