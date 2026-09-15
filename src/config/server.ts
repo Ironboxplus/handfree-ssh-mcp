@@ -16,7 +16,7 @@ Recommended workflow:
 8. Use close-connection to close a cached SSH connection for a server before retrying with a clean reused connection. Closing a jump host also closes cached targets that jump through it.
 9. For SSH/channel diagnostics, add vvv=true. Use it with reuseConnection=false when you need fresh handshake/debug output.
 10. Use upload and download for single-file SFTP transfers. Use transfer for recursive directory transfers or cross-server relay.
-11. For large host-to-remote or remote-to-host single-file SFTP transfers, fast=true enables ssh2 fastPut/fastGet with optional sftpConcurrency and chunkSize. It is off by default and does not add multi-file concurrency; relay keeps the streaming pipe path.
+11. For large host-to-remote or remote-to-host single-file SFTP transfers, fast=true enables ssh2 fastPut/fastGet with optional sftpConcurrency and chunkSize. It is on by default; pass fast=false for the buffered compatibility path. It does not add multi-file concurrency; relay keeps the streaming pipe path.
 12. Call help or help { tool: "<name>" } for detailed per-tool parameter docs and examples.
 
 Server targeting:

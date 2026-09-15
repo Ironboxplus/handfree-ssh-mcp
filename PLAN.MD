@@ -4,21 +4,43 @@
 > 制定日期：2026-09-14  
 > 修订：2026-09-14（Rev.2）— 阶段顺序调整为「传输加速 → 远程运行 → 三模式同步 → WebUI」；同步范围由单向 push 扩展为 `push / pull / bidirectional` 三模式  
 > 修订：2026-09-14（Rev.3）— **本轮交付范围收窄为 Phase 0 / 1 / 2**；Phase 3（三模式同步）与 Phase 4（WebUI）暂缓，设计保留不删。新增 `transfer` 批量上传、`workspace-run` 的 `push`/`collect` phase 流水线。测试政策收紧为全真实执行、禁止 mock。  
-> 当前代码基线：`main@66ffc04`，工作树包含尚未提交的 v1.0.19 transfer/archive/fast/TDD 变更  
+> 修订：2026-09-15（Rev.4）— 反过度设计校正。P1-09（批量上传）解除对 P1-01/P1-02 的虚假依赖，提为 Phase 1 首个交付；P0-06（Controller daemon）取消；P0-05（`src/jobs/`）产物不入库。新增 §7.3 打包门禁。  
+> 当前代码基线：`main@1129ba7`（PLAN.MD 与 v1.0.19 transfer/archive/fast/TDD 变更已入库）  
 > 目标版本：`2.0.0`（现有 1.x MCP tool 与服务器配置尽量向后兼容）
 
 ## 0. 本轮交付范围（Rev.3）
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
-| Phase 0 | **本轮交付** | preflight、基线修复、SSH lab、契约、模块化、JobStore/EventBus、Controller daemon |
-| Phase 1 | **本轮交付** | TransferMetrics、路径身份基座、批量上传、checker/walker、striped、multi-channel relay、external engine、direct planner |
+| Phase 0 | **本轮交付** | preflight、基线修复、SSH lab、契约、模块化。~~JobStore/EventBus~~、~~Controller daemon~~ 见下方 Rev.4 取消说明 |
+| Phase 1 | **本轮交付** | **批量上传（先做，无依赖）**、TransferMetrics、路径身份基座、checker/walker、striped、multi-channel relay、external engine、direct planner |
 | Phase 2 | **本轮交付** | workspace-run：`push` → preflight → launching → remote-running → `collect` |
 | Phase 3 | 暂缓 | 三模式同步。设计（§5.6 决策表、schema、任务）全部保留，不在本轮实施 |
 | Phase 4 | 暂缓 | WebUI + Streamable HTTP MCP。设计保留，不在本轮实施 |
 | Phase 5 | 部分 | 本轮只做文档/打包/发布门中适用于已交付功能的部分 |
 
 暂缓不等于删除：Phase 3/4 的契约位（`sync=flush`、sync tools 名称、HTTP 路由）在 Phase 0 契约中**保留占位并明确返回未实现错误**，避免将来回填时推翻既有 schema。本轮任何任务都不得因为「同步以后会做」而留下半成品代码路径。
+
+### 0.1 Rev.4 反过度设计校正
+
+用户约束（原文）：「注意不要过度设计，以完成我的目标为目的，不要扩大修改大量的内容」。据此复核已完成与在建任务，实测结果：
+
+```
+src/contracts/  1564 行   唯一消费者是 src/jobs/
+src/jobs/       1396 行   无任何生产代码引用，未 git 跟踪
+```
+
+二者构成闭环：`src/index.ts` / `src/tools` / `src/services` / `src/core` 全都不 import 这两个目录。合计约 2,960 行服务于已暂缓的 Phase 3/4。处置：
+
+| 项 | 决定 | 理由 |
+|---|---|---|
+| **P0-06 Controller daemon** | **取消** | 只有 direct 传输（P1-08）与 WebUI 需要常驻进程。本轮目标不含常驻形态，不引入进程生命周期、IPC 与崩溃恢复这一整层 |
+| **P0-05 `src/jobs/`** | **产物不入库** | 当前为 untracked，不提交即零成本撤销，无需任何删除动作。JobStore/EventBus 服务于 WebUI 的任务流，本轮无消费者 |
+| **`src/contracts/`** | **保留，但停止扩展** | 已入库且 `validate-contracts.mjs` 门禁与其 4 个测试均为绿。删除它本身就是一次「大量修改」，恰好违反上述约束；停止在其上继续增建的收益与删除相同，风险为零 |
+| **9 个 dead transfer facade 方法** | **删除**（约 85 行） | 无调用方，且为 P0-04 提取时 private→public 放宽的残留 |
+| **P1-09 对 P1-01/P1-02 的依赖** | **解除** | 经复核该依赖不成立，见 P1-09 任务节 |
+
+净效果：实际改动约 85 行，而非约 2,000 行。判据是「停止新增」而不是「推倒重来」——后者同样是对约束的违反。
 
 ## 1. 计划目的
 
@@ -654,7 +676,8 @@ transfer:       [pack] → connect → transfer → verify → [extract] → cle
 ```text
 P0-00 → P0-01 ─┬→ P0-03 → P0-04 → P0-05 → P0-06
                 └→ P0-02 ────────────────────┘
-PHASE-0-GATE → P1-01 → P1-02 → P1-09 → P1-03 → P1-04 → P1-05 → P1-06 → P1-07 → P1-08
+PHASE-0-GATE → P1-09（无依赖，先做）
+PHASE-0-GATE → P1-01 → P1-02 → P1-03 → P1-04 → P1-05 → P1-06 → P1-07 → P1-08
 PHASE-1-GATE → P2-01 → P2-02 → P2-03 → P2-04 → P2-06 → P2-05
 PHASE-2-GATE → Phase 5（本轮）
 
@@ -663,7 +686,9 @@ PHASE-1-GATE → P3-01 → ... → P3-06 ； PHASE-2-GATE + P3-06 → P3-07
 PHASE-3-GATE → P4-01 → ... → P4-06
 ```
 
-本轮（Rev.3）关键路径为 `P0-00 → … → PHASE-0-GATE → P1-* → PHASE-1-GATE → P2-* → PHASE-2-GATE`。P1-09（批量上传）插在 P1-02 之后，因为它依赖路径身份基座；它与 P1-03 之后的性能任务无相互依赖，可并行。
+本轮（Rev.3）关键路径为 `P0-00 → … → PHASE-0-GATE → P1-* → PHASE-1-GATE → P2-* → PHASE-2-GATE`。
+
+Rev.4 修正：P1-09（批量上传）原先排在 P1-02 之后，理由是「依赖路径身份基座」。该理由经复核不成立（见 P1-09 任务节），依赖已移除。P1-09 现无任何前置依赖，是 Phase 1 中最先交付的任务，与其余 P1-* 全程可并行。
 
 - P0-02 fixture 可与 P0-03 contracts 并行，但 P0-04 之后的 service acceptance 同时依赖二者。
 - Phase 2（运行）与 P3-01..P3-06（同步）在 PHASE-1-GATE 之后可以由不同工作树并行，但不能同时修改共享 contracts/Controller；共享契约变更先单独合并并重跑 P0 gates。
@@ -776,9 +801,15 @@ P0-04 实施记录：
 
 - [ ] **PHASE-0-GATE**：**尚未达成**。四项条件中已满足三项：外部行为不变（特征化套件冻结并通过，`1e0a62f`/`9760990`）；真实 SSH lab 可重复运行（`6f07052`，`.88` 实测 A1 通过且清理干净）；契约 artifacts 完整（`7172793`，`validate-contracts` 真实 exit 0）。**第四项「持久 job 与 daemon 生命周期成立」仍缺**——P0-05（JobStore/EventBus）与 P0-06（Controller daemon 与 IPC）均未实施。Phase 1 不得在此之前开工。
 
-### P0-05 JobStore 与 EventBus
+### P0-05 JobStore 与 EventBus 〔Rev.4 取消：产物不入库〕
 
-- [ ] RED：真实 SQLite 文件重启后 job 和 event cursor 不可恢复。
+**状态：取消。** 实现已由子代理完成于工作树（`src/jobs/`，1,396 行 + 5 个测试文件），但**不提交**。当前为 untracked，不提交即零成本撤销，不需要任何删除动作。
+
+理由：JobStore/EventBus 的唯一消费者是 WebUI（Phase 4，已暂缓）与 Controller daemon（P0-06，已取消）。本轮无任何生产代码路径引用它——实测 `src/index.ts` / `src/tools` / `src/services` / `src/core` 全部不 import `src/jobs/`。批量上传、传输加速、远程运行三项本轮目标均不需要持久 job 状态。
+
+将来重启 Phase 4 时可从本 session 的工作树或 transcript 恢复该实现；在此之前它不构成需要维护的代码。下列原验收项一并冻结。
+
+- [ ] ~~RED：真实 SQLite 文件重启后 job 和 event cursor 不可恢复。~~
 - [ ] GREEN：实现 migration、JobStore、递增 event seq、查询和恢复。
 - [ ] RED：订阅者断开后不能从最后 seq 续传。
 - [ ] GREEN：EventBus 支持 live subscribe + persisted catch-up。
@@ -788,9 +819,15 @@ P0-04 实施记录：
 - [ ] **P0-05-A1**：关闭并重新打开真实磁盘 SQLite JobStore 后，运行中/已完成 job 可查询，event cursor 无重复、无缺口。
 - [ ] **P0-05-A2**：中断 migration 后 mutating API 被拒绝，只读诊断和 `database restore` 可恢复旧备份。
 
-### P0-06 Controller daemon 与 IPC
+### P0-06 Controller daemon 与 IPC 〔Rev.4 取消〕
 
-- [ ] RED：MCP adapter 退出后测试 SSH client和 durable sentinel job 全部消失。
+**状态：取消，未开工。**
+
+理由：常驻进程只有两个真实需求方——WebUI（Phase 4，已暂缓）与 P1-08 direct 传输的 marker/恢复语义。本轮目标（批量上传、传输加速、远程运行、两端直传）都不要求服务器在 MCP adapter 退出后继续存活。为此引入进程生命周期、单实例锁、IPC 协议、instanceId 命名空间与崩溃恢复是纯粹的前置投资。
+
+对 P1-08 的影响：direct 传输若需要跨调用的 marker 状态，改为在**远端文件系统**上落 marker（源端已有 shell 执行能力），不引入本机常驻进程。该取舍在 P1-08 开工前重新评估。
+
+- [ ] ~~RED：MCP adapter 退出后测试 SSH client和 durable sentinel job 全部消失。~~
 - [ ] GREEN：实现 daemon、单实例锁、IPC、adapter 自动连接。
 - [ ] RED：并发启动两个 daemon。
 - [ ] GREEN：只有一个成为 owner，另一个返回现有 daemon 状态。
@@ -800,7 +837,7 @@ P0-04 实施记录：
 - [ ] **P0-06-A1**：关闭 MCP adapter 后 daemon PID 仍在；重新启动 adapter 能查询之前的 sentinel job；执行 `daemon stop` 后 socket/pipe、锁和 SSH client 全部释放。
 - [ ] **P0-06-A2**：daemon auto 启动不向 MCP stdout 写任何非 JSON-RPC 字节；不同 instanceId adapter 无法连错 daemon。
 
-- [ ] **PHASE-0-GATE**：外部行为不变、真实 SSH lab 可重复运行、契约 artifacts 完整、持久 job 与 daemon 生命周期成立。
+- [ ] **PHASE-0-GATE**（Rev.4 收窄）：外部行为不变（characterization test 全绿）、真实 SSH lab 可重复运行、契约 artifacts 完整、打包门禁 `test:package` 通过。~~持久 job 与 daemon 生命周期成立~~——P0-05/P0-06 已取消，不再是 Phase 0 的出门条件。
 
 ## Phase 1：传输可观测性、加速与远端直传
 
@@ -911,7 +948,16 @@ P0-04 实施记录：
 
 ### P1-09 批量上传
 
-按 5.7 契约实现。依赖 P1-02 的路径身份基座；与 P1-03 之后的性能任务无相互依赖。
+按 5.7 契约实现。**无前置依赖，Phase 1 第一个做。**
+
+Rev.4 修正：本任务原先被排在 `P1-01 → P1-02 → P1-09`，即等 TransferMetrics 与路径身份基座（`src/fspath/`）完成。复核 5.7 契约后确认该依赖不成立——basename 冲突检测、数组内重复检测、长度上限全部只需 `path.basename` 与一个 `Set`，不需要 `src/fspath/`。依赖已移除。
+
+实现基线（调研 `transfer-service.ts` 后确定，禁止新建子系统）：
+
+- `uploadDirectory`（`transfer-service.ts:2322`）已经具备本任务所需的全部机制：收集文件清单 → `sftpMkdirMany` 在单条 channel 上批量建目录 → `runBoundedTransfers`（`:646`）以有界并发逐个调用 `this.upload()`。批量上传 = `uploadDirectory` 去掉目录遍历、换成显式数组。
+- 逐文件仍走现有 `upload()`（`:830`），因此 skip-if-identical、CRLF 修正、`fast`/`fastPut`、路径策略校验全部自动继承，不重写。
+- 连接复用已由 pool 的 client cache 提供：`upload()` 每次 `acquireSshClient` 拿到的是同一个缓存 SSH client，每文件只新开一条 SFTP channel。不需要为批量另做连接管理；但每文件一条 channel 会触碰 `MaxSessions`，并发上限必须沿用 `resolveRecursiveFileConcurrency`（`:627`）的既有帽子。
+- 唯一需要新写的是结果收集：`runBoundedTransfers` 是 fail-fast 且**抛出后丢失哪些文件已成功**的信息，而 5.7 要求两种 `onError` 模式都返回逐文件结果。新增一个返回 `Array<{status, reason}>` 的有界执行器（约 35 行），**不改动 `runBoundedTransfers` 本身**——`uploadDirectory` 依赖它的抛出语义。
 
 - [ ] `localPath` 扩展为 `string | string[]`；字符串入参行为与 1.x 逐字节一致，由 characterization test 冻结。
 - [ ] 数组入参要求 `remotePath` 为目录，每个源落到 `remotePath/<basename>`。
@@ -928,7 +974,7 @@ P0-04 实施记录：
 - [ ] **P1-09-A2**（灰盒）：注入第 7 个文件的真实失败（目标目录只读），`abort` 模式下后续文件未被调度、在飞文件已收尾、远端无半文件；`continue` 模式下其余 11 个成功且第 7 个被准确标记失败。
 - [ ] **P1-09-A3**（白盒）：basename 冲突检测、重复路径检测、长度上限为纯函数，穷举 value test；断言冲突检测在任何 SFTP 调用前完成（以真实 SFTP 调用计数为 0 证明）。
 
-- [ ] **PHASE-1-GATE**：能够解释实际选择的 strategy/engine；真实 direct 不经 Controller 数据面；release qualification 的单文件、relay 和碎文件数值门通过；批量上传三盒验收通过；`src/fspath/` 被 transfer 全量使用且无旁路。
+- [ ] **PHASE-1-GATE**：能够解释实际选择的 strategy/engine；真实 direct 不经 Controller 数据面；release qualification 的单文件、relay 和碎文件数值门通过；批量上传三盒验收通过（P1-09 独立于 `src/fspath/`，不得以 fspath 未完成为由阻塞）；`src/fspath/` 被 transfer 全量使用且无旁路。
 
 ## Phase 2：远程 workspace run
 
@@ -1318,7 +1364,7 @@ WebUI 使用 Vitest Browser/coverage-v8 覆盖纯组件和真实 DOM 行为；AP
   "bench:transfer:qualify": "node scripts/benchmark.mjs --profile release",
   "bench:transfer:full": "node scripts/benchmark.mjs --profile full",
   "test:security": "node scripts/security-gate.mjs",
-  "test:package": "node scripts/package-smoke.mjs",
+  "test:package": "node scripts/test-package.mjs",
   "test:release:local": "node scripts/release-gate.mjs --local",
   "test:release:verify-artifacts": "node scripts/release-gate.mjs --verify-artifacts",
   "test:release": "npm run test:release:local"
@@ -1331,6 +1377,10 @@ WebUI 使用 Vitest Browser/coverage-v8 覆盖纯组件和真实 DOM 行为；AP
 - `test-runner.mjs` 读取显式 suite manifest，不依赖 Windows shell glob。
 - `ssh-lab.mjs` 负责 Compose up、健康检查、执行和 finally cleanup；失败日志写 artifact。
 - `release-gate --local` 超时 45 分钟，运行当前平台 A gates、真实 SSH acceptance、coverage、security、Web E2E、package smoke 和 performance smoke；performance smoke 只查功能/明显退化，不给出吞吐 qualification 结论。
+- **`test:package` 已交付（`main@1129ba7`，`scripts/test-package.mjs`）**。真实 `npm pack` → 真实 `npm install <tarball>` 到仓库外的干净临时目录 → spawn 装好的 entry point → 真实 MCP handshake + `list-servers`。不入 `npm test`（pack + install 远慢于单测），显式调用。
+  它专门覆盖其余所有测试的盲区：它们全部直接跑 `build/`，因此看不见 `package.json` 的 `files` 白名单。已实测捕获两类真实回归，均由重新引入缺陷验证 RED、修复后 GREEN：
+  1. 编译产物未列入 `files`——P0-04 提取 `SshConnectionPool` 后 `build/connection/**` 未加入白名单，发布出去的包在第一次 tool 调用即崩溃（`f876cf1` 修复）。
+  2. `SERVER_CONFIG.version` 与 `package.json` 版本漂移——实际已漂移至 `1.0.17` vs `1.0.19`，即所有客户端握手拿到的版本号连续两个版本是错的（`1129ba7` 修复并加断言锁死）。
 - Windows/Linux CI matrix 分别运行 `test:release:local`，artifact manifest 包含 commit SHA、config fingerprint、runner image digest 和 SHA-256。
 - `bench:transfer:qualify` 只在 Linux netem runner 运行并覆盖所有数值性能门；最长 3 小时。
 - `bench:transfer:full` 为 nightly/manual 完整矩阵；不是每个 PR 或本地 release 的同步依赖。
@@ -1578,8 +1628,8 @@ P*-A* 是任务内验收标签，RT-* 是唯一 canonical 测试结果 ID；每�
 
 本轮（Rev.3）交付：
 
-- [ ] Phase 0：preflight、基线修复（Windows tar）、真实 SSH lab、契约、模块化、JobStore/EventBus、Controller daemon。
-- [ ] Phase 1：TransferMetrics、路径身份基座、批量上传、checker/walker、striped upload/download、multi-channel relay、external engines、direct planner。
+- [ ] Phase 0：preflight、基线修复（Windows tar）、真实 SSH lab、契约、模块化、打包门禁。~~JobStore/EventBus、Controller daemon~~（Rev.4 取消，见 §0.1）。
+- [ ] Phase 1：**批量上传（首个交付，无依赖）**、TransferMetrics、路径身份基座、checker/walker、striped upload/download、multi-channel relay、external engines、direct planner。
 - [ ] Phase 2：workspace-run 全流水线 `push → preflight → launching → remote-running → collect`、持久 runner、logs/cancel/retry。
 - [ ] Phase 5（部分）：已交付功能的文档、打包、跨平台 smoke、经授权发布。
 
