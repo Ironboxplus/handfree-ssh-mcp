@@ -131,7 +131,47 @@ export function evaluateBandwidthUtilisation({ bytesPerSec, shapedBitsPerSec, rt
   };
 }
 
+/**
+ * Pure. The `--sweep` grid.
+ *
+ * Question it answers: is `fast` limited by how many SFTP requests it keeps
+ * outstanding (tunable via sftpConcurrency x chunkSize), or by the SSH
+ * CHANNEL's own flow-control window, which ssh2 hardcodes at
+ * MAX_WINDOW = 2 MiB with a 1 MiB refill threshold (lib/Channel.js) and does
+ * not expose as an option?
+ *
+ * The two hypotheses make opposite predictions, which is what makes this
+ * worth running: if SFTP depth is the limit, throughput rises with
+ * concurrency x chunkSize. If the channel window is the limit, throughput is
+ * FLAT across the whole grid no matter how much more is requested, because
+ * the peer may not send beyond the window regardless of how many SFTP reads
+ * are queued.
+ *
+ * `connections` > 1 runs that many INDEPENDENT SSH connections concurrently,
+ * each with its own channel window, and reports aggregate throughput. That is
+ * the one thing the grid cannot do within a single connection, and it is
+ * exactly the multi-CONNECTION design PLAN.MD originally specified before the
+ * implementation substituted multi-channel.
+ */
+export function buildSweepGrid() {
+  return [
+    { label: "c16 x 32KiB", sftpConcurrency: 16, chunkSize: 32 * 1024, connections: 1 },
+    { label: "c64 x 32KiB (ssh2 default)", sftpConcurrency: 64, chunkSize: 32 * 1024, connections: 1 },
+    { label: "c64 x 128KiB", sftpConcurrency: 64, chunkSize: 128 * 1024, connections: 1 },
+    { label: "c64 x 512KiB", sftpConcurrency: 64, chunkSize: 512 * 1024, connections: 1 },
+    { label: "c256 x 128KiB", sftpConcurrency: 256, chunkSize: 128 * 1024, connections: 1 },
+    { label: "c64 x 32KiB x 2 CONNECTIONS", sftpConcurrency: 64, chunkSize: 32 * 1024, connections: 2 },
+    { label: "c64 x 32KiB x 4 CONNECTIONS", sftpConcurrency: 64, chunkSize: 32 * 1024, connections: 4 },
+  ];
+}
+
 const PROFILES = {
+  sweep: {
+    name: "sweep",
+    fileBytes: 128 * 1024 * 1024,
+    warmups: 1,
+    runs: 3,
+  },
   smoke: {
     name: "smoke",
     fileBytes: 32 * 1024 * 1024,
@@ -575,21 +615,86 @@ async function main() {
     log(`payload ready, source SHA-256 ${expectedSha256}`);
 
     const serverName = "bench-source";
+    const baseServerConfig = {
+      host: config.host,
+      port: lab.ports.source,
+      username: "labuser",
+      privateKey: keypair.privateKeyPath,
+      disableSftpPathPolicy: true,
+    };
     manager.setConfig(
-      {
-        [serverName]: {
-          host: config.host,
-          port: lab.ports.source,
-          username: "labuser",
-          privateKey: keypair.privateKeyPath,
-          disableSftpPathPolicy: true,
-        },
-      },
+      { [serverName]: baseServerConfig },
       [serverName],
     );
     log("waiting for the container to complete a real SSH handshake");
     await waitForSshReady(config.host, lab.ports.source, "labuser", keypair.privateKeyPath, 60000, log);
     const transferService = manager.getTransferService();
+
+    if (profile.name === "sweep") {
+      const grid = buildSweepGrid();
+      log(`sweep: ${grid.length} points x (${profile.warmups} warm-up + ${profile.runs} runs) of ${profile.fileBytes} bytes`);
+      const rows = [];
+      for (const point of grid) {
+        // Each "connection" is a SEPARATE configured server pointing at the
+        // same container, so reuseConnection caches one real SSH client per
+        // name -- genuinely independent TCP connections and channel windows,
+        // not N channels on one connection (which is what was removed).
+        const names = [];
+        const config = {};
+        for (let i = 0; i < point.connections; i += 1) {
+          const n = `${serverName}-conn${i}`;
+          names.push(n);
+          config[n] = { ...baseServerConfig };
+        }
+        manager.setConfig(config, names);
+        const svc = manager.getTransferService();
+        const opts = { fast: true, reuseConnection: true, timeout: 1_800_000, sftpConcurrency: point.sftpConcurrency, chunkSize: point.chunkSize };
+
+        const runOnce = async () => {
+          const started = process.hrtime.bigint();
+          await Promise.all(names.map(async (n, i) => {
+            const local = path.join(scratchDir, `sweep-${i}.bin`);
+            if (fs.existsSync(local)) fs.rmSync(local);
+            await svc.download(remotePath, local, n, opts);
+            if (sha256File(local) !== expectedSha256) throw new Error(`${point.label}: SHA-256 mismatch on connection ${i}`);
+            fs.rmSync(local);
+          }));
+          // Aggregate: every connection pulled the whole payload, so the
+          // bytes moved are fileBytes x connections.
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+
+        for (let i = 0; i < profile.warmups; i += 1) await runOnce();
+        const samples = [];
+        for (let i = 0; i < profile.runs; i += 1) samples.push(await runOnce());
+        const totalBytes = profile.fileBytes * point.connections;
+        const aggregate = throughput(totalBytes, median(samples));
+        const perConn = aggregate / point.connections;
+        rows.push({ ...point, samples, aggregateBytesPerSec: aggregate, perConnectionBytesPerSec: perConn });
+        log(
+          `  ${point.label.padEnd(30)} aggregate ${(aggregate / (1024 * 1024)).toFixed(2)} MiB/s` +
+            (point.connections > 1 ? ` (${(perConn / (1024 * 1024)).toFixed(2)} MiB/s per connection)` : ""),
+        );
+        manager.disconnect();
+      }
+      modes = rows.map((r) => ({
+        name: r.label, streams: r.connections, samples: r.samples, hashMatched: true,
+        medianElapsedMs: median(r.samples), medianBytesPerSec: r.aggregateBytesPerSec,
+        coefficientOfVariation: coefficientOfVariation(r.samples),
+      }));
+      utilisation = evaluateBandwidthUtilisation({
+        bytesPerSec: Math.max(...rows.map((r) => r.aggregateBytesPerSec)),
+        shapedBitsPerSec: profile.shaping ? SHAPED_BITS_PER_SEC : 0,
+        // The SHAPED delay, not measuredRttMs. measuredRttMs is a TCP-connect
+      // time, and in SSH_LAB_MODE=local it is sub-millisecond (the handshake
+      // does not traverse the shaped egress path the bulk data does), which
+      // made impliedInFlightBytes/bdpBytes come out ~100x too small and
+      // therefore meaningless. measuredRttMs stays in the artifact as
+      // context, but the in-flight arithmetic uses the delay actually applied.
+      rttMs: profile.shaping ? NETEM_DELAY_MS : (measuredRttMs ?? 0),
+      });
+      log(`sweep best aggregate = ${(utilisation.impliedInFlightBytes / (1024 * 1024)).toFixed(2)} MiB in flight vs BDP ${(utilisation.bdpBytes / (1024 * 1024)).toFixed(2)} MiB`);
+    } else {
 
     // One mode: the shipping `fast` path. Striped was removed from the
     // product (see the module doc comment), so there is no longer a second
@@ -631,7 +736,13 @@ async function main() {
     utilisation = evaluateBandwidthUtilisation({
       bytesPerSec: fast.medianBytesPerSec,
       shapedBitsPerSec: profile.shaping ? SHAPED_BITS_PER_SEC : 0,
-      rttMs: measuredRttMs ?? NETEM_DELAY_MS,
+      // The SHAPED delay, not measuredRttMs. measuredRttMs is a TCP-connect
+      // time, and in SSH_LAB_MODE=local it is sub-millisecond (the handshake
+      // does not traverse the shaped egress path the bulk data does), which
+      // made impliedInFlightBytes/bdpBytes come out ~100x too small and
+      // therefore meaningless. measuredRttMs stays in the artifact as
+      // context, but the in-flight arithmetic uses the delay actually applied.
+      rttMs: profile.shaping ? NETEM_DELAY_MS : (measuredRttMs ?? 0),
     });
     log(
       `fast: median ${(fast.medianBytesPerSec / (1024 * 1024)).toFixed(2)} MiB/s` +
@@ -640,6 +751,7 @@ async function main() {
             `${(utilisation.impliedInFlightBytes / (1024 * 1024)).toFixed(2)} MiB vs BDP ${(utilisation.bdpBytes / (1024 * 1024)).toFixed(2)} MiB`
           : " (UNSHAPED control run -- not comparable to a shaped result)"),
     );
+    }
   } catch (error) {
     // Mirrors scripts/ssh-lab.mjs's classification: a lab that never came up
     // is an INFRASTRUCTURE_ERROR (exit 3), not an implementation failure.

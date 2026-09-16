@@ -995,8 +995,36 @@ PLAN 正文 §2 要的是「多连接单文件分片」，`PLAN.MD:81` 甚至专
 
 - **删除 striped**（用户决定，2026-09-16）：`downloadStriped`/`runStripedReadWorkers`/`computeDownloadStripeRanges`/`writeLocalPositional` 及 4 个 stripe 常量、`download`/`transfer` 的 `striped`/`stripeCount`/`maxBufferBytes` 参数、相关测试与文档一并移除。这是**移除一个已发布的工具参数**，属于面向用户的破坏性变更，必须在 release notes 写明；由于它从未带来加速（反而是倒退），保留它才是持续的伤害。
 - **P1-05（capability-gated striped upload）同理作废**：它是 striped download 的上传镜像，前提同样不成立。
-- **真正的加速杠杆记在账上（未做，不得默认已做）**：`fast` 只用到 2 MiB 在途，而 50 ms/1 Gbps 的 BDP 是 6.25 MB。把 `sftpConcurrency` × `chunkSize` 提上去是直接对着 BDP 打的一个参数级改动（旋钮已存在并已透传到工具参数），benchmark harness 也已具备扫参数能力。本轮未做，因为用户的交付范围是"只保留 fast"。
+- **真正的加速杠杆（已用真机扫参数定位，2026-09-16）**：见下方「P1-04c 参数扫描结果」。**先前写在这里的猜测（"把 `sftpConcurrency` × `chunkSize` 提上去"）已被实测否定**，保留这句话的修订痕迹是为了记住：未经测量的杠杆假设和未经测量的加速声明一样不可信。
 - **harness 保留**（`scripts/benchmark.mjs`、compose 的 `cap_add: NET_ADMIN`、`SSH_LAB_MODE=local`、`src/tests/benchmark-stats.test.ts`）：它是上述全部结论的证据来源，也是将来调参的唯一可信入口。
+
+### P1-04c 参数扫描结果（2026-09-16，真机 netem）：瓶颈是 ssh2 的 channel window，多连接才是解
+
+`npm run bench:transfer:sweep`（`scripts/benchmark.mjs --profile sweep`），128 MiB，50 ms/1 Gbps 整形，1 warm-up + 3 runs 取 median，每次都校验 SHA-256：
+
+| 配置 | 聚合吞吐 |
+|---|---|
+| c16 × 32 KiB | 8.68 MiB/s |
+| **c64 × 32 KiB（ssh2 默认）** | **17.89 MiB/s** |
+| c64 × 128 KiB | 17.42 MiB/s |
+| c64 × 512 KiB | 17.84 MiB/s |
+| c256 × 128 KiB | 17.43 MiB/s |
+| c64 × 32 KiB × **2 连接** | **33.21** MiB/s（每连接 16.61） |
+| c64 × 32 KiB × **4 连接** | **59.93** MiB/s（每连接 14.98） |
+
+**单连接从 c64 起完全平坦**：chunkSize 放大 16 倍（32 KiB→512 KiB）、concurrency 放大 4 倍（64→256），吞吐纹丝不动。c16 低于平台是因为 16 × 32 KiB = 512 KiB 还没顶到天花板，说明这条曲线确实测到了拐点，不是"怎么调都一样"的无效实验。
+
+**天花板的位置有代码依据**：ssh2 把 SSH channel 的流控窗口写死在 `node_modules/ssh2/lib/Channel.js:15` —— `MAX_WINDOW = 2 MiB`，`WINDOW_THRESHOLD = 1 MiB`，且**不通过任何 Client 选项暴露**。对端在窗口耗尽前最多只能发 2 MiB，落到 1 MiB 时才补窗。50 ms RTT 下 1–2 MiB 在途 ⇒ 20–40 MiB/s，实测 17.9 落在区间内。SFTP 层排再多请求也没用：**窗口不是 SFTP 的，是 channel 的**。
+
+**多连接近线性**：2 连接 1.86×，4 连接 3.35×，每连接吞吐基本不掉 —— 证明这个上限是**每连接**的，且链路本身远未饱和（4 连接 59.93 MiB/s ≈ 线速 50%，而单连接只有 15%）。
+
+**这恰好证明 PLAN 正文最初的设计是对的、被实现改坏了**：§2 与 `PLAN.MD:81` 要的是「多**连接**分片」，验收条目写成「channel 或 connection」，实现选了 channel —— 而 channel 恰恰是那个共享窗口、什么都换不来的选项。删掉 striped 删的是错误实现，不是错误想法。
+
+**测量口径的诚实说明**：多连接那两行是 **N 条连接各自完整下载同一个文件**、取聚合吞吐，不是单文件分片下载。二者的算术等价（单文件分片下每连接取 1/N，总时间 = fileBytes /(N × 每连接速率)），所以可以作为投影；但它**尚未**验证单文件分片下的区间拼接、乱序落盘与校验在多连接下仍然正确 —— 那部分正确性此前由已删除的 P1-04a 覆盖，若要重做多连接分片必须重新建立。
+
+**顺带修掉的报告缺陷**：`impliedInFlightBytes`/`bdpBytes` 原本用 `measuredRttMs`（TCP connect 时间）计算，而 local 模式下握手不走被整形的 egress 路径，该值是亚毫秒级，导致这两个数字小了约两个数量级（日志里出现过 "0.01 MiB in flight vs BDP 0.03 MiB"）。已改为在整形开启时用实际施加的 delay 计算，`measuredRttMs` 仅作为上下文保留在 artifact 里。吞吐数字本身不受影响（不依赖 RTT）。
+
+**处置：未做，等决策。** 把 striped 按原意重做成多连接是一个真实可得的 ~3.4× 加速，但它是重新引入一个刚删掉的特性，范围远超本轮「只保留 fast」的交付边界，不自行开工。
 
 ### P1-05 Capability-gated striped upload 〔2026-09-16 作废〕
 
