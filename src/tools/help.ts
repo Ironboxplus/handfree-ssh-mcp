@@ -296,12 +296,28 @@ state (meta.json/stdout.log/stderr.log/pid/heartbeat/exit.json) lives under
 local cache of run state — status/logs/cancel require the remote server to
 be reachable.
 
-This delivery round implements the LAUNCH phase only (PLAN.MD Phase 2):
-  • push must be false. Omitting it (true default) or passing true returns
-    PUSH_NOT_AVAILABLE — the push phase is not implemented yet; the code
-    must already exist under the profile's remoteRoot.
-  • collect must be empty/omitted. A non-empty array returns
-    COLLECT_NOT_AVAILABLE — use download/transfer for artifacts instead.
+Full pipeline this round (PLAN.MD Phase 2): [push] → preflight → launching →
+remote-running → [collect].
+  • push (default true, or the profile's defaultPush) uploads
+    runProfiles.<name>.push.paths to remoteRoot before launch — batch upload
+    for individual files, recursive upload for directories, both
+    skip-if-identical. Requires push.paths to be configured on the profile
+    (otherwise INVALID_CONFIGURATION). Pass push:false to skip it and use
+    code already present under remoteRoot.
+  • collect (default the profile's collect.paths) pulls artifacts back by
+    explicit glob (relative to remoteRoot) after the run finishes, into
+    runProfiles.<name>.collect.localDir — never defaults to pulling the
+    whole remoteRoot. Requesting collect (non-empty, by default or
+    explicitly) makes this call BLOCK, bounded by timeout, until the run
+    reaches a terminal state, then collects; a plain launch (no collect)
+    still returns immediately once the process is confirmed started, exactly
+    as before. Pass collect:[] to disable collect for this call. Enforces a
+    total byte cap and file-count cap (profile collect.maxBytes/maxFiles) —
+    exceeding either fails the collect phase and reports what was already
+    pulled, no silent truncation. Collect still runs by default even if the
+    run failed or was cancelled (logs/partial artifacts are diagnostic
+    material); a collect failure never rewrites the run's own exit code —
+    it is reported separately in details.collect.
   • sync only accepts "none"/omitted; "flush" returns SYNC_NOT_AVAILABLE
     (Phase 3).
   • Only environment.type venv/executable profiles are supported;
@@ -321,17 +337,26 @@ Parameters:
                   otherwise ENV_KEY_NOT_ALLOWED.
   server          (string, optional)   Defaults to the profile's configured
                   server.
-  push            (boolean, optional)  Must be false. See above.
-  collect         (string[], optional) Must be empty/omitted. See above.
+  push            (boolean, optional)  Default true (or profile defaultPush).
+                  See above.
+  collect         (string[], optional) Default the profile's collect.paths.
+                  See above.
   sync            (string, optional)   "none" (default) or "flush" (rejected
                   with SYNC_NOT_AVAILABLE).
+  timeout         (number, optional)   Only meaningful when collect actually
+                  runs: ms to wait for a terminal state before giving up on
+                  collect. Default the profile's timeout, else 600000 (10m).
 
 Returns: { ok, jobId, state, message, next, details } — jobId equals the
 returned runId. details.status is the same shape run-status returns.
+details.collect (when collect ran) is { status, reason?, files, totalBytes }.
 
 Example:
   workspace-run { profile: "qwen-dev", entrypoint: "train.py",
-                  args: ["--epochs", "3"], push: false }`,
+                  args: ["--epochs", "3"] }
+  workspace-run { profile: "qwen-dev", entrypoint: "train.py", push: false }
+  workspace-run { profile: "qwen-dev", entrypoint: "train.py",
+                  collect: ["outputs/*.json"], timeout: 1800000 }`,
 
   "run-status": `run-status — Query a workspace-run's current status by runId.
 
@@ -438,6 +463,37 @@ Example:
   run-cancel { runId: "run_20260915T120000Z_ab12cd34" }
   run-cancel { runId: "run_20260915T120000Z_ab12cd34", graceMs: 10000 }`,
 
+  "run-retry": `run-retry — Launch a fresh run from an earlier run's stored config snapshot.
+
+Reads the ORIGINAL run's own recorded non-secret config snapshot (profile,
+entrypoint, args, env, push/collect settings) rather than the live
+runProfiles config, so a config hot-reload or a since-deleted profile cannot
+change what actually gets retried. Creates a brand-new runId recording
+parentRunId; the original run is untouched and still independently
+queryable. Requires the original run to have been launched by a build that
+recorded a config snapshot — RETRY_SNAPSHOT_UNAVAILABLE otherwise. Returns
+SECRET_REQUIRED if the snapshot declares secretEnv (not re-resolvable this
+delivery round).
+
+Parameters:
+  runId           (string, required)   runId of the run to retry.
+  connectionName  (string, see below)  Server the original run was launched
+                  on.
+  push            (boolean, optional)  Default the snapshot's own default
+                  (profile defaultPush, or true — re-pushes). Pass false to
+                  reuse code already on remoteRoot.
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Returns: { ok, jobId, state, message, next, details } — jobId is the NEW
+runId. details.parentRunId is the original runId.
+
+Example:
+  run-retry { runId: "run_20260915T120000Z_ab12cd34" }
+  run-retry { runId: "run_20260915T120000Z_ab12cd34", push: false }`,
+
   "help": `help — Show detailed usage for one or all tools.
 
 Parameters:
@@ -459,11 +515,12 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   upload            Upload a single file, or a batch of files, to a remote server.
   download          Download a single file from a remote server.
   transfer          Move files: single, recursive, batch upload, or cross-server relay.
-  workspace-run     Launch an entrypoint on a remote server under a runProfiles.<name> entry (launch only in this delivery round).
+  workspace-run     Launch an entrypoint on a remote server under a runProfiles.<name> entry ([push] -> preflight -> launching -> remote-running -> [collect]).
   run-status        Query a workspace-run's current status by runId.
   run-logs          Read a byte-offset window of a run's stdout/stderr.
   run-list          List runs on a server, newest first.
   run-cancel        Cancel a run (TERM, then KILL after graceMs; identity-verified).
+  run-retry         Launch a fresh run from an earlier run's stored config snapshot.
   help              Show this help or detailed per-tool usage.
 
 Quick start:

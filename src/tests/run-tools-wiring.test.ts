@@ -147,25 +147,31 @@ describe("P2-05 black-box: workspace-run / run-status / run-logs / run-list / ru
       assert.equal(body.error.code, "ENV_KEY_NOT_ALLOWED");
     });
 
-    test("push omitted (defaults true) -> PUSH_NOT_AVAILABLE", async () => {
+    // PLAN.MD P2-02/P2-06 (this round): push and collect are now real
+    // phases. 'good-venv' declares neither push.paths nor collect.localDir,
+    // so requesting either without configuring it is a config error --
+    // caught before any remote I/O, same as every other case in this
+    // describe block (superseding the old, this-round-only
+    // PUSH_NOT_AVAILABLE/COLLECT_NOT_AVAILABLE placeholders).
+    test("push omitted (defaults true) but profile has no push.paths -> INVALID_CONFIGURATION", async () => {
       const result = await mcpClient.callTool({ name: "workspace-run", arguments: { profile: "good-venv", entrypoint: "train.py" } });
       const body = responseJson(result);
-      assert.equal(body.error.code, "PUSH_NOT_AVAILABLE");
+      assert.equal(body.error.code, "INVALID_CONFIGURATION");
     });
 
-    test("push:true explicit -> PUSH_NOT_AVAILABLE", async () => {
+    test("push:true explicit but profile has no push.paths -> INVALID_CONFIGURATION", async () => {
       const result = await mcpClient.callTool({ name: "workspace-run", arguments: { profile: "good-venv", entrypoint: "train.py", push: true } });
       const body = responseJson(result);
-      assert.equal(body.error.code, "PUSH_NOT_AVAILABLE");
+      assert.equal(body.error.code, "INVALID_CONFIGURATION");
     });
 
-    test("non-empty collect -> COLLECT_NOT_AVAILABLE", async () => {
+    test("non-empty collect but profile has no collect.localDir -> INVALID_CONFIGURATION", async () => {
       const result = await mcpClient.callTool({
         name: "workspace-run",
         arguments: { profile: "good-venv", entrypoint: "train.py", push: false, collect: ["out/*.txt"] },
       });
       const body = responseJson(result);
-      assert.equal(body.error.code, "COLLECT_NOT_AVAILABLE");
+      assert.equal(body.error.code, "INVALID_CONFIGURATION");
     });
 
     test("sync:'flush' -> SYNC_NOT_AVAILABLE", async () => {

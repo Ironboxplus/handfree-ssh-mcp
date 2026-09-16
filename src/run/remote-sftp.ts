@@ -133,7 +133,21 @@ export async function readRemoteByteRange(
 export interface RemoteDirEntry {
   filename: string;
   isDirectory: boolean;
+  /** PLAN.MD P2-06: collect must never traverse or download through a
+   * symlink (the simplest sufficient rule that makes "symlink pointing
+   * outside remoteRoot" structurally unreachable -- see
+   * src/run/collect-glob.ts). SFTP READDIR attrs are lstat-based (the real
+   * server test fixture builds them via `fs.lstatSync`), so a symlink entry
+   * here has neither the regular-file nor the directory bit set; computed
+   * from the raw mode's S_IFMT nibble rather than trusted from the SFTP
+   * library's own type field so this stays correct against any spec-
+   * conformant sftp-server. */
+  isSymlink: boolean;
 }
+
+const S_IFMT = 0o170000;
+const S_IFLNK = 0o120000;
+const S_IFDIR = 0o040000;
 
 /** Lists a remote directory. Returns an empty array if it does not exist
  * (e.g. no runs have ever been launched for this server yet). */
@@ -146,8 +160,31 @@ export async function listRemoteDirectory(serverName: string | undefined, absolu
       }
       resolve(list.map((entry) => ({
         filename: entry.filename,
-        isDirectory: (entry.attrs.mode & 0o40000) !== 0,
+        isDirectory: (entry.attrs.mode & S_IFDIR) !== 0,
+        isSymlink: (entry.attrs.mode & S_IFMT) === S_IFLNK,
       })));
+    });
+  }));
+}
+
+export interface RemoteFileStat {
+  size: number;
+  isFile: boolean;
+}
+
+/** Stats a remote path (follows symlinks, like `stat(2)`, NOT `lstat(2)` --
+ * callers that must not follow symlinks use listRemoteDirectory's
+ * lstat-based `isSymlink` instead, before ever calling this). Returns null
+ * if the path does not exist. Used by the push phase (entrypoint revision)
+ * and the collect phase (byte-cap accounting before downloading). */
+export async function statRemoteFile(serverName: string | undefined, absolutePath: string): Promise<RemoteFileStat | null> {
+  return withSftp(serverName, (sftp) => new Promise<RemoteFileStat | null>((resolve, reject) => {
+    sftp.stat(absolutePath, (err, stats) => {
+      if (err) {
+        if (isMissingFileError(err)) return resolve(null);
+        return reject(err);
+      }
+      resolve({ size: stats.size, isFile: (stats.mode & S_IFMT) !== S_IFDIR });
     });
   }));
 }

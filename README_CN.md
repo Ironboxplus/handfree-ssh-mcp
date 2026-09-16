@@ -27,11 +27,12 @@ handfree-ssh-mcp 使 AI 助手能够通过标准化的 MCP 接口执行远程 SS
 | download | 从远程服务器下载文件；支持 `striped` 多通道分片下载（见下方"多通道分片下载"） |
 | transfer | 上传、下载或在两台远端服务器之间 relay；支持碎文件并发、批量上传（`localPath` 数组）、临时 tar 打包、可选压缩、多通道分片下载和分块预取 |
 | list-servers | 列出所有可用的 SSH 服务器配置 |
-| workspace-run | 在配置好的 `runProfiles.<name>` 下，于远端服务器启动一个入口程序，持久运行：所有状态都写在远端文件系统（不落本机），可扛住 SSH 断线与 MCP adapter 重启。**本轮交付只实现 launch 阶段**（见下方"workspace-run（远程运行，仅 launch 阶段）"） |
+| workspace-run | 在配置好的 `runProfiles.<name>` 下，于远端服务器启动一个入口程序：`[push] → preflight → launching → remote-running → [collect]`。持久运行：所有状态都写在远端文件系统（不落本机），可扛住 SSH 断线与 MCP adapter 重启。详见下方"workspace-run（远程运行）" |
 | run-status | 按 `runId` 查询 `workspace-run` 运行状态（每次都经 SFTP 读远端状态目录，无本机缓存） |
 | run-logs | 按字节偏移读取运行的 stdout/stderr，跨多次调用正确处理被截断在窗口边界上的多字节 UTF-8 字符 |
 | run-list | 列出某服务器上的运行记录，按时间倒序 |
 | run-cancel | 取消一次运行：先向进程组发 TERM，等待 `graceMs` 后仍存活则发 KILL；信号前会重新核对进程身份 |
+| run-retry | 用某次运行自己保存的（非秘密）配置快照重新发起一次新运行，而不是读当前实时配置；记录 `parentRunId` |
 
 ## 📚 使用方法
 
@@ -168,25 +169,27 @@ servers:
 
 `download` 与 `transfer mode=download` 支持 `striped: true`（默认 `false`，不开启时单文件下载行为与之前完全一致）：将同一个远程文件切分为 `stripeCount`（默认 4，上限 8，与 `fileConcurrency` 相同的 OpenSSH `MaxSessions` 余量考量）个不重叠的字节区间，每个区间各自使用独立的 SFTP channel 并发拉取，通过定位写（positional write）直接写入本地预分配的 temp 文件，各区间完成顺序互不影响。`chunkSize`（默认 262144 字节）限制单个区间一次读入内存的字节数，`maxBufferBytes`（默认 64 MiB）硬性限制 `stripeCount * chunkSize`，即任意时刻 MCP 进程内存中缓冲的数据总量上限——大文件不会被整个装入内存。全部区间写完后先校验本地 temp 文件大小（远端暴露 `md5sum` 时还会尽力校验 MD5），通过后才原子 rename 到目标路径；任一分片失败或校验失败都会删除 temp 文件，从不触碰最终目标路径。同时设置 `fast` 时 `striped` 优先生效。该开关只改变字节的搬运方式，不改变工具的返回内容。
 
-### 🏃 workspace-run（远程运行，仅 launch 阶段）
+### 🏃 workspace-run（远程运行）
 
 在 YAML 中声明 `runProfiles.<name>`（`server`、`remoteRoot`、`environment.type: venv|executable`、`allowedEntrypoints`、`env` 白名单等）后即可用 `workspace-run` 启动。远端 wrapper 用 `setsid` 使目标进程脱离本次 SSH 会话、拥有独立进程组，并把 `meta.json`/`stdout.log`/`stderr.log`/`pid`/`heartbeat`/`exit.json` 原子写入 `~/.handfree-runs/<runId>/`——**没有本机 JobStore、没有常驻 daemon**，MCP adapter 重启不会丢任何东西，因为它本来就没持有任何权威状态；代价是查询状态/日志/取消都需要能连上远端，没有离线缓存视图。
 
+完整流水线为 `[push] → preflight → launching → remote-running → [collect]`：
+
 ```json
-{ "tool": "workspace-run", "params": { "profile": "qwen-dev", "entrypoint": "train.py", "push": false } }
+{ "tool": "workspace-run", "params": { "profile": "qwen-dev", "entrypoint": "train.py" } }
 { "tool": "run-status", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
 { "tool": "run-cancel", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
+{ "tool": "run-retry", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
 ```
 
-**本轮明确未实现**（均返回明确的 `*_NOT_AVAILABLE` 错误，不会被静默忽略）：
-
-- `push`（预推送阶段，P2-02）：必须显式传 `false`，代码需已存在于 `remoteRoot`；省略（默认 true）或传 `true` 返回 `PUSH_NOT_AVAILABLE`。
-- `collect`（跑完拉回产物，P2-06）：必须为空/省略，请改用 `download`/`transfer`；非空数组返回 `COLLECT_NOT_AVAILABLE`。
-- `sync: "flush"`（Phase 3 的常驻同步屏障）：只支持 `"none"`/省略；`"flush"` 返回 `SYNC_NOT_AVAILABLE`。
-- `run-retry`：本轮完全未实现。
+- **`push`**（默认 `true`，或 profile 的 `defaultPush`）：启动前把 `runProfiles.<name>.push.paths` 声明的本地文件/目录上传到 `remoteRoot`，复用与 `upload`/`transfer` 相同的批量/递归上传逻辑，默认 skip-if-identical——未变化的文件不会重传。必须配置 `push.paths`，否则在触网前即返回 `INVALID_CONFIGURATION`；传 `push: false` 可跳过并使用 `remoteRoot` 上已有的代码。push 失败绝不会进入 launching 阶段，错误信息会指明失败的文件/目录与所处阶段。push 完成（或跳过）后会对远端 entrypoint 做 stat + 内容哈希，连同一份已推送文件清单的摘要一起记为该次运行的 `revision`，事后可据此判断跑的到底是哪一版代码。
+- **`collect`**（默认取 profile 的 `collect.paths`）：运行结束后按显式 glob（相对 `remoteRoot`）把产物拉回本地的 `runProfiles.<name>.collect.localDir`——**绝不会**默认拉取整个 `remoteRoot`。只要 `collect.paths`/调用参数非空，就必须配置 `collect.localDir`。只要实际请求了 collect（无论来自 profile 默认值还是显式参数），`workspace-run` 调用就会**阻塞**（受 `timeout` 限制，默认取 profile 的 `timeout` 或 10 分钟）直到运行进入终态后再执行 collect；不请求 collect 的普通启动行为不变，进程确认起来后立即返回。有总字节上限和文件数上限（`collect.maxBytes`/`collect.maxFiles`），超限会让 collect 阶段失败并报告已经拉取的清单——绝不静默截断。即便运行失败或被取消，collect 默认仍会执行（日志与部分产物往往正是诊断材料）；collect 失败绝不会改写运行本身的 exit code，会在 `details.collect` 中单独呈现。传 `collect: []` 可对某次调用禁用 collect。glob 匹配会拒绝 `..`、绝对路径，且从不穿过符号链接。
+- `sync: "flush"`（Phase 3 的常驻同步屏障，本轮未实现）：只支持 `"none"`/省略；`"flush"` 返回 `SYNC_NOT_AVAILABLE`。
 - `environment.type: conda | module | slurm`、`gpu.required`、`secretEnv`：配置可以解析成功，但启动时会分别返回 `ENVIRONMENT_ADAPTER_NOT_AVAILABLE` / `GPU_VALIDATION_NOT_AVAILABLE` / `SECRET_ENV_NOT_AVAILABLE`。仅 `environment.type: venv`（直接调用 `<path>/bin/python`，不依赖 `source activate`）与 `executable` 可用。
 
 `run-cancel` 会向整个远端进程组发 `TERM`，等待 `graceMs`（默认 5000ms）后仍存活再发 `KILL`；发信号前会重新核对远端 boot id、pid、pgid、`/proc` 启动 tick 以及从存活进程自身环境变量中读回的 wrapper token，任一不匹配（PID 复用、主机重启）都会转入 `orphaned` 而不是冒险向可能已被复用的 PID 发信号。
+
+`run-retry` 会读取**某次运行自己保存的配置快照**（从其 `meta.json` 经 SFTP 读回），而不是当前实时的 `runProfiles` 配置——因此配置热重载或 profile 被删除都不会改变一次重试实际执行的内容。它会拿到全新的 `runId` 并记录 `parentRunId`；原来那次运行不受影响、仍可独立查询。对一次在本功能上线之前发起的运行调用 `run-retry` 会返回 `RETRY_SNAPSHOT_UNAVAILABLE`；若快照声明了 `secretEnv`（本轮无法重新解析）则返回 `SECRET_REQUIRED`。
 
 ## 🛡️ 安全注意事项
 

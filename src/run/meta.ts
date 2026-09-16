@@ -21,6 +21,23 @@ export const processIdentitySchema = z.object({
 });
 export type ProcessIdentity = z.infer<typeof processIdentitySchema>;
 
+/**
+ * PLAN.MD P2-02: "记录不可变 config revision、非秘密配置 snapshot 和 remoteRoot
+ * 根摘要；后续 launch/status/retry 不混读热更新配置" and "为该 run 的 revision"
+ * (entrypoint stat+hash + pushed-file-list digest). These five fields are
+ * new-this-round and all OPTIONAL on the schema: a hand-seeded meta.json
+ * fixture from an earlier test (or a run launched by a build that predates
+ * this feature) simply parses with them `undefined` -- see
+ * src/run/push-revision.ts and run-service.ts's launch()/retry() for where
+ * they are populated on a real launch.
+ */
+export const runRevisionSchema = z.object({
+  entrypointHash: z.string().min(1),
+  entrypointBytes: z.number().int().nonnegative(),
+  pushedFilesDigest: z.string().nullable(),
+});
+export type RunRevision = z.infer<typeof runRevisionSchema>;
+
 export const runMetaSchema = z.object({
   runId: z.string().min(1),
   profile: z.string().min(1),
@@ -33,6 +50,22 @@ export const runMetaSchema = z.object({
   env: z.record(z.string(), z.string()),
   createdAt: z.string().min(1),
   identity: processIdentitySchema,
+  /** The relative (to remoteRoot) entrypoint as originally validated against
+   * allowedEntrypoints, before it was resolved to the absolute `entrypoint`
+   * path above. Needed by retry() to re-run the same allowedEntrypoints
+   * check without guessing it back out of the absolute path. */
+  entrypointRelative: z.string().min(1).optional(),
+  revision: runRevisionSchema.optional(),
+  configRevision: z.string().min(1).optional(),
+  /** Non-secret snapshot of the resolved runProfiles.<profile> entry used for
+   * this launch (see run-profiles-loader.ts's RunProfileEntry) -- already
+   * secret-free by construction (secretEnv only ever holds provider/key
+   * references, never a raw secret value). retry() reads this back instead
+   * of re-resolving the (possibly hot-reloaded, possibly since-deleted)
+   * live profile. */
+  configSnapshot: z.record(z.string(), z.unknown()).optional(),
+  /** Set only on a run created by run-retry; the runId it was retried from. */
+  parentRunId: z.string().min(1).optional(),
 });
 export type RunMeta = z.infer<typeof runMetaSchema>;
 

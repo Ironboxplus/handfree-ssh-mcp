@@ -33,14 +33,21 @@ import type { RunPaths } from "./remote-run-paths.js";
  *    rather than assumed, so meta.json records the group that actually
  *    exists.
  *
- *  - The supervisor traps TERM/INT to IGNORE them. Because the target is in
- *    its own group, a cancel aimed at that group does not reach the
- *    supervisor -- the trap is defense in depth for the case where a signal
- *    arrives by another route (e.g. someone signalling the supervisor
- *    directly), keeping it alive long enough to `wait()` the real exit
- *    status and write exit.json. The target does NOT inherit this trap: it
- *    is separately exec'd with default signal disposition, so a normal TERM
- *    still terminates it.
+ *  - The supervisor traps TERM/INT to IGNORE them, but only AFTER forking
+ *    the target. Because the target is in its own group, a cancel aimed at
+ *    that group does not reach the supervisor -- the trap is defense in
+ *    depth for the case where a signal arrives by another route (e.g.
+ *    someone signalling the supervisor directly), keeping it alive long
+ *    enough to `wait()` the real exit status and write exit.json.
+ *
+ *    (Corrected 2026-09-16: this comment previously claimed the target does
+ *    not inherit the trap because it is "exec'd with default signal
+ *    disposition". That is wrong -- SIG_IGN survives both fork and exec --
+ *    and the code was wrong with it: the trap sat above the fork, so every
+ *    launched target ignored SIGTERM. Found on .88 when a target refused to
+ *    die from pkill and /proc/<pid>/status showed SigIgn with bit 15 set.
+ *    P2-04-A1 had passed throughout, because cancel's SIGKILL escalation
+ *    masked it. See P2-04-A3 for the regression test.)
  *
  *  - Only the supervisor can `wait()` the target (wait() only works on your
  *    own direct children) -- this is why identity capture, the heartbeat
@@ -82,6 +89,17 @@ export interface WrapperLaunchSpec {
   createdAt: string;
   heartbeatIntervalSec: number;
   paths: RunPaths;
+  /** PLAN.MD P2-02/P2-04: all optional, all static (known in TypeScript
+   * before the wrapper script is even built -- no shell-side splicing
+   * needed, unlike `identity`). Omitted entirely from meta.json when not
+   * given, so this is fully backward compatible with every fixture/test
+   * written before this round. See src/run/meta.ts's runMetaSchema doc
+   * comment for what each field means. */
+  entrypointRelative?: string;
+  revision?: { entrypointHash: string; entrypointBytes: number; pushedFilesDigest: string | null };
+  configRevision?: string;
+  configSnapshot?: Record<string, unknown>;
+  parentRunId?: string;
 }
 
 /** Pure. The JSON.stringify()-produced static portion of meta.json, minus
@@ -100,6 +118,11 @@ export function buildStaticMetaJson(spec: WrapperLaunchSpec): string {
     args: [...spec.args],
     env: { ...spec.env },
     createdAt: spec.createdAt,
+    ...(spec.entrypointRelative !== undefined ? { entrypointRelative: spec.entrypointRelative } : {}),
+    ...(spec.revision !== undefined ? { revision: spec.revision } : {}),
+    ...(spec.configRevision !== undefined ? { configRevision: spec.configRevision } : {}),
+    ...(spec.configSnapshot !== undefined ? { configSnapshot: spec.configSnapshot } : {}),
+    ...(spec.parentRunId !== undefined ? { parentRunId: spec.parentRunId } : {}),
   });
 }
 
@@ -151,13 +174,25 @@ write_atomic() {
 }
 
 (
-  trap '' TERM INT
   cd "$WORKDIR" || exit 19
   export HANDFREE_WRAPPER_TOKEN=${posixShellQuote(spec.wrapperToken)}
 ${envExports}
 
   setsid "$EXECUTABLE" "$ENTRYPOINT"${argsLiteral ? " " + argsLiteral : ""} < /dev/null > "$STDOUT_PATH" 2> "$STDERR_PATH" &
   CHILD_PID=$!
+
+  # ORDER IS LOAD-BEARING: this trap must be installed AFTER the target is
+  # forked, never before. \`trap '' SIG\` sets the disposition to SIG_IGN in
+  # this shell process, and SIG_IGN is inherited across fork AND preserved
+  # across exec (exec resets only *caught* signals to default, never ignored
+  # ones). With the trap above the fork, the target permanently ignored
+  # SIGTERM -- measured on real Linux as SigIgn including bit 15 -- so
+  # cancel-script.ts's \`kill -TERM -\$PGID\` was a no-op and every cancel had
+  # to wait out the full grace period and then SIGKILL. Installed here, the
+  # target forks with the default disposition and a plain TERM terminates it,
+  # while the supervisor still holds the trap for the whole \`wait\` below,
+  # which is the only window where its defense-in-depth matters.
+  trap '' TERM INT
 
   write_atomic "$PID_PATH" "$CHILD_PID"
 

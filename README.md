@@ -120,11 +120,12 @@ The AI can now execute commands on your servers. All within your defined securit
 | `download` | Download remote file to local disk (optional `reuseConnection`, `vvv`, `fast`, or `striped` for a multi-channel single-file download — see [Striped (multi-channel) download](#striped-multi-channel-download)) |
 | `transfer` | Unified upload / download / server-to-server relay. Supports recursive small-file concurrency (`fileConcurrency`), batch upload (array `localPath`), temporary tar packing (`archive`, `archiveCompression`), fast SFTP by default, striped multi-channel download, and a bounded relay read-ahead window. |
 | `list-servers` | List configured (enabled) servers. Lean by default; `verbose:true` adds cached system status, `refresh:true` re-collects it (implies verbose). |
-| `workspace-run` | Launch an entrypoint on a remote server under a configured `runProfiles.<name>` entry. Durable: survives SSH disconnect and MCP adapter restart because all state lives on the remote filesystem, not locally. **Launch phase only in this delivery round** — see [workspace-run (remote runner)](#workspace-run-remote-runner-launch-phase-only). |
+| `workspace-run` | Launch an entrypoint on a remote server under a configured `runProfiles.<name>` entry: `[push] → preflight → launching → remote-running → [collect]`. Durable: survives SSH disconnect and MCP adapter restart because all state lives on the remote filesystem, not locally — see [workspace-run (remote runner)](#workspace-run-remote-runner). |
 | `run-status` | Query a `workspace-run` run's current status by `runId` (reads the remote state directory over SFTP; no local cache). |
 | `run-logs` | Read a byte-offset window of a run's stdout/stderr, UTF-8-boundary-safe across sequential calls. |
 | `run-list` | List runs on a server, newest first. |
 | `run-cancel` | Cancel a run: TERM to its process group, then KILL after `graceMs`; re-verifies process identity before signalling. |
+| `run-retry` | Launch a fresh run from an earlier run's own stored (non-secret) config snapshot, not the live config; records `parentRunId`. |
 | `help` | Self-describing help text for the MCP client |
 
 ### show-whitelist
@@ -184,30 +185,31 @@ Returns command mode, built-in command guards, configured whitelist/blacklist pa
 
 Closes the cached SSH client for a configured server. This is useful after a timeout or suspected stale reused connection when you want the next default `reuseConnection: true` command to reconnect cleanly. Closing a jump host also closes cached targets whose jump chain uses that host. `reuseConnection: false` commands do not need this because their one-shot SSH clients close after each command.
 
-### workspace-run (remote runner, launch phase only)
+### workspace-run (remote runner)
 
 Launches an entrypoint on a remote server under a `runProfiles.<name>` entry declared in your YAML config (see [YAML Config Reference](#-yaml-config-reference)). The launched process is detached from the SSH session (its own process group, `setsid`) and writes its own state atomically to `~/.handfree-runs/<runId>/meta.json` / `stdout.log` / `stderr.log` / `pid` / `heartbeat` / `exit.json` on the remote filesystem. There is **no local job store or daemon** — an MCP adapter restart loses nothing because it held nothing, but this also means status/logs/cancel require the remote server to be reachable; there is no offline/cached view of run state.
 
+The full pipeline is `[push] → preflight → launching → remote-running → [collect]`:
+
 ```json
 { "tool": "workspace-run", "params": {
-  "profile": "qwen-dev", "entrypoint": "train.py", "args": ["--epochs", "3"],
-  "push": false
+  "profile": "qwen-dev", "entrypoint": "train.py", "args": ["--epochs", "3"]
 } }
 { "tool": "run-status", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
 { "tool": "run-logs", "params": { "runId": "run_20260915T120000Z_ab12cd34", "offset": 0 } }
 { "tool": "run-list", "params": { "profile": "qwen-dev" } }
 { "tool": "run-cancel", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
+{ "tool": "run-retry", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
 ```
 
-**This delivery round implements the launch phase only** (PLAN.MD Phase 2). Explicitly **not yet implemented** — each returns a specific `*_NOT_AVAILABLE` error rather than being silently ignored:
-
-- `push` — the pre-launch upload phase. Must be passed as `false`; the code must already exist under the profile's `remoteRoot`. Omitting it (true default) or passing `true` returns `PUSH_NOT_AVAILABLE`.
-- `collect` — pulling artifacts back after the run finishes. Must be empty/omitted; use `download`/`transfer` instead. A non-empty array returns `COLLECT_NOT_AVAILABLE`.
-- `sync: "flush"` — the persistent sync barrier (Phase 3). Only `"none"`/omitted works; `"flush"` returns `SYNC_NOT_AVAILABLE`.
-- `run-retry` — not implemented at all in this delivery round.
+- **`push`** (default `true`, or the profile's `defaultPush`) uploads `runProfiles.<name>.push.paths` (files and/or directories) to `remoteRoot` before launch, over the same batch/recursive upload used by `upload`/`transfer` — skip-if-identical, so an unchanged file is not re-transferred. Requires `push.paths` to be configured on the profile, or the call fails with `INVALID_CONFIGURATION` before touching the network. Pass `push: false` to skip it and use code already present under `remoteRoot`. A push failure never reaches the launching phase; the error names the failing file/directory and the phase. After push (or when skipped), the entrypoint is stat'd and content-hashed on the remote and recorded, together with a digest of the pushed file list, as the run's `revision` — so you can tell afterwards which code actually ran.
+- **`collect`** (default the profile's `collect.paths`) pulls artifacts back by explicit glob (relative to `remoteRoot`) after the run finishes, into `runProfiles.<name>.collect.localDir` — it **never** defaults to pulling the whole `remoteRoot`. Requires `collect.localDir` to be configured whenever `collect.paths`/the `collect` param is non-empty. Requesting collect (whether via the profile default or explicitly) makes the `workspace-run` call **block** (bounded by `timeout`, default the profile's `timeout` or 10 minutes) until the run reaches a terminal state, then collects — a plain launch with no collect requested still returns immediately once the process is confirmed started, unchanged. Enforces a total byte cap and file-count cap (`collect.maxBytes`/`collect.maxFiles`); exceeding either fails the collect phase and reports exactly what was already pulled — no silent truncation. Collect still runs by default even when the run failed or was cancelled (logs/partial artifacts are diagnostic material); a collect failure never rewrites the run's own exit code, it is reported separately (`details.collect`). Pass `collect: []` to disable collect for a call. Glob matching rejects `..`, absolute paths, and never traverses a symlink.
+- `sync: "flush"` — the persistent sync barrier (Phase 3, not this round). Only `"none"`/omitted works; `"flush"` returns `SYNC_NOT_AVAILABLE`.
 - `environment.type: conda | module | slurm`, `gpu.required`, and `secretEnv` — parse successfully in config but are rejected at launch time with `ENVIRONMENT_ADAPTER_NOT_AVAILABLE` / `GPU_VALIDATION_NOT_AVAILABLE` / `SECRET_ENV_NOT_AVAILABLE`. Only `environment.type: venv` (invokes `<path>/bin/python` directly, never `source activate`) and `environment.type: executable` are supported.
 
 `run-cancel` sends `TERM` to the run's whole remote process group, waits `graceMs` (default 5000), then `KILL` if it's still alive. Before signalling anything it re-verifies the recorded process identity (remote boot id, pid, pgid, `/proc` start ticks, and a wrapper token read back from the live process's own environment) against what is actually running right now; a mismatch (pid reuse, host reboot) moves the run to `orphaned` instead of risking a signal to an unrelated process.
+
+`run-retry` launches a fresh run from an **earlier run's own stored config snapshot** (its `meta.json`, read over SFTP) rather than the live `runProfiles` config — so a config hot-reload or a since-deleted profile cannot change what actually gets retried. It gets its own new `runId` and records `parentRunId`; the original run is untouched. Returns `RETRY_SNAPSHOT_UNAVAILABLE` for a run launched before this snapshot feature existed, and `SECRET_REQUIRED` if the snapshot declares `secretEnv` (not re-resolvable this delivery round).
 
 ## 📄 YAML Config Reference
 
@@ -282,8 +284,7 @@ servers:
     # disableSftpPathPolicy: true
 
 # Optional: workspace-run profiles (PLAN.MD Phase 2). See "workspace-run
-# (remote runner, launch phase only)" above for what is and isn't
-# implemented yet in this delivery round.
+# (remote runner)" above for exact push/collect semantics.
 runProfiles:
   qwen-dev:
     server: server_name          # must match a servers: entry above
@@ -296,6 +297,17 @@ runProfiles:
       - benchmarks/*.py
     env:
       PYTHONUNBUFFERED: "1"      # caller-supplied env overrides may only use keys declared here
+    # defaultPush: true          # overrides workspace-run's own push default for this profile
+    push:
+      paths:                     # local sources (files and/or directories) uploaded to remoteRoot
+        - E:/projects/qwen       # a directory's CONTENTS land directly under remoteRoot (flattened,
+                                  # not nested under "qwen/") -- remoteRoot IS the pushed project root
+    collect:
+      paths:                     # globs relative to remoteRoot; never defaults to the whole tree
+        - outputs/*.json
+      localDir: E:/collected/qwen # required whenever paths above is non-empty
+      maxBytes: 104857600         # optional, default 209715200 (200 MiB)
+      maxFiles: 200                # optional, default 1000
 ```
 
 ### Security note: command policy

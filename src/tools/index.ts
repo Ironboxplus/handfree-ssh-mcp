@@ -13,6 +13,7 @@ import { registerRunStatusTool } from "./run-status.js";
 import { registerRunLogsTool } from "./run-logs.js";
 import { registerRunListTool } from "./run-list.js";
 import { registerRunCancelTool } from "./run-cancel.js";
+import { registerRunRetryTool } from "./run-retry.js";
 
 /**
  * Register all tools
@@ -32,5 +33,6 @@ export function registerAllTools(server: McpServer): void {
   registerRunLogsTool(server);
   registerRunListTool(server);
   registerRunCancelTool(server);
+  registerRunRetryTool(server);
   registerHelpTool(server);
 }
