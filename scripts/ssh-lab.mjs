@@ -111,15 +111,20 @@ export function shellQuote(value) {
 // CLI / config
 // ---------------------------------------------------------------------------
 
-function readLabConfig() {
-  const host = process.env.SSH_LAB_HOST;
+export function readLabConfig() {
+  // SSH_LAB_MODE=local means the harness is already running ON the lab host
+  // (see LocalLabConnection): there is nothing to authenticate to, so the
+  // credentials are not required and `host` is just the address the test
+  // client uses to reach the containers' published ports.
+  const local = (process.env.SSH_LAB_MODE ?? "ssh") === "local";
+  const host = process.env.SSH_LAB_HOST ?? (local ? "127.0.0.1" : undefined);
   const user = process.env.SSH_LAB_USER;
   const keyPath = process.env.SSH_LAB_KEY_PATH;
   const password = process.env.SSH_LAB_PASSWORD;
   const missing = [];
   if (!host) missing.push("SSH_LAB_HOST");
-  if (!user) missing.push("SSH_LAB_USER");
-  if (!keyPath && !password) missing.push("SSH_LAB_KEY_PATH or SSH_LAB_PASSWORD");
+  if (!local && !user) missing.push("SSH_LAB_USER");
+  if (!local && !keyPath && !password) missing.push("SSH_LAB_KEY_PATH or SSH_LAB_PASSWORD");
   if (missing.length > 0) {
     return { ok: false, missing };
   }
@@ -140,7 +145,7 @@ function readLabConfig() {
 // Real SSH/SFTP/exec driver against the lab host
 // ---------------------------------------------------------------------------
 
-class LabHostConnection {
+export class LabHostConnection {
   constructor(config) {
     this.config = config;
     this.client = null;
@@ -231,9 +236,90 @@ class LabHostConnection {
   }
 }
 
+/**
+ * Same surface as LabHostConnection, but executing on THIS machine instead
+ * of over SSH. Selected with SSH_LAB_MODE=local.
+ *
+ * Why this exists (PLAN.MD P1-04b): the benchmark's client has to sit close
+ * to the lab, because it measures throughput. Driving it from the Windows
+ * dev box was measured at ~1 MiB/s to the lab host -- confirmed to be the
+ * path, not the product, since OpenSSH `scp` over the identical path gets
+ * the same figure -- which makes a 1 Gbps netem shaper meaningless and the
+ * P1-04-A1 gate unmeasurable from there. Running the harness ON the lab host
+ * fixes that.
+ *
+ * The obvious alternative, letting the host SSH to itself, would have meant
+ * adding a key to a shared account's authorized_keys. That is a security-
+ * relevant change to someone else's machine and squarely outside P0-02's
+ * "禁止触碰前缀之外的任何路径、容器或网络", so it is not done. Local exec
+ * needs no credentials at all.
+ */
+export class LocalLabConnection {
+  constructor(config) {
+    this.config = config;
+    // Non-null so callers' `if (conn.client)` teardown guard behaves the
+    // same as it does for the SSH connection.
+    this.client = { local: true };
+  }
+
+  async connect() { /* nothing to connect: we are already here */ }
+
+  close() { /* nothing to close */ }
+
+  exec(command, { timeoutMs = 120000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const child = spawn("/bin/sh", ["-c", command], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        child.kill("SIGKILL");
+        // Same wording as the SSH path, because both ssh-lab.mjs and
+        // benchmark.mjs classify timeouts by matching this text.
+        reject(new Error(`remote command timed out after ${timeoutMs}ms: ${command}`));
+      }, timeoutMs);
+      child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+      child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+      child.on("error", (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+      child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ code: code ?? 0, stdout, stderr });
+      });
+    });
+  }
+
+  async execOk(command, options) {
+    const result = await this.exec(command, options);
+    if (result.code !== 0) {
+      throw new Error(`remote command failed (exit ${result.code}): ${command}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    }
+    return result;
+  }
+
+  async sftpUploadFile(localPath, remotePath) {
+    fs.mkdirSync(path.dirname(remotePath), { recursive: true });
+    fs.copyFileSync(localPath, remotePath);
+  }
+}
+
+/** Picks the SSH or local driver. SSH remains the default so every existing
+ * caller and every documented SSH_LAB_* workflow behaves exactly as before. */
+export function createLabConnection(config) {
+  return (process.env.SSH_LAB_MODE ?? "ssh") === "local" ? new LocalLabConnection(config) : new LabHostConnection(config);
+}
+
 /** docker (optionally sudo -n) with explicit env-var injection via `env`,
  * because `sudo -n` does not forward the caller's shell environment. */
-function dockerCmd(config, argsString, { env = {} } = {}) {
+export function dockerCmd(config, argsString, { env = {} } = {}) {
   const envAssignments = Object.entries(env)
     .map(([key, value]) => `${key}=${shellQuote(value)}`)
     .join(" ");
@@ -250,7 +336,7 @@ function dockerCmd(config, argsString, { env = {} } = {}) {
  * a failure on the very first remote command still leaves `main()` knowing
  * exactly what (if anything) needs to be torn down — see the `lab` object
  * being built here and threaded into the finally block in main(). */
-function buildLabPaths(config, token) {
+export function buildLabPaths(config, token) {
   const projectName = buildProjectName(token);
   const remoteDir = `${config.remoteDirRoot}/${projectName}`;
   const imageTag = `handfree-sshlab-image:${token}`;
@@ -258,7 +344,7 @@ function buildLabPaths(config, token) {
   return { projectName, remoteDir, imageTag, composePath };
 }
 
-async function upLab(conn, config, lab, log) {
+export async function upLab(conn, config, lab, log) {
   const { projectName, remoteDir, imageTag, composePath } = lab;
 
   log(`creating remote fixture directory ${remoteDir}`);
@@ -274,7 +360,12 @@ async function upLab(conn, config, lab, log) {
     dockerCmd(config, `compose -p ${shellQuote(projectName)} -f ${shellQuote(composePath)} build`, {
       env: { APT_PROXY: config.aptProxy, LAB_IMAGE_TAG: imageTag },
     }),
-    { timeoutMs: 240000 },
+    // Default unchanged (240s). Overridable because a cold build pulls the
+    // base image and runs a full `apt-get install` -- on a lab host whose
+    // egress to deb.debian.org is intermittent (see the Dockerfile comment)
+    // that legitimately exceeds 240s, and the benchmark's `release` profile
+    // should not lose a multi-hour run to a fixture build timeout.
+    { timeoutMs: Number(process.env.SSH_LAB_BUILD_TIMEOUT_MS ?? 240000) },
   );
 
   log(`starting containers (project ${projectName})`);
@@ -317,7 +408,7 @@ async function upLab(conn, config, lab, log) {
   return { projectName, remoteDir, imageTag, composePath, ports };
 }
 
-async function downLab(conn, config, lab, log) {
+export async function downLab(conn, config, lab, log) {
   if (!lab) return;
   try {
     log(`tearing down project ${lab.projectName}`);
@@ -338,11 +429,11 @@ async function downLab(conn, config, lab, log) {
   }
 }
 
-function sleep(ms) {
+export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function waitForTcpOpen(host, port, timeoutMs) {
+export function waitForTcpOpen(host, port, timeoutMs) {
   const net = require_net();
   const deadline = Date.now() + timeoutMs;
   const attempt = () =>
@@ -429,7 +520,7 @@ function sftpRoundTrip(client, payload, remotePath) {
 
 /** Generates a real OpenSSH-format ed25519 keypair via the real `ssh-keygen`
  * binary (guaranteed-correct format; no hand-rolled key encoding). */
-function generateKeypair(outDir, name) {
+export function generateKeypair(outDir, name) {
   const keyPath = path.join(outDir, name);
   const result = spawnSync("ssh-keygen", ["-t", "ed25519", "-N", "", "-C", `handfree-sshlab-${name}`, "-f", keyPath], {
     encoding: "utf8",
@@ -526,7 +617,7 @@ async function runAcceptance(conn, config, lab, log) {
   return results;
 }
 
-async function installPinnedKeys(conn, config, lab, log) {
+export async function installPinnedKeys(conn, config, lab, log) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "handfree-sshlab-keys-"));
   try {
     const direct = generateKeypair(tmpDir, "id_ed25519_direct");

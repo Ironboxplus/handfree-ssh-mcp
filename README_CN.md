@@ -24,8 +24,8 @@ handfree-ssh-mcp 使 AI 助手能够通过标准化的 MCP 接口执行远程 SS
 | execute-command | 在远程服务器执行 SSH 命令并获取结果 |
 | execute-command-stream | 执行命令并获取实时流式输出 |
 | upload | 上传本地文件到远程服务器；`localPath` 也可传数组以批量上传多个文件到同一个远程目录（见下方"批量上传"） |
-| download | 从远程服务器下载文件；支持 `striped` 多通道分片下载（见下方"多通道分片下载"） |
-| transfer | 上传、下载或在两台远端服务器之间 relay；支持碎文件并发、批量上传（`localPath` 数组）、临时 tar 打包、可选压缩、多通道分片下载和分块预取 |
+| download | 从远程服务器下载文件 |
+| transfer | 上传、下载或在两台远端服务器之间 relay；支持碎文件并发、批量上传（`localPath` 数组）、临时 tar 打包、可选压缩、分块预取，以及 relay 的 `strategy: "relay" \| "direct" \| "auto"`（源到目标直传，绕过本机） |
 | list-servers | 列出所有可用的 SSH 服务器配置 |
 | workspace-run | 在配置好的 `runProfiles.<name>` 下，于远端服务器启动一个入口程序：`[push] → preflight → launching → remote-running → [collect]`。持久运行：所有状态都写在远端文件系统（不落本机），可扛住 SSH 断线与 MCP adapter 重启。详见下方"workspace-run（远程运行）" |
 | run-status | 按 `runId` 查询 `workspace-run` 运行状态（每次都经 SFTP 读远端状态目录，无本机缓存） |
@@ -144,6 +144,10 @@ servers:
 
 `transfer` 的 `mode: "relay"` 会以带偏移量的 SFTP 分块读写替代单路流式 pipe：目标端等待写入确认时，源端可提前下载后续分块。默认窗口是 `sftpConcurrency: 64`、`chunkSize: 32768`，应用层分块缓存至多约 2 MiB；可通过这两个参数调节，最大窗口为 64 MiB。文件仍只经过 MCP 进程内存，不写入本机临时文件，结束后继续做大小与可用时的 MD5 校验。
 
+### 🔀 relay 的 `strategy`（两端直传）
+
+`transfer mode=relay` 支持 `strategy: "relay" | "direct" | "auto"`。`"relay"`（默认）就是上面的分块预取行为，未做任何改动。`"direct"` 会**在源服务器上**执行拷贝（优先 `rsync`，否则 `tar` 通过 `ssh` 管道传输；不支持 `rclone`），使本机 MCP 进程完全不经手文件字节；当源服务器无法直连目标、目标主机指纹尚未在源服务器上被信任、非交互式 `existing-remote-key` 认证不可用，或源服务器上两种 backend 都不可用时，会给出明确失败原因。认证完全依赖源服务器自身已有的信任关系（其默认 SSH 身份 / `known_hosts`）——本工具不会读取、拼装或传输任何私钥，也绝不会传递 `StrictHostKeyChecking=no` 之类的自动信任参数。直传无法穿透 NAT：请确保源到目标可直连，或改用跳板机/overlay 网络，或退回 `strategy: "relay"`。`"auto"` 会带真实超时地探测上述条件（路由、主机指纹、backend 可用性、认证、目标路径策略），可行时使用直传，否则回退到 relay 并报告准确原因。
+
 ### 📦 tar-before-transfer 与碎文件并发
 
 - `upload`、`download` 以及 `transfer` 的上传/下载模式现在默认启用 `fast`，即使用 ssh2 `fastPut` / `fastGet`；需要兼容路径时可显式设置 `fast: false`。
@@ -164,10 +168,6 @@ servers:
 - 每个文件仍然复用现有单文件上传逻辑：skip-if-identical、`.sh`/`.bash`/`.zsh` 的 CRLF 修正、`fast`、路径策略校验全部自动继承，不重新实现。
 - 数组入参返回结构化 JSON（`{ results, total, uploadedCount, skippedCount, failedCount, crlfFixedCount }`），而不是单文件时的纯文本结果。
 - 本轮 `archive: true` 不支持与数组 `localPath` 同时使用；`download`/`relay` 暂不支持数组形式的 `localPath`。
-
-### 🧵 多通道分片下载（`striped`）
-
-`download` 与 `transfer mode=download` 支持 `striped: true`（默认 `false`，不开启时单文件下载行为与之前完全一致）：将同一个远程文件切分为 `stripeCount`（默认 4，上限 8，与 `fileConcurrency` 相同的 OpenSSH `MaxSessions` 余量考量）个不重叠的字节区间，每个区间各自使用独立的 SFTP channel 并发拉取，通过定位写（positional write）直接写入本地预分配的 temp 文件，各区间完成顺序互不影响。`chunkSize`（默认 262144 字节）限制单个区间一次读入内存的字节数，`maxBufferBytes`（默认 64 MiB）硬性限制 `stripeCount * chunkSize`，即任意时刻 MCP 进程内存中缓冲的数据总量上限——大文件不会被整个装入内存。全部区间写完后先校验本地 temp 文件大小（远端暴露 `md5sum` 时还会尽力校验 MD5），通过后才原子 rename 到目标路径；任一分片失败或校验失败都会删除 temp 文件，从不触碰最终目标路径。同时设置 `fast` 时 `striped` 优先生效。该开关只改变字节的搬运方式，不改变工具的返回内容。
 
 ### 🏃 workspace-run（远程运行）
 

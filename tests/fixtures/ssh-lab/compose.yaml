@@ -31,6 +31,15 @@ services:
       - "0:22"
     networks:
       - lab
+    # PLAN.MD P0-00 ("netem runner 显式授予 CAP_NET_ADMIN") and §8.2: the
+    # benchmark gates are defined under `tc netem` shaping, and `tc qdisc add`
+    # inside the container fails with RTNETLINK "Operation not permitted"
+    # without this. iproute2 is already in the image. NET_ADMIN is scoped to
+    # this container's own network namespace, so it cannot alter the shared
+    # lab host's networking. Nothing but scripts/benchmark.mjs uses it; the
+    # P0-02 acceptance path is unaffected by its presence.
+    cap_add:
+      - NET_ADMIN
     restart: "no"
 
   destination:
@@ -45,6 +54,10 @@ services:
       - "0:22"
     networks:
       - lab
+    # Same rationale as `source` above: the two-leg relay gate in §8.2 shapes
+    # both legs, so both containers need to be shapeable.
+    cap_add:
+      - NET_ADMIN
     restart: "no"
 
 networks:

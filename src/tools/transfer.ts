@@ -3,6 +3,7 @@ import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { formatToolErrorResponse, ToolError, toToolError } from "../utils/tool-error.js";
+import { transferStrategySchema } from "../contracts/transfer-contract.js";
 
 /**
  * Register unified file transfer tool
@@ -24,11 +25,19 @@ export function registerTransferTool(server: McpServer): void {
 Modes:
   upload   — push a local file or directory to a remote server.
   download — pull a remote file or directory to the MCP host.
-  relay    — stream a file from one remote server to another via a bounded
-             parallel SFTP read-ahead window. No temp file touches the MCP host
-             disk. No SCP or authorized-key
-             exchange between the two servers is needed — each side uses its
-             own existing SSH session.
+  relay    — copy a file from one remote server to another. Default strategy
+             ("relay") streams it via a bounded parallel SFTP read-ahead
+             window through this MCP host; no temp file touches the MCP host
+             disk, and no SCP or authorized-key exchange between the two
+             servers is needed. strategy="direct" instead runs the copy ON
+             the source server (rsync, else tar piped over ssh) so this MCP
+             host never reads or writes the file's bytes at all; it requires
+             the source server to already be able to reach the destination
+             directly (no NAT traversal) with its own pre-existing SSH trust
+             (host key + non-interactive key auth already set up on the
+             source — this tool never transfers a private key). strategy="auto"
+             uses direct when possible and otherwise falls back to relay,
+             reporting the real reason it fell back.
 
 Set recursive=true when transferring a directory (upload/download only).
 Set archive=true to package a file or directory into one temporary tar before
@@ -63,6 +72,16 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
       destRemotePath: z.string().optional().describe(
         "(relay only) Absolute POSIX destination path on the target server. Any path is allowed by default unless the destination server configures allowedRemoteDirectories.",
       ),
+      strategy: transferStrategySchema.optional().describe(
+        "(relay only) 'relay' (default) — unchanged behavior, streams through this MCP host via SFTP. " +
+          "'direct' — run the copy on the source server (rsync, else tar|ssh; never rclone) so this MCP host " +
+          "relays zero file-data bytes; fails explicitly with the precise reason if not possible (source cannot " +
+          "reach the destination directly, destination host key not pinned on the source, non-interactive " +
+          "existing-remote-key auth unavailable, or no backend installed on the source). " +
+          "'auto' — probes the same conditions and uses direct when possible, otherwise falls back to relay " +
+          "and reports the real reason it fell back. Never auto-accepts an unknown destination host key and " +
+          "never transfers a private key; auth relies entirely on keys/trust already present on the source server.",
+      ),
       recursive: z.boolean().optional().describe(
         "(upload/download only) When true, transfers an entire directory tree recursively. Default false.",
       ),
@@ -88,16 +107,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         "Upload/download: only used when fast=true. Relay: number of concurrent prefetched source chunks, default 64. The relay window is bounded to 64 MiB.",
       ),
       chunkSize: z.number().int().positive().optional().describe(
-        "Upload/download: only used when fast=true, or when striped=true (per-stripe read/write chunk bytes; default 262144). Relay: bytes per prefetched source chunk, default 32768. The relay window is bounded to 64 MiB.",
-      ),
-      striped: z.boolean().optional().describe(
-        "Download only. Default false. Split the download into stripeCount non-overlapping byte ranges pulled concurrently over separate SFTP channels into a preallocated local temp file, verified and atomically renamed into place when complete. Takes priority over fast when both are set. Accepted but ignored for upload and relay.",
-      ),
-      stripeCount: z.number().int().positive().optional().describe(
-        "Download with striped=true only. Number of concurrent byte-range channels. Default 4, maximum 8 (same OpenSSH MaxSessions headroom as fileConcurrency).",
-      ),
-      maxBufferBytes: z.number().int().positive().optional().describe(
-        "Download with striped=true only. Hard cap in bytes on stripeCount * chunkSize, the total data ever buffered in MCP-host memory at once. Default 67108864 (64 MiB).",
+        "Upload/download: only used when fast=true. Relay: bytes per prefetched source chunk, default 32768. The relay window is bounded to 64 MiB.",
       ),
       fileConcurrency: z.number().int().positive().optional().describe(
         "Recursive upload/download only: maximum independent files transferred in parallel. Default 4, maximum 8. Each file transferred in parallel opens its own SFTP channel on the same SSH connection, and the cap is kept under OpenSSH's common default MaxSessions=10 so it does not reliably fail against a default-configured remote sshd. This improves directory trees with many small files without creating an archive.",
@@ -132,14 +142,17 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         const compression = archiveCompression ?? "none";
 
         if (mode === "relay") {
-          const { sourceServer, sourceRemotePath, destServer, destRemotePath, skipIfIdentical, reuseConnection, timeout, vvv, sftpConcurrency, chunkSize } = params;
+          const { sourceServer, sourceRemotePath, destServer, destRemotePath, skipIfIdentical, reuseConnection, timeout, vvv, sftpConcurrency, chunkSize, strategy } = params;
           if (!sourceServer || !sourceRemotePath || !destServer || !destRemotePath) {
             return {
               content: [{ type: "text", text: "relay mode requires: sourceServer, sourceRemotePath, destServer, destRemotePath" }],
               isError: true,
             };
           }
-          const relayOptions = { reuseConnection, timeout, vvv, sftpConcurrency, chunkSize };
+          const relayOptions = {
+            reuseConnection, timeout, vvv, sftpConcurrency, chunkSize,
+            ...(strategy === undefined ? {} : { strategy }),
+          };
           const result = archive
             ? await transferService.transferArchiveBetweenServers(
                 sourceServer,
@@ -160,7 +173,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         }
 
         // upload or download
-        const { remotePath, connectionName, recursive, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, fileConcurrency, striped, stripeCount, maxBufferBytes } = params;
+        const { remotePath, connectionName, recursive, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, fileConcurrency } = params;
         if (!localPath || !remotePath) {
           return {
             content: [{ type: "text", text: `${mode} mode requires: localPath, remotePath` }],
@@ -196,9 +209,6 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
           sftpConcurrency,
           chunkSize,
           ...(fileConcurrency === undefined ? {} : { fileConcurrency }),
-          ...(striped === undefined ? {} : { striped }),
-          ...(stripeCount === undefined ? {} : { stripeCount }),
-          ...(maxBufferBytes === undefined ? {} : { maxBufferBytes }),
         };
         const uploadOptions = { skipIfIdentical: skipIfIdentical !== false, ...sftpOptions };
 

@@ -1,4 +1,4 @@
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
@@ -40,6 +40,13 @@ export interface RealSshServerStats {
   // bookkeeping -- to prove striped download's ranges are non-overlapping
   // and exactly cover the file.
   readRequests: Array<{ offset: number; length: number }>;
+  // PLAN.MD P1-08a: cumulative count of real "exec" channel requests this
+  // instance has received (covers md5sum/tar/the generic real-shell
+  // fallback alike). Lets a test prove a rejected direct-transfer call made
+  // ZERO exec attempts (path-policy failed before any network I/O), the same
+  // "prove it with a real counter" discipline maxActiveSftpChannels already
+  // applies to SFTP.
+  execCommandCount: number;
 }
 
 const { Server } = ssh2;
@@ -111,6 +118,7 @@ export class RealSshTestServer {
     maxActiveReaddirs: 0,
     openDirRequests: 0,
     readRequests: [],
+    execCommandCount: 0,
   };
 
   public port = 0;
@@ -125,6 +133,17 @@ export class RealSshTestServer {
   // progress (and others then genuinely cancelled) is reproducible without
   // any sleep/poll race.
   private failReadsAfterCount: number | null = null;
+  // PLAN.MD P1-08a: parsed once in the constructor from
+  // directExecOptions.authorizedPublicKeyPem (see below), or undefined when
+  // that option is omitted -- `any` because ssh2's ParsedKey type isn't
+  // exported from its public typings.
+  private readonly authorizedKey: any;
+  // PLAN.MD P1-08a: this instance's own real host private key (PEM), set in
+  // the constructor. Backs knownHostsLine() below, which lets a test PIN a
+  // real, correct known_hosts entry for this exact server (via a temp
+  // HOME's .ssh/known_hosts, see directExecOptions.execEnv) instead of
+  // disabling host-key checking to make a happy-path test pass.
+  private hostPrivateKeyPem = "";
 
   public constructor(
     public readonly rootDirectory: string,
@@ -145,15 +164,51 @@ export class RealSshTestServer {
     // other test's behavior (including reads outside this suite) is
     // unchanged.
     private readonly readResponseDelayMs = 0,
+    // PLAN.MD P1-08a (direct transfer): options for the generic real-shell
+    // exec fallback below (see executeCommand), which is what a direct
+    // transfer's rsync/tar|ssh backend commands run against when this
+    // instance plays "source" or "destination" in a real-fixture test.
+    //   - execEnv: environment passed to that spawned shell. Overriding HOME
+    //     here lets a test point ssh's own default identity/known_hosts
+    //     resolution at a throwaway temp directory instead of this test
+    //     machine's real ~/.ssh -- exactly mirroring "the key/host-key trust
+    //     already present on the source server", without ever touching a
+    //     real developer's actual SSH state. Defaults to process.env
+    //     (unchanged behavior) when omitted.
+    //   - authorizedPublicKeyOpenSsh: a public key in OpenSSH single-line
+    //     format ("ssh-rsa AAAA...", i.e. `<type> <base64>`, no comment
+    //     needed) this instance additionally accepts for publickey auth, on
+    //     top of the existing password ("test"/"test") auth. Undefined by
+    //     default, which preserves password-only auth exactly as before --
+    //     existing tests that never set this see no behavior change. NOTE:
+    //     ssh2's own utils.parseKey cannot parse a PEM "RSA PUBLIC KEY"
+    //     (PKCS1) or "PUBLIC KEY" (SPKI) block (verified for real -- both
+    //     return an Error), only PEM PRIVATE keys or this OpenSSH line
+    //     format; derive this from a real private key with
+    //     `const k = ssh2.utils.parseKey(privateKeyPem); \`${k.type} ${k.getPublicSSH().toString("base64")}\``.
+    private readonly directExecOptions: { execEnv?: NodeJS.ProcessEnv; authorizedPublicKeyOpenSsh?: string } = {},
   ) {
     const { privateKey } = generateKeyPairSync("rsa", {
       modulusLength: 2048,
       privateKeyEncoding: { format: "pem", type: "pkcs1" },
       publicKeyEncoding: { format: "pem", type: "pkcs1" },
     });
+    const authorizedKey = directExecOptions.authorizedPublicKeyOpenSsh
+      ? (ssh2.utils as any).parseKey(directExecOptions.authorizedPublicKeyOpenSsh)
+      : undefined;
+    this.authorizedKey = authorizedKey && !(authorizedKey instanceof Error) ? authorizedKey : undefined;
+    this.hostPrivateKeyPem = privateKey;
     this.server = new Server({ hostKeys: [privateKey] }, (client) => {
       this.clients.add(client);
       client.once("close", () => this.clients.delete(client));
+      // PLAN.MD P1-08a: this fixture now routinely runs several real ssh2
+      // servers concurrently in one test file (one making real outbound ssh
+      // connections to another), so a connection being reset mid-teardown
+      // by a concurrent stop() elsewhere is an expected, benign occurrence,
+      // not a bug -- without this listener the underlying socket's 'error'
+      // event has no handler and crashes the whole test process (observed
+      // for real; see this task's investigation notes).
+      client.on("error", () => { /* connection reset during teardown; nothing to do */ });
       client.on("authentication", (context) => {
         if (
           context.method === "password" &&
@@ -161,9 +216,35 @@ export class RealSshTestServer {
           context.password === "test"
         ) {
           context.accept();
-        } else {
-          context.reject();
+          return;
         }
+        if (context.method === "publickey" && this.authorizedKey) {
+          const offered = context.key;
+          const allowedPublicSsh: Buffer = this.authorizedKey.getPublicSSH();
+          // A real client offering an RSA key negotiates a SIGNATURE
+          // algorithm (rsa-sha2-256/512, per RFC 8332) that is NOT the same
+          // string as the KEY TYPE itself ("ssh-rsa") -- observed for real
+          // against this fixture with OpenSSH_9.7p1, which defaults to
+          // rsa-sha2-256 even for a plain ssh-rsa key. Accept either the
+          // exact key type or one of its RSA-SHA2 signature variants.
+          const sameAlgo = offered.algo === this.authorizedKey.type
+            || (this.authorizedKey.type === "ssh-rsa" && (offered.algo === "rsa-sha2-256" || offered.algo === "rsa-sha2-512"));
+          const sameData = Buffer.isBuffer(offered.data)
+            && offered.data.length === allowedPublicSsh.length
+            && timingSafeEqual(offered.data, allowedPublicSsh);
+          // verify() needs the negotiated hash algorithm (context.hashAlgo)
+          // to interpret an RSA-SHA2 signature correctly -- omitting it
+          // silently falls back to a default that does not match what the
+          // client actually signed with, and verification fails even for a
+          // genuinely correct key/signature. Also observed for real.
+          const signatureOk = !context.signature
+            || this.authorizedKey.verify(context.blob, context.signature, context.hashAlgo) === true;
+          if (sameAlgo && sameData && signatureOk) {
+            context.accept();
+            return;
+          }
+        }
+        context.reject();
       });
       client.on("ready", () => {
         client.on("session", (accept) => {
@@ -267,6 +348,20 @@ export class RealSshTestServer {
       throw new Error(`Remote path escapes test root: ${remotePath}`);
     }
     return path.join(this.rootDirectory, ...components);
+  }
+
+  /**
+   * PLAN.MD P1-08a: a real OpenSSH known_hosts line for THIS instance's own
+   * real generated host key -- e.g. `[127.0.0.1]:52341 ssh-rsa AAAA...`.
+   * Lets a test pin trust for this exact server (write this line into a temp
+   * HOME's `.ssh/known_hosts`) the same way an operator would with
+   * `ssh-keyscan`, rather than disabling host-key checking to reach a
+   * happy-path direct-transfer test.
+   */
+  public knownHostsLine(hostPattern = `[127.0.0.1]:${this.port}`): string {
+    const parsed = (ssh2.utils as any).parseKey(this.hostPrivateKeyPem);
+    const publicSsh: Buffer = parsed.getPublicSSH();
+    return `${hostPattern} ${parsed.type} ${publicSsh.toString("base64")}`;
   }
 
   private attachSftp(sftp: any): void {
@@ -449,6 +544,7 @@ export class RealSshTestServer {
   }
 
   private executeCommand(channel: any, command: string): void {
+    this.stats.execCommandCount++;
     if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
       channel.on("close", () => process.stderr.write(`[real-ssh ${this.port}] CHANNEL CLOSE\n`));
       channel.on("end", () => process.stderr.write(`[real-ssh ${this.port}] CHANNEL END\n`));
@@ -480,9 +576,14 @@ export class RealSshTestServer {
       return;
     }
 
-    if (words[0] !== "tar" || words.length < 5) {
-      channel.stderr.write(`Unsupported real test command: ${command}\n`);
-      finish(127);
+    // The `!command.includes("|")` guard matters for PLAN.MD P1-08a: a
+    // direct-transfer tar|ssh command also starts with "tar" and easily has
+    // >=5 words, but it is a pipeline this simple argv-indexed handler was
+    // never written to understand (it would try to feed "|", "ssh", "-o",
+    // ... to real tar as if they were tar's own arguments). Route pipelines
+    // to the real-shell fallback below instead.
+    if (words[0] !== "tar" || words.length < 5 || command.includes("|")) {
+      this.executeGenericShellCommand(channel, command);
       return;
     }
 
@@ -511,6 +612,101 @@ export class RealSshTestServer {
     child.once("close", (code) => {
       if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
         process.stderr.write(`[real-ssh ${this.port}] TAR CLOSE code=${code}\n`);
+      }
+      finish(code ?? 1);
+    });
+  }
+
+  /**
+   * PLAN.MD P1-08a: real-shell fallback for any exec command that is not one
+   * of the simple tar/md5sum forms above -- specifically the probe commands
+   * (`rsync --version`, `ssh -V`, `tar --version`, the non-interactive
+   * `ssh ... true` reachability probe) and the actual rsync/tar|ssh direct-
+   * copy commands TransferService builds. Spawns a REAL `sh -c command`
+   * subprocess: a genuine ssh/rsync/tar binary on THIS test machine does the
+   * real work, including making a real outbound TCP/SSH connection when the
+   * command targets another RealSshTestServer instance -- nothing here is
+   * stubbed.
+   *
+   * Path translation: this fixture simulates "a real remote host" by mapping
+   * remote absolute paths onto rootDirectory (see toLocalPath), but a
+   * compound shell command is opaque text, not structured argv, so it can't
+   * be translated the way the tar branch above translates argv[1]/-C by
+   * index. Rather than generic (and fragile) path-shaped regexing, this only
+   * recognizes the exact fixed shapes buildDirectTarSshCommand in
+   * direct-transfer.ts always produces, and the two shapes are mutually
+   * exclusive on any single command this method ever receives:
+   *   - SOURCE side (this instance is where MCP's own exec landed): the
+   *     command starts with `tar -cf - -C '<dir>' -- `. Only <dir> is
+   *     translated; everything after the pipe (the embedded, still-quoted
+   *     command meant for the destination) is left completely alone here --
+   *     it is opaque to the source and is not this fixture's job to
+   *     understand, only to forward via a real ssh subprocess.
+   *   - DESTINATION side (this instance received the command over a REAL
+   *     ssh hop that the source's own spawned `ssh` process made -- a
+   *     separate, independent exec request executeCommand sees no
+   *     differently than a real remote's sshd would): the command ends with
+   *     ` _ '<destPath>' '<basename>'`. Only <destPath> is translated.
+   * Any command matching neither shape (rsync's own commands, the version
+   * probes, the reachability probe) runs completely unmodified. This fixture
+   * never claims to speak rsync's server protocol, so an end-to-end rsync
+   * backend run is only ever proven by the Linux-gated acceptance test
+   * against a real rsync binary -- the non-gated suite instead proves the
+   * real, honest "rsync not installed here" probe result.
+   */
+  private executeGenericShellCommand(channel: any, rawCommand: string): void {
+    const sourceTarMatch = rawCommand.match(/^tar -cf - -C '([^']*)' -- /);
+    const destInnerMatch = rawCommand.match(/ _ '([^']*)' '([^']*)'$/);
+    let translated = rawCommand;
+    if (sourceTarMatch) {
+      const originalDir = sourceTarMatch[1];
+      translated = translated.replace(
+        `tar -cf - -C '${originalDir}' -- `,
+        `tar -cf - -C '${this.toLocalPath(originalDir)}' -- `,
+      );
+    } else if (destInnerMatch) {
+      const originalDestPath = destInnerMatch[1];
+      translated = translated.replace(
+        ` _ '${originalDestPath}' '`,
+        ` _ '${this.toLocalPath(originalDestPath)}' '`,
+      );
+    }
+    if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
+      process.stderr.write(`[real-ssh ${this.port}] SHELL EXEC ${translated}\n`);
+    }
+    const finish = (code: number): void => {
+      channel.exit(code);
+      channel.end();
+      channel.close();
+    };
+    const child = spawn("sh", ["-c", translated], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      env: this.directExecOptions.execEnv ?? process.env,
+    });
+    // Defensive 'error' listeners on every stream in this pipe chain: unlike
+    // stdout/stderr, stdin is written FROM the (server-side) ssh2 exec
+    // channel, whose underlying connection can be torn down abruptly by a
+    // concurrent RealSshTestServer.stop() elsewhere in a test's `after()`
+    // (this fixture routinely runs two independent real ssh2 servers, one
+    // making real outbound connections to the other). stream.pipe() does
+    // NOT forward 'error' events between the streams it connects, so an
+    // unhandled EPIPE/ECONNRESET on either side would otherwise crash the
+    // whole test process instead of just ending this one exec -- observed
+    // for real while building this fixture (see this task's investigation
+    // notes).
+    channel.on("error", () => { /* connection torn down; nothing left to do */ });
+    child.stdin.on("error", () => { /* peer already closed; nothing left to do */ });
+    channel.pipe(child.stdin);
+    child.stdout.pipe(channel, { end: false });
+    child.stderr.pipe(channel.stderr, { end: false });
+    child.once("error", (error) => {
+      channel.stderr.write(`${error.message}\n`);
+      finish(127);
+    });
+    child.once("close", (code) => {
+      if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
+        process.stderr.write(`[real-ssh ${this.port}] SHELL CLOSE code=${code}\n`);
       }
       finish(code ?? 1);
     });

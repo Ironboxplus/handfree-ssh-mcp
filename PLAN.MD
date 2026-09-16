@@ -960,9 +960,49 @@ P1-03a 相对 P1-01/P1-02 的依赖不成立，理由：
 
 已知行为（非缺陷，已文档化）：`striped=true` 用于 upload/relay 时被接受但忽略，工具描述中明确写有「Download only... Accepted but ignored for upload and relay」，与既有 `fast` 在 relay 模式下的先例一致。因其有明确文档，不属于今日修复的 `fast=` 默认值那类「文档与实际相反」的问题。
 
-- [ ] **P1-04-A1**：1 GiB 随机文件在 50 ms/1 Gbps netem 下，striped 相对同场单 channel baseline 至少 1.8×，或达到整形带宽 70% 以上；二者满足其一且 SHA-256 相同。**未验证 —— 这是 P1-04b，需要在 `.88` 的 Docker + `tc` netem lab 上真跑；进程内测试服务器 RTT 近乎为零，结构上无法产生任何真实加速数据，本轮（P1-04a）未做、也不得声称。**
+- [x] ~~**P1-04-A1**：1 GiB 随机文件在 50 ms/1 Gbps netem 下，striped 相对同场单 channel baseline 至少 1.8×……~~ **作废 —— P1-04b 真跑之后，striped 被整体删除。见下。**
 
-### P1-05 Capability-gated striped upload
+### P1-04b 执行结果（2026-09-16，复核者在真实 netem lab 上执行）：striped 被证伪并删除
+
+**结论先行：striped 不是"没达到 1.8×"，是比 baseline 慢 2.3 倍。按用户决定，只保留 fast 路径，striped 从产品中删除。**
+
+#### 一、先修好测量环境（两个都是真问题）
+
+1. **netem 队列小于 BDP**。netem 默认 `limit` 是 1000 个包，而 1 Gbps × 50 ms 的 BDP ≈ 6.25 MB ≈ 4200 个包。队列装不下合法在途数据，整形退化成持续丢包，两种模式都只有 ~1 MiB/s。已改为按 BDP 计算队列（`netemQueueLimitPackets()`，取 4×BDP），并加了回归测试。
+2. **从 Windows 开发机根本测不了这个门**。修完队列数字没变，于是逐层排查：产品 fast 0.94 MiB/s、产品 striped 1.35 MiB/s、**OpenSSH `scp` 0.96 MiB/s、裸 `ssh cat` 0.82 MiB/s**。同一条路径上 OpenSSH 和本产品数字一致 ⇒ 瓶颈是本机到 `.88` 的链路（~8 Mbit/s），不是产品也不是 fixture。**在一条比整形带宽慢 125 倍的链路后面挂 1 Gbps 的 netem，整形是空操作，P1-04-A1 在这台机器上不可测。** 解法是把 harness 搬到 lab 主机上跑（`SSH_LAB_MODE=local` + `LocalLabConnection`）。没有选择"让 `.88` SSH 自己"，因为那要往共享账号的 `authorized_keys` 里加 key，属于对他人机器的安全性变更，违反 P0-02。
+
+#### 二、真实数字（在 lab 主机上跑，50 ms/1 Gbps netem 真实生效）
+
+| 模式 | 32 MiB smoke | 1 GiB release |
+|---|---|---|
+| `fast`（单 channel fastGet） | 16.0 MiB/s | **19.5–19.6 MiB/s**（5/5 runs，CoV ≈ 0.1%） |
+| `striped`（4 条） | 6.9 MiB/s | 未跑完（模式已决定删除，中止） |
+
+1 Gbps 线速 = 119.2 MiB/s，故 `fast` 达到整形带宽的 **16.4%**。
+
+#### 三、为什么 striped 更慢（架构层面，不是调参问题）
+
+- **N 个 SFTP channel ≠ N 条 TCP 连接。** 所有 channel 复用同一条 TCP 连接、同一个拥塞窗口。而"多线程下载更快"（aria2/axel/rclone）靠的正是多条 **TCP 连接**绕开单流 TCP 限制。本实现从头到尾只有一条 TCP 连接，多开 channel 什么都没多拿到。
+- **流水线反而更浅。** `runStripedReadWorkers` 每个 worker 是 `while { await 一个 READ; 写本地 }`，同一时刻只有 1 个未完成请求 ⇒ 在途 4 × 256 KiB = **1 MiB**。而 ssh2 `fastGet` 是 64 × 32 KiB = **2 MiB** 持续挂着。50 ms RTT 下吞吐 ≈ 在途字节 / RTT，实测比例（19.5 : 6.9）与在途字节比例吻合。
+
+#### 四、这个缺陷是怎么进来的，以及复核为什么没拦住
+
+PLAN 正文 §2 要的是「多连接单文件分片」，`PLAN.MD:81` 甚至专门写明「`fast` 是单 channel 内并发，**不是多 SSH 连接分片**」——**原意明确就是多 TCP 连接**。但 P1-04 的验收条目（本节上方）写成了「每个 stream 使用独立 SSH/SFTP **channel 或 connection**」。这个"或"把唯一能产生加速的机制变成了可选项，实现选了便宜的 channel，加速的前提就此消失。
+
+复核（我）验了区间不重叠、SHA-256、`maxBufferBytes`、失败清理、原子 rename，还用 1 字节重叠的变异验证过断言强度——这些都是真的、也都通过了。**但验的全是"它有没有正确地做它在做的事"，从未质疑"它在做的这件事本身能否产生加速"。** `fast` 已有 64 深流水线这一事实就写在同一份 PLAN 上面 60 行处，比对一下即可看出 4 个串行 worker 是倒退。教训与 SIGTERM 那条同类但更深一层：**变异测试能证明断言有效，不能证明被测特性有意义；架构前提必须单独审。**
+
+#### 五、处置
+
+- **删除 striped**（用户决定，2026-09-16）：`downloadStriped`/`runStripedReadWorkers`/`computeDownloadStripeRanges`/`writeLocalPositional` 及 4 个 stripe 常量、`download`/`transfer` 的 `striped`/`stripeCount`/`maxBufferBytes` 参数、相关测试与文档一并移除。这是**移除一个已发布的工具参数**，属于面向用户的破坏性变更，必须在 release notes 写明；由于它从未带来加速（反而是倒退），保留它才是持续的伤害。
+- **P1-05（capability-gated striped upload）同理作废**：它是 striped download 的上传镜像，前提同样不成立。
+- **真正的加速杠杆记在账上（未做，不得默认已做）**：`fast` 只用到 2 MiB 在途，而 50 ms/1 Gbps 的 BDP 是 6.25 MB。把 `sftpConcurrency` × `chunkSize` 提上去是直接对着 BDP 打的一个参数级改动（旋钮已存在并已透传到工具参数），benchmark harness 也已具备扫参数能力。本轮未做，因为用户的交付范围是"只保留 fast"。
+- **harness 保留**（`scripts/benchmark.mjs`、compose 的 `cap_add: NET_ADMIN`、`SSH_LAB_MODE=local`、`src/tests/benchmark-stats.test.ts`）：它是上述全部结论的证据来源，也是将来调参的唯一可信入口。
+
+### P1-05 Capability-gated striped upload 〔2026-09-16 作废〕
+
+**状态：作废，未开工。** 本任务是 striped download 的上传镜像。P1-04b 在真实 netem lab 上证明 striped 的多 channel 架构不产生加速（比 baseline 慢 2.3 倍，原因见 P1-04b 执行结果），striped download 已整体删除，上传镜像的前提随之消失。下方条目保留供存档，不再是欠债。
+
+
 
 - [ ] 创建、截断和预分配目标 temp 文件只执行一次。
 - [ ] worker 后续打开同一 temp 文件时不得带 truncate flag。
@@ -1000,6 +1040,13 @@ P1-03a 相对 P1-01/P1-02 的依赖不成立，理由：
 
 ### P1-08 Direct planner 与生命周期
 
+**P1-08 拆分记录（Rev.5，2026-09-16）。** 本节原文是照着「有 Controller daemon」写的（marker 恢复、daemon crash 重入、unknown outcome 仲裁），而 Rev.4 已取消 daemon。按 Rev.5「按功能交付、不按分层交付」与「不要过度设计」，拆成两片：
+
+- **P1-08a（本轮做）——「A→B 真的不过本机」这一件事**。`transfer` 的 relay 模式增加 `strategy: "relay" | "direct" | "auto"`，默认 `"relay"`（不改变任何既有行为）。`direct` 在 **source 服务器上**执行拷贝，把 destination 当作它唯一的 remote，于是数据 A→B，**本机中转字节数恒为 0**——这正是用户第 4 个目标的全部内容。范围内：backend 优先 `rsync`、退化到 `tar | ssh`（`rclone` 不做，无人要求）；认证仅 `existing-remote-key`（不传输任何私钥）；destination host key 必须 pinned，禁止自动接受；`auto` 不满足时记录**准确原因**并回退 relay，`direct` 则明确失败；网络不可达时不得声称能绕 NAT。
+- **P1-08b（仍然 gated，本轮不做）**：`rclone` backend、`agent-forward`、daemon crash 后的 marker 重入与 unknown-outcome 仲裁。这些的唯一需求方是常驻形态，Rev.4 已取消。取消 daemon 后 direct 是**单次调用内**的同步操作，没有跨调用崩溃窗口需要仲裁——把不存在的崩溃窗口的恢复协议实现出来，正是约束里禁止的过度设计。
+
+因此下列条目中属于 P1-08b 的（agent-forward、rclone、daemon crash 恢复、unknown outcome 重入）本轮**不标记为未完成的欠债，而是标记为不适用于无 daemon 形态**。
+
 - [ ] `strategy=auto` 依次检查 route、TCP:22、host key、engine、非交互认证和目标 path policy。
 - [ ] probe 必须有超时并返回逐项结果。
 - [ ] direct 优先级：远端 source 上的 `rsync`，其次 `rclone`，其次 `tar | ssh`；仅选 route 允许的 direct backend。
@@ -1014,8 +1061,32 @@ P1-03a 相对 P1-01/P1-02 的依赖不成立，理由：
 - [ ] 每个 backend 定义 cleanup matrix：probe fail、auth fail、source read fail、destination write fail、cancel、Controller crash、unknown outcome。
 - [ ] unknown outcome 禁止直接覆盖重试；只有 marker 与 temp identity/hash 一致时允许安全重入。
 
-- [ ] **P1-08-A1**：真实 source 容器通过 rsync 直接传 destination；Controller relay data byte counter 为 0、控制/日志流量受限、目标 SHA-256 正确；破坏 route/host-key/auth 后 auto 回退且原因准确。
-- [ ] **P1-08-A2**：direct 中途强杀 Controller，重启后不重复覆盖，能恢复/完成或进入 orphaned并安全清理。
+- [x] **P1-08-A1**：**达成，2026-09-16 由复核者在真实两容器 lab 上执行**。`source` 容器用真实 `rsync` 直传 `destination`，MCP host 零 relay；目标内容真实校验。执行记录见下。
+- [ ] ~~**P1-08-A2**：direct 中途强杀 Controller……~~ **不适用**：属 P1-08b，Rev.4 已取消 daemon，direct 是单次调用内的同步操作，不存在跨调用崩溃窗口需要仲裁。
+
+#### P1-08a 执行结果（2026-09-16）
+
+实现：`src/services/direct-transfer.ts`（纯构造与分类）+ `TransferService.probeDirectTransfer`/`executeDirectTransfer`，`transfer` 新增 `strategy: relay|direct|auto`，默认 `relay`（既有行为逐字节不变）。backend 优先 `rsync`，退化 `tar | ssh`；不实现 `rclone`。
+
+**最关键的那条断言是被真实计数器证明的**：`direct` 模式下两端服务器自己的 `openedFiles` / `readRequests` 计数器增量为 **0**，且**同一个测试内**紧接着用默认 relay 跑同一次拷贝，证明这些计数器确实会动——否则"恒为 0"可能只是断言打在了一个永远不动的计数器上。复核者做了变异验证：把 `strategy === "direct"` 分支改成偷偷走 relay，该测试立刻变红（`no real SFTP OPEN during a direct transfer`），证明它真的在守这条性质。
+
+安全面复核：`buildSshCommand` 只加 `-o BatchMode=yes`，全文件无 `StrictHostKeyChecking=no`、无 `UserKnownHostsFile=/dev/null`，host key 信任完全交给 source 既有的 `known_hosts`；不传输任何私钥；不启用 agent forwarding。
+
+真实两容器验收（复核者手工 provision，source→dest 的信任**在测试之前**就已建立，产品只负责在信任已存在时正确工作）：
+
+```
+# lab: 两个 compose 容器，source 的 ~/.ssh/id_ed25519 已授权进 dest 的 authorized_keys，
+# dest 的 host key 已 ssh-keyscan 进 source 的 known_hosts；先独立验证
+#   docker exec -u labuser <source> ssh -o BatchMode=yes -p <destport> labuser@<host> 'echo OK; which rsync'
+#   → DIRECT_TRUST_OK  /usr/bin/rsync
+DIRECT_LAB_SOURCE_HOST/PORT/USER/PASSWORD + DIRECT_LAB_DEST_HOST/PORT/USER/PASSWORD \
+  node --test build/tests/direct-transfer-linux-pending.test.js
+→ tests 2, pass 2, fail 0
+```
+
+**复核中修正的一个 fixture 错误**：auto 回退那条用例原本把 destination 配成"真实主机 + 死端口(2)"，然后断言 auto 回退到 relay 并**成功投递**。这不可能成立——它破坏的是 direct 跳和 relay 腿**共用的同一个地址**，MCP host 同样连不上，所以回退腿必然失败；该用例按原样写永远不可能通过（实测 `Connection lost before handshake`）。要造出"source 连不上而 MCP host 连得上"需要两个不同的网络视角，本两容器 lab 不具备。已改为只断言这个 fixture **唯一能真实证明**的性质：真实网络层探测失败时，`direct` 明确失败、`auto` 拒绝谎报完成（不挂起、不假成功），并显式断言该 destination 从本机同样不可达，使上述拒绝不会被误读为产品缺陷。成功回退 relay 的路径**已在进程内真实 fixture 中证明**（`direct-transfer.test.ts` 的 auto→relay 用例，relay 腿真实可用），不在此处重复。用例标题已同步改写，不再声称"still completes via relay"。
+
+**MSYS 路径转换再次咬人**：`DIRECT_LAB_REMOTE_DIR=/home/labuser/data` 被 git-bash 改写成 `C:/Program Files/Git/home/...`。与 P2 那次同因同解：不传该变量，用 JS 侧默认值。
 
 ### P1-09 批量上传
 
@@ -1079,9 +1150,9 @@ Rev.4 修正：本任务原先被排在 `P1-01 → P1-02 → P1-09`，即等 Tra
 | 用户目标 | 状态 | 对应任务 |
 |---|---|---|
 | 批量上传 | ✅ 已交付 `d0dc039` | P1-09 |
-| 传输加速 | 🔄 部分 | P1-03a ✅ `8244a90`、P1-04a ✅ `06b1552`；P1-04b（性能证明）待做 |
+| 传输加速 | 🔄 部分 | P1-03a ✅ `8244a90`；P1-04a `06b1552` **已删除**（P1-04b 真机证伪，striped 比 baseline 慢 2.3×）；P1-04b 已跑出真实数字（`fast` 19.5 MiB/s = 线速 16.4%），下一步杠杆「提高在途字节数」已记账未做 |
 | 远程运行 | ⬜ 本节 | P2-01/02/03/04/05/06 |
-| 两服务器直传 | ⬜ | P1-08 |
+| 两服务器直传 | ✅ 已交付 | P1-08a（P1-08b 的 rclone/agent-forward/daemon 崩溃重入按 Rev.4 不适用） |
 
 基座任务（P1-01 TransferMetrics、P1-02 `src/fspath/`、P1-03b 资源预算体系）**只在某个功能真正需要它时才做**，并在该功能的任务里写明为什么需要。它们不再是任何功能的默认前置。
 

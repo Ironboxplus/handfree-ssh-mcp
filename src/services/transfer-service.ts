@@ -35,8 +35,26 @@ import path from "path";
 import crypto from "crypto";
 import os from "os";
 import { spawn } from "node:child_process";
+import {
+  buildDirectRsyncCommand,
+  buildDirectTarSshCommand,
+  classifyDirectProbeFailure,
+  selectDirectBackend,
+  type DirectBackend,
+  type DirectEndpoint,
+  type DirectProbeItemResult,
+  type DirectProbeReport,
+  type TransferStrategy,
+} from "./direct-transfer.js";
 
 export type SftpOptions = {
+  /**
+   * PLAN.MD P1-08a. Only used by relay-mode transfers (transferBetweenServers
+   * / transferArchiveBetweenServers). Default "relay" preserves every
+   * existing relay behavior byte-for-byte -- upload/download ignore this
+   * field entirely. See direct-transfer.ts for what "direct"/"auto" do.
+   */
+  strategy?: TransferStrategy;
   reuseConnection?: boolean;
   timeout?: number;
   vvv?: boolean;
@@ -44,17 +62,6 @@ export type SftpOptions = {
   sftpConcurrency?: number;
   chunkSize?: number;
   fileConcurrency?: number;
-  /**
-   * PLAN.MD P1-04a: opt-in multi-channel striped single-file download.
-   * Default false/omitted preserves the existing fast/buffered download
-   * behavior exactly. Download only -- striped upload is P1-05 and not
-   * implemented by this option.
-   */
-  striped?: boolean;
-  /** Only used when striped=true. Number of concurrent byte-range workers. Default 4, capped like fileConcurrency. */
-  stripeCount?: number;
-  /** Only used when striped=true. Hard cap (bytes) on stripeCount * chunkSize, the total data ever buffered in MCP-host memory at once. */
-  maxBufferBytes?: number;
 };
 
 export type ArchiveCompression = "none" | "gzip" | "bzip2" | "xz" | "zstd";
@@ -370,22 +377,6 @@ export class TransferService {
   private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = 8;
   private static readonly ARCHIVE_ERROR_OUTPUT_BYTES = 16 * 1024;
 
-  // PLAN.MD P1-04a: striped (multi-channel) single-file download. Each
-  // stripe worker opens its own SFTP channel on the shared connection, plus
-  // one short-lived channel for the initial stat -- the same MaxSessions
-  // headroom reasoning as MAX_RECURSIVE_FILE_CONCURRENCY above, so the cap
-  // is shared with it rather than re-derived.
-  private static readonly DEFAULT_STRIPE_COUNT = 4;
-  private static readonly MAX_STRIPE_COUNT = TransferService.MAX_RECURSIVE_FILE_CONCURRENCY;
-  // Per-worker read/write chunk inside its own byte range: bounds how much
-  // of one stripe is ever held in memory at a time, matching
-  // SFTP_WRITE_CHUNK_BYTES's role for the buffered upload/download path.
-  private static readonly DEFAULT_STRIPE_CHUNK_BYTES = 256 * 1024;
-  // Hard cap on stripeCount * chunkSize (see createStripeTransferOptions),
-  // same bound and reasoning as MAX_RELAY_PREFETCH_BYTES: a large file must
-  // never be buffered whole in MCP-host memory.
-  private static readonly DEFAULT_STRIPE_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
-
   // upload() returns a human-readable string, and uploadBatch() has to
   // classify each file's outcome from it (the single-file return shape is
   // frozen by the legacy characterization tests, so it cannot become a
@@ -491,36 +482,6 @@ export class TransferService {
    */
   private resolveRelayWorkerCount(sourceSize: number, chunkSize: number, concurrency: number): number {
     return Math.min(concurrency, Math.ceil(sourceSize / chunkSize));
-  }
-
-  /**
-   * Pure: split a `totalSize`-byte file into up to `stripeCount` contiguous,
-   * non-overlapping byte ranges for striped download (PLAN.MD P1-04a).
-   * Never produces more ranges than there are bytes -- a 3-byte file with
-   * stripeCount=8 yields 3 single-byte ranges, not 8 with five empty ones --
-   * and any leftover bytes from an uneven division are spread one-per-range
-   * across the first ranges rather than dumped entirely onto the last one,
-   * so every range's length is within 1 byte of every other. Ranges are
-   * returned in file order and their lengths always sum to exactly
-   * totalSize. A zero-byte file yields no ranges at all: callers create an
-   * empty file directly instead of starting zero-length stripe workers.
-   */
-  private computeDownloadStripeRanges(
-    totalSize: number,
-    stripeCount: number,
-  ): Array<{ offset: number; length: number }> {
-    if (totalSize <= 0) return [];
-    const count = Math.max(1, Math.min(stripeCount, totalSize));
-    const base = Math.floor(totalSize / count);
-    const remainder = totalSize - base * count;
-    const ranges: Array<{ offset: number; length: number }> = [];
-    let offset = 0;
-    for (let index = 0; index < count; index += 1) {
-      const length = base + (index < remainder ? 1 : 0);
-      ranges.push({ offset, length });
-      offset += length;
-    }
-    return ranges;
   }
 
   private sftpOpenFile(
@@ -853,49 +814,6 @@ export class TransferService {
       );
     }
     return concurrency;
-  }
-
-  /**
-   * Striped download channel count (PLAN.MD P1-04a): same MaxSessions-
-   * headroom reasoning as resolveRecursiveFileConcurrency above, since each
-   * stripe worker likewise opens its own SFTP channel on the shared
-   * connection.
-   */
-  private resolveStripeCount(options?: SftpOptions): number {
-    const requested = this.optionalPositiveInteger(options?.stripeCount, "stripeCount");
-    const count = requested ?? TransferService.DEFAULT_STRIPE_COUNT;
-    if (count > TransferService.MAX_STRIPE_COUNT) {
-      throw new ToolError(
-        "INVALID_CONFIGURATION",
-        `stripeCount must not exceed ${TransferService.MAX_STRIPE_COUNT}`,
-        false,
-      );
-    }
-    return count;
-  }
-
-  /**
-   * Resolve and validate a striped download's channel count and per-worker
-   * chunk size against the hard maxBufferBytes cap, BEFORE any SFTP channel
-   * is opened -- same ordering rationale as createRelayTransferOptions.
-   */
-  private createStripeTransferOptions(options?: SftpOptions): { stripeCount: number; chunkSize: number } {
-    const stripeCount = this.resolveStripeCount(options);
-    const chunkSize = this.optionalPositiveInteger(options?.chunkSize, "chunkSize") ??
-      TransferService.DEFAULT_STRIPE_CHUNK_BYTES;
-    const maxBufferBytes = this.optionalPositiveInteger(options?.maxBufferBytes, "maxBufferBytes") ??
-      TransferService.DEFAULT_STRIPE_MAX_BUFFER_BYTES;
-    const bufferNeeded = stripeCount * chunkSize;
-
-    if (!Number.isSafeInteger(bufferNeeded) || bufferNeeded > maxBufferBytes) {
-      throw new ToolError(
-        "INVALID_CONFIGURATION",
-        `striped download buffer window is too large (${stripeCount} x ${chunkSize} bytes; max ${maxBufferBytes} bytes)`,
-        false,
-      );
-    }
-
-    return { stripeCount, chunkSize };
   }
 
   /**
@@ -1799,266 +1717,6 @@ export class TransferService {
   }
 
   /**
-   * Positional write into an already-open local file descriptor. Multiple
-   * stripe workers call this concurrently with disjoint (offset, length)
-   * ranges -- passing an explicit position makes each call independent of
-   * the fd's shared cursor, so concurrent calls never race or overwrite
-   * each other's bytes.
-   */
-  private writeLocalPositional(fd: number, chunk: Buffer, offset: number): Promise<void> {
-    return new Promise((resolve, reject) => {
-      fs.write(fd, chunk, 0, chunk.length, offset, (error) => {
-        if (error) {
-          reject(new ToolError(
-            "LOCAL_FILE_WRITE_FAILED",
-            `Failed to write striped download data at offset ${offset}: ${error.message}`,
-            false,
-          ));
-          return;
-        }
-        resolve();
-      });
-    });
-  }
-
-  /** Streaming MD5 of a local file, without buffering it whole. */
-  private localFileMd5(localPath: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const hash = crypto.createHash("md5");
-      const stream = fs.createReadStream(localPath);
-      stream.on("data", (chunk: string | Buffer) => hash.update(chunk));
-      stream.on("end", () => resolve(hash.digest("hex")));
-      stream.on("error", reject);
-    });
-  }
-
-  /**
-   * Temp path for a striped download's local file, alongside the final
-   * destination so the closing rename is same-volume (and therefore
-   * atomic). Dot-prefixed and PID/random-suffixed so concurrent striped
-   * downloads to the same directory never collide.
-   */
-  private stripeTempFilePath(localPath: string): string {
-    const directory = path.dirname(localPath);
-    const base = path.basename(localPath);
-    const unique = crypto.randomBytes(6).toString("hex");
-    return path.join(directory, `.${base}.striped-${process.pid}-${unique}.tmp`);
-  }
-
-  /**
-   * PLAN.MD P1-04a: pull each byte range in `ranges` over its own SFTP
-   * channel, positionally writing straight into `fd`. Follows the same
-   * fire-and-forget-worker-with-shared-`settled`-flag shape as
-   * relayWithPrefetchWindow above (not Promise.all): a worker that fails
-   * calls `fail()` internally instead of letting its async function reject,
-   * so no worker's promise ever rejects after the pool has already settled
-   * -- avoiding unhandled rejections from workers still winding down after
-   * the first failure. On any failure or stall, `abort()` ends every
-   * currently-open stripe channel, which fails their in-flight read/write
-   * and lets each worker's own cleanup run; the shared `client` connection
-   * itself is never touched here; a connection-shaped error is left for
-   * download()'s existing pool-health handling.
-   */
-  private async runStripedReadWorkers(
-    client: Client,
-    remotePath: string,
-    fd: number,
-    ranges: ReadonlyArray<{ offset: number; length: number }>,
-    chunkSize: number,
-    timeout: number | undefined,
-    debug: SshDebugSink | undefined,
-  ): Promise<void> {
-    const openSftps = new Set<SFTPWrapper>();
-
-    const abort = () => {
-      for (const sftp of openSftps) {
-        try {
-          sftp.end();
-        } catch {
-          // Ignore a channel that is already gone.
-        }
-      }
-    };
-
-    await this.runWithInactivityTimeout<void>(
-      (onProgress) =>
-        new Promise<void>((resolve, reject) => {
-          let settled = false;
-          let workersRemaining = ranges.length;
-
-          const fail = (error: Error) => {
-            if (settled) return;
-            settled = true;
-            abort();
-            reject(error);
-          };
-
-          const runWorker = async (range: { offset: number; length: number }, index: number): Promise<void> => {
-            let sftp: SFTPWrapper | null = null;
-            let handle: Buffer | null = null;
-            try {
-              sftp = await this.openSftp(client, `stripe-${index}`, timeout, debug);
-              if (settled) {
-                sftp.end();
-                return;
-              }
-              openSftps.add(sftp);
-              handle = await this.sftpOpenFile(
-                sftp,
-                remotePath,
-                "r",
-                (error) => this.makeSftpError(`Striped read open error (stripe ${index})`, error),
-              );
-              let received = 0;
-              while (received < range.length) {
-                if (settled) return;
-                const wantLength = Math.min(chunkSize, range.length - received);
-                const readOffset = range.offset + received;
-                const chunk = await this.sftpReadRelayChunk(sftp, handle, readOffset, wantLength);
-                onProgress();
-                if (settled) return;
-                await this.writeLocalPositional(fd, chunk, readOffset);
-                onProgress();
-                received += wantLength;
-              }
-            } catch (error) {
-              fail(error as Error);
-              return;
-            } finally {
-              if (handle && sftp) {
-                try {
-                  await this.sftpCloseFile(sftp, handle);
-                } catch {
-                  // Ignore cleanup errors after the original outcome.
-                }
-              }
-              if (sftp) {
-                openSftps.delete(sftp);
-                try {
-                  sftp.end();
-                } catch {
-                  // Ignore a channel that is already gone.
-                }
-              }
-            }
-
-            workersRemaining -= 1;
-            if (workersRemaining === 0 && !settled) {
-              settled = true;
-              resolve();
-            }
-          };
-
-          for (let index = 0; index < ranges.length; index += 1) {
-            void runWorker(ranges[index], index);
-          }
-        }),
-      this.transferStallTimeout(timeout),
-      `striped download ${remotePath}`,
-      debug,
-      abort,
-    );
-  }
-
-  /**
-   * PLAN.MD P1-04a: multi-channel striped single-file download. Splits the
-   * remote file into non-overlapping byte ranges (computeDownloadStripeRanges),
-   * pulls each range concurrently over its own SFTP channel into a
-   * preallocated local temp file via positional writes, verifies size (and
-   * MD5 when the remote exposes md5sum, best-effort like every other
-   * verification path in this service), then atomically renames the temp
-   * file into place. Any failure -- a worker's or verification's -- deletes
-   * the temp file before the error propagates; the destination path is
-   * never touched until the rename, so a failed striped download never
-   * leaves a partial file at localPath.
-   */
-  private async downloadStriped(
-    client: Client,
-    remotePath: string,
-    localPath: string,
-    options: SftpOptions | undefined,
-    timeout: number | undefined,
-    debug: SshDebugSink | undefined,
-  ): Promise<void> {
-    const { stripeCount, chunkSize } = this.createStripeTransferOptions(options);
-
-    // One extra short-lived channel for the initial stat -- the same
-    // accounting MAX_RECURSIVE_FILE_CONCURRENCY already budgets headroom
-    // for with its own briefly-held mkdir channel.
-    const statSftp = await this.openSftp(client, "stripe-stat", timeout, debug);
-    let remoteSize: number;
-    try {
-      remoteSize = (await this.sftpStat(statSftp, remotePath, "source")).size;
-    } finally {
-      try {
-        statSftp.end();
-      } catch {
-        // Ignore late SFTP cleanup errors.
-      }
-    }
-
-    const ranges = this.computeDownloadStripeRanges(remoteSize, stripeCount);
-    const tempPath = this.stripeTempFilePath(localPath);
-    let fd: number | null = null;
-
-    const cleanupTempFile = () => {
-      if (fd !== null) {
-        try {
-          fs.closeSync(fd);
-        } catch {
-          // Already closed.
-        }
-        fd = null;
-      }
-      try {
-        fs.unlinkSync(tempPath);
-      } catch {
-        // Already gone.
-      }
-    };
-
-    try {
-      fd = fs.openSync(tempPath, "w");
-      fs.ftruncateSync(fd, remoteSize); // Preallocate: fix the final size up front.
-
-      if (ranges.length > 0) {
-        await this.runStripedReadWorkers(client, remotePath, fd, ranges, chunkSize, timeout, debug);
-      }
-
-      fs.closeSync(fd);
-      fd = null;
-
-      const localSize = fs.statSync(tempPath).size;
-      if (localSize !== remoteSize) {
-        throw new ToolError(
-          "SFTP_ERROR",
-          `Striped download verification failed: size mismatch (remote=${remoteSize} bytes, local=${localSize} bytes)`,
-          true,
-        );
-      }
-
-      // Best-effort MD5 verification: only enforced when the remote exposes
-      // md5sum, matching transferBetweenServers's own post-transfer check.
-      const remoteHash = await this.remoteMd5(client, remotePath).catch(() => null);
-      if (remoteHash) {
-        const localHash = await this.localFileMd5(tempPath);
-        if (localHash !== remoteHash) {
-          throw new ToolError(
-            "SFTP_ERROR",
-            `Striped download verification failed: MD5 mismatch (remote=${remoteHash}, local=${localHash})`,
-            true,
-          );
-        }
-      }
-
-      fs.renameSync(tempPath, localPath);
-    } catch (error) {
-      cleanupTempFile();
-      throw error;
-    }
-  }
-
-  /**
    * Download file
    */
   public async download(
@@ -2081,21 +1739,6 @@ export class TransferService {
         debug,
         purpose: "sftp",
       });
-
-      if (options?.striped === true) {
-        await this.downloadStriped(
-          connection.client,
-          validatedRemotePath,
-          validatedLocalPath,
-          options,
-          options?.timeout,
-          debug,
-        );
-        return appendDebugOutput(
-          "File downloaded successfully via striped multi-channel SFTP",
-          debugCollector,
-        );
-      }
 
       if (options?.fast === true) {
         await this.sftpFastGet(
@@ -2150,7 +1793,307 @@ export class TransferService {
    * After the transfer, file sizes are compared via SFTP stat.
    * If both servers have md5sum, a hash verification is also performed.
    */
+  /**
+   * PLAN.MD P1-08a dispatcher. `strategy` defaults to "relay", which routes
+   * straight to transferBetweenServersRelay below with zero behavior change
+   * (that method's body is byte-for-byte what public transferBetweenServers
+   * used to be). "direct"/"auto" probe the source server for a usable direct
+   * backend (rsync, else tar|ssh -- never rclone) and, if usable, run the
+   * copy ON THE SOURCE so bytes travel source -> destination without ever
+   * passing through this MCP host. "direct" fails explicitly if no backend
+   * is usable; "auto" falls back to the existing relay path and reports the
+   * accurate reason it did so.
+   */
   public async transferBetweenServers(
+    sourceName: string,
+    sourceRemotePath: string,
+    destName: string,
+    destRemotePath: string,
+    options?: SftpOptions & { skipIfIdentical?: boolean },
+  ): Promise<string> {
+    const strategy: TransferStrategy = options?.strategy ?? "relay";
+    if (strategy === "relay") {
+      return this.transferBetweenServersRelay(sourceName, sourceRemotePath, destName, destRemotePath, options);
+    }
+
+    const probe = await this.probeDirectTransfer(sourceName, destName, destRemotePath, options);
+    if (strategy === "direct") {
+      if (!probe.ok || !probe.backend) {
+        throw new ToolError(
+          "DIRECT_TRANSFER_UNAVAILABLE",
+          `Direct transfer is not possible: ${probe.reason ?? "no usable direct backend"}`,
+          false,
+        );
+      }
+      return this.executeDirectTransfer(sourceName, sourceRemotePath, destName, destRemotePath, probe.backend, options);
+    }
+
+    // strategy === "auto"
+    if (probe.ok && probe.backend) {
+      return this.executeDirectTransfer(sourceName, sourceRemotePath, destName, destRemotePath, probe.backend, options);
+    }
+    const relayResult = await this.transferBetweenServersRelay(sourceName, sourceRemotePath, destName, destRemotePath, options);
+    return `auto strategy: direct transfer not possible (${probe.reason ?? "no usable direct backend"}); fell back to relay.\n${relayResult}`;
+  }
+
+  /**
+   * PLAN.MD P1-08a: probe the source server for a usable direct-transfer
+   * path to destName:destRemotePath, with a real timeout on every network
+   * check, returning per-item results (PLAN.MD requires this, not just a
+   * single ok/fail). Never mutates anything -- safe to call speculatively
+   * (which "auto" does on every call).
+   */
+  public async probeDirectTransfer(
+    sourceName: string,
+    destName: string,
+    destRemotePath: string,
+    options?: SftpOptions,
+  ): Promise<DirectProbeReport> {
+    const { debug } = createDebugCollector(options?.vvv === true);
+    const destConfig = this.pool.getConfig(destName);
+
+    // 1. Destination path policy: pure, no network -- reuses the exact same
+    // check upload/download/relay already enforce. Checked FIRST and, if it
+    // fails, returned immediately WITHOUT attempting any of the network
+    // probes below: a request whose destination path is already policy-
+    // rejected cannot succeed regardless of route/host-key/auth/backend, so
+    // there is nothing to gain from paying for those round trips -- and
+    // "auto" falling back to relay would hit the exact same rejection
+    // immediately anyway (relay validates the same path the same way at the
+    // top of its own call). The other items are left at their default
+    // (unevaluated) `{ ok: true }` shape -- they were never checked, not
+    // "checked and passed".
+    let destinationPathPolicy: DirectProbeItemResult = { ok: true };
+    try {
+      this.validateRemotePath(destRemotePath, destName);
+    } catch (error) {
+      destinationPathPolicy = { ok: false, reason: (error as Error).message };
+    }
+    if (!destinationPathPolicy.ok) {
+      return {
+        ok: false,
+        reason: destinationPathPolicy.reason,
+        items: {
+          destinationPathPolicy,
+          backendAvailable: { ok: true },
+          route: { ok: true },
+          hostKey: { ok: true },
+          auth: { ok: true },
+        },
+      };
+    }
+
+    // 2. Backend availability: real exec on the source server. rsync/tar/ssh
+    // absence is a genuine, real "not installed" result (ENOENT-shaped exit),
+    // not simulated.
+    const noop = { code: 1, stdout: "", stderr: "" };
+    const [rsyncResult, sshResult, tarResult] = await Promise.all([
+      this.execCapture(sourceName, "rsync --version", options, debug, TransferService.DEFAULT_DIRECT_PROBE_TIMEOUT_MS).catch(() => noop),
+      this.execCapture(sourceName, "ssh -V", options, debug, TransferService.DEFAULT_DIRECT_PROBE_TIMEOUT_MS).catch(() => noop),
+      this.execCapture(sourceName, "tar --version", options, debug, TransferService.DEFAULT_DIRECT_PROBE_TIMEOUT_MS).catch(() => noop),
+    ]);
+    const backendSelection = selectDirectBackend({
+      rsyncAvailable: rsyncResult.code === 0,
+      sshAvailable: sshResult.code === 0,
+      tarAvailable: tarResult.code === 0,
+    });
+    const backendAvailable: DirectProbeItemResult & { backend?: DirectBackend } = backendSelection.ok
+      ? { ok: true, backend: backendSelection.backend }
+      : { ok: false, reason: backendSelection.reason };
+
+    // 3. Route + host key + auth: ONE real non-interactive probe connection
+    // from source to destination (ssh ... true), classified from its real
+    // exit code/stderr. Collapsing these into one exec call is deliberate --
+    // OpenSSH's own error text already distinguishes "never reached the
+    // host" from "reached it but the host key is unknown" from "reached it,
+    // key is fine, but auth failed", so a second/third round trip would only
+    // add latency, not information. classifyDirectProbeFailure is what turns
+    // that text into a distinct, testable per-item result.
+    let route: DirectProbeItemResult = { ok: true };
+    let hostKey: DirectProbeItemResult = { ok: true };
+    let auth: DirectProbeItemResult = { ok: true };
+    const probeCommand = [
+      "ssh", "-o", "BatchMode=yes",
+      "-o", `ConnectTimeout=${TransferService.DEFAULT_DIRECT_CONNECT_TIMEOUT_SECONDS}`,
+      "-p", String(destConfig.port),
+      `${destConfig.username}@${destConfig.host}`,
+      "true",
+    ].join(" ");
+    const probeResult = await this.execCapture(sourceName, probeCommand, options, debug, TransferService.DEFAULT_DIRECT_PROBE_TIMEOUT_MS);
+    if (probeResult.code !== 0) {
+      const classification = classifyDirectProbeFailure(probeResult.code, probeResult.stderr);
+      const item: DirectProbeItemResult = { ok: false, reason: classification.reason };
+      if (classification.category === "hostKey") hostKey = item;
+      else if (classification.category === "auth") auth = item;
+      else route = item; // "route" and "unknown" both surface under route.
+    }
+
+    const items = { destinationPathPolicy, backendAvailable, route, hostKey, auth };
+    // PLAN.MD's own enumeration order: route, host key, backend, auth, path policy.
+    const failurePriority: Array<keyof typeof items> = ["route", "hostKey", "backendAvailable", "auth", "destinationPathPolicy"];
+    const firstFailure = failurePriority.map((key) => items[key]).find((item) => !item.ok);
+    return {
+      ok: !firstFailure,
+      reason: firstFailure?.reason,
+      backend: backendAvailable.backend,
+      items,
+    };
+  }
+
+  /**
+   * PLAN.MD P1-08a: run the actual copy ON THE SOURCE SERVER (source path is
+   * local to it; destination is its only remote), then verify byte-for-byte
+   * correctness using ONLY exec-based md5sum on both ends -- never SFTP
+   * OPEN/READ of the file's own bytes, so this MCP host never touches the
+   * transferred data at all, not even for verification.
+   */
+  private async executeDirectTransfer(
+    sourceName: string,
+    sourceRemotePath: string,
+    destName: string,
+    destRemotePath: string,
+    backend: DirectBackend,
+    options: SftpOptions | undefined,
+  ): Promise<string> {
+    const validatedSourcePath = this.validateRemotePath(sourceRemotePath, sourceName);
+    const validatedDestPath = this.validateRemotePath(destRemotePath, destName);
+    const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
+    const destConfig = this.pool.getConfig(destName);
+    const endpoint: DirectEndpoint = { user: destConfig.username, host: destConfig.host, port: destConfig.port };
+    const commandOptions = { connectTimeoutSeconds: TransferService.DEFAULT_DIRECT_CONNECT_TIMEOUT_SECONDS };
+    const command = backend === "rsync"
+      ? buildDirectRsyncCommand(validatedSourcePath, endpoint, validatedDestPath, commandOptions)
+      : buildDirectTarSshCommand(validatedSourcePath, endpoint, validatedDestPath, commandOptions);
+
+    debug?.(`[mcp] direct transfer (${backend}) ${sourceName}:${validatedSourcePath} -> ${destName}:${validatedDestPath}`);
+    let srcConnection: AcquiredSshClient | null = null;
+    let dstConnection: AcquiredSshClient | null = null;
+    const reuseConnection = options?.reuseConnection !== false;
+    try {
+      const result = await this.execCapture(sourceName, command, options, debug);
+      if (result.code !== 0) {
+        throw new ToolError(
+          "DIRECT_TRANSFER_FAILED",
+          `Direct transfer (${backend}) failed on source [${sourceName}] (exit ${result.code ?? "unknown"})` +
+            `${result.stderr.trim() ? `: ${result.stderr.trim().slice(-500)}` : ""}`,
+          false,
+        );
+      }
+
+      srcConnection = await this.pool.acquireSshClient(sourceName, { reuseConnection, timeout: options?.timeout, debug, purpose: "command" });
+      dstConnection = sourceName === destName
+        ? srcConnection
+        : await this.pool.acquireSshClient(destName, { reuseConnection, timeout: options?.timeout, debug, purpose: "command" });
+      const [srcMd5, dstMd5] = await Promise.all([
+        this.remoteMd5(srcConnection.client, validatedSourcePath).catch(() => null),
+        this.remoteMd5(dstConnection.client, validatedDestPath).catch(() => null),
+      ]);
+      if (srcMd5 && dstMd5 && srcMd5 !== dstMd5) {
+        throw new ToolError(
+          "DIRECT_TRANSFER_FAILED",
+          `Direct transfer (${backend}) verification failed: MD5 mismatch (source=${srcMd5}, dest=${dstMd5})`,
+          true,
+        );
+      }
+      const verification = srcMd5 && dstMd5 ? `, verified md5=${srcMd5}` : "";
+      return appendDebugOutput(
+        `Direct transfer complete (${backend}, source-to-destination; the MCP host relayed no file data)${verification}: ` +
+          `${sourceName}:'${validatedSourcePath}' → ${destName}:'${validatedDestPath}'`,
+        debugCollector,
+      );
+    } catch (error) {
+      throw appendDebugToError(error as Error, debugCollector);
+    } finally {
+      srcConnection?.close();
+      if (sourceName !== destName) dstConnection?.close();
+    }
+  }
+
+  /**
+   * Run `command` on server `name` via a plain exec channel and capture its
+   * exit code plus bounded stdout/stderr tails, WITHOUT throwing on a
+   * non-zero exit -- callers (probe/direct execution) need to classify
+   * failure, not just detect it. `execTimeoutMs` bounds the whole call
+   * (channel open + run); omit it for an operation whose duration should not
+   * be capped by this (matching relay/upload/download's own "timeout bounds
+   * setup, not stream duration" contract).
+   */
+  private async execCapture(
+    name: string,
+    command: string,
+    options: SftpOptions | undefined,
+    debug: SshDebugSink | undefined,
+    execTimeoutMs?: number,
+  ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    const reuseConnection = options?.reuseConnection !== false;
+    let connection: AcquiredSshClient | null = null;
+    try {
+      connection = await this.pool.acquireSshClient(name, {
+        reuseConnection,
+        timeout: options?.timeout,
+        debug,
+        purpose: "command",
+      });
+      const stream = await this.pool.withConnectionTimeout(
+        new Promise<ClientChannel>((resolve, reject) => {
+          connection!.client.exec(command, (error, channel) => {
+            if (error) {
+              reject(this.pool.isConnectionShapedMessage(error.message)
+                ? new ToolError("SSH_CONNECTION_FAILED", `Failed to open direct-transfer command channel on [${name}]: ${error.message}`, true)
+                : new ToolError("COMMAND_EXECUTION_ERROR", `Failed to open direct-transfer command channel on [${name}]: ${error.message}`, false));
+              return;
+            }
+            resolve(channel);
+          });
+        }),
+        this.pool.normalizeConnectTimeout(options?.timeout),
+        `Direct-transfer command channel open on [${name}]`,
+        debug,
+      );
+      const drain = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+        const stdoutCollector = new OutputCollector(TransferService.ARCHIVE_ERROR_OUTPUT_BYTES);
+        const stderrCollector = new OutputCollector(TransferService.ARCHIVE_ERROR_OUTPUT_BYTES);
+        let settled = false;
+        const finish = (code: number | null, error?: Error) => {
+          if (settled) return;
+          settled = true;
+          if (error) { reject(error); return; }
+          resolve({
+            code,
+            stdout: stdoutCollector.getSnapshot().tail.toString("utf8"),
+            stderr: stderrCollector.getSnapshot().tail.toString("utf8"),
+          });
+        };
+        stream.on("data", (chunk: Buffer) => stdoutCollector.push(chunk));
+        stream.stderr.on("data", (chunk: Buffer) => stderrCollector.push(chunk));
+        stream.on("error", (error: Error) => finish(null, this.makeSftpError(`Direct-transfer command failed on [${name}]`, error)));
+        stream.on("exit", (code: number | null) => finish(code));
+        stream.on("close", (code: number | null) => finish(code));
+      });
+      return await this.pool.withConnectionTimeout(
+        drain,
+        execTimeoutMs,
+        `Direct-transfer command run on [${name}]`,
+        debug,
+        () => { try { stream.close(); } catch { /* already closed */ } },
+      );
+    } catch (error) {
+      if (reuseConnection && this.pool.isConnectionError(error as Error)) {
+        this.pool.closeClient(name, true);
+      }
+      throw error;
+    } finally {
+      connection?.close();
+    }
+  }
+
+  // PLAN.MD P1-08a probe timings. Not user-configurable -- these bound
+  // internal diagnostic exec calls (version checks, one non-interactive
+  // connectivity probe), not the actual data transfer.
+  private static readonly DEFAULT_DIRECT_PROBE_TIMEOUT_MS = 8000;
+  private static readonly DEFAULT_DIRECT_CONNECT_TIMEOUT_SECONDS = 6;
+
+  private async transferBetweenServersRelay(
     sourceName: string,
     sourceRemotePath: string,
     destName: string,

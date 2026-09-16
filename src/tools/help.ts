@@ -175,18 +175,7 @@ Parameters:
   fast            (boolean, optional)  Default false. Use ssh2 fastGet for
                   single-file download throughput. Not multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
-  chunkSize       (number, optional)   Only with fast=true, or with striped=true
-                  (per-stripe chunk bytes; default 262144).
-  striped         (boolean, optional)  Default false. Split into stripeCount
-                  non-overlapping byte ranges pulled concurrently over separate
-                  SFTP channels into a preallocated local temp file, then
-                  verified (size, and MD5 when the remote has md5sum) and
-                  atomically renamed into place. Takes priority over fast.
-  stripeCount     (number, optional)   Only with striped=true. Concurrent
-                  byte-range channels. Default 4, maximum 8.
-  maxBufferBytes  (number, optional)   Only with striped=true. Hard cap on
-                  stripeCount * chunkSize, the data ever buffered in MCP-host
-                  memory at once. Default 67108864 (64 MiB).
+  chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -195,19 +184,23 @@ connectionName rule:
 Example:
   download { remotePath: "/var/log/app.log", localPath: "app.log" }
   download { remotePath: "/tmp/big.bin", localPath: "big.bin", fast: true,
-             sftpConcurrency: 32, chunkSize: 131072 }
-  download { remotePath: "/tmp/huge.bin", localPath: "huge.bin", striped: true,
-             stripeCount: 4 }`,
+             sftpConcurrency: 32, chunkSize: 131072 }`,
 
   "transfer": `transfer — Move files between hosts (single/recursive/cross-server).
 
 Modes:
   upload    Push local → remote (single file or recursive directory).
   download  Pull remote → local (single file or recursive directory).
-  relay     Stream a file from remote-A → remote-B via SFTP piping.
-            No temp file on the MCP host, no SCP, no authorized-key
-            exchange between the two servers. Each side uses its own
-            existing SSH session.
+  relay     Copy a file from remote-A → remote-B. strategy="relay" (default,
+            unchanged) streams it via SFTP piping through this MCP host; no
+            temp file on the MCP host, no SCP, no authorized-key exchange
+            between the two servers. strategy="direct" instead runs the copy
+            ON server-A (rsync, else tar piped over ssh) so this MCP host
+            never reads or writes the file's bytes; requires server-A to
+            already reach server-B directly with its own pre-existing
+            non-interactive SSH trust (never transfers a private key, never
+            auto-accepts an unknown host key). strategy="auto" uses direct
+            when possible, else falls back to relay and reports why.
 
 Parameters for upload / download:
   mode            (string, required)   "upload" or "download"
@@ -225,19 +218,7 @@ Parameters for upload / download:
                   use ssh2 fastPut/fastGet for each single file. Directory
                   recursion stays sequential; no multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
-  chunkSize       (number, optional)   Only with fast=true, or with striped=true
-                  (per-stripe chunk bytes; default 262144).
-  striped         (boolean, optional)  Download only. Default false. Split the
-                  download into stripeCount non-overlapping byte ranges pulled
-                  concurrently over separate SFTP channels into a preallocated
-                  local temp file, verified (size, and MD5 when the remote has
-                  md5sum) and atomically renamed into place. Takes priority
-                  over fast. Accepted but ignored for upload and relay.
-  stripeCount     (number, optional)   Download with striped=true only.
-                  Concurrent byte-range channels. Default 4, maximum 8.
-  maxBufferBytes  (number, optional)   Download with striped=true only. Hard
-                  cap on stripeCount * chunkSize, the data ever buffered in
-                  MCP-host memory at once. Default 67108864 (64 MiB).
+  chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
   fileConcurrency (number, optional)   Recursive or batch upload only: independent
                   files transferred in parallel. Default 4, maximum 8. Each
                   parallel file opens its own SFTP channel on the same SSH
@@ -275,6 +256,18 @@ Parameters for relay:
   vvv               (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
   fast              (boolean, optional)  Accepted but relay keeps the streaming
                     SFTP pipe path; fastGet/fastPut apply to host<->remote only.
+  strategy          (string, optional)   "relay" (default) | "direct" | "auto".
+                    "direct": run the copy on the source server (rsync, else
+                    tar|ssh; never rclone) so this MCP host relays zero
+                    file-data bytes; fails explicitly with the precise reason
+                    if not possible (source cannot reach the destination
+                    directly, destination host key not pinned on the source,
+                    non-interactive existing-remote-key auth unavailable, or
+                    no backend installed on the source). Direct transfer
+                    cannot traverse NAT — use a jump host, an overlay
+                    network, or strategy="relay" instead. "auto": probe the
+                    same conditions and use direct when possible, else fall
+                    back to relay and report the real reason.
 
 connectionName rule (upload/download):
   • If only one server is enabled → optional.
@@ -284,9 +277,10 @@ Examples:
   transfer { mode: "upload", localPath: "dist/", remotePath: "/opt/app/dist", recursive: true }
   transfer { mode: "upload", localPath: ["a/config.yaml", "b/settings.json"], remotePath: "/etc/app" }
   transfer { mode: "download", localPath: "huge.bin", remotePath: "/data/huge.bin",
-             striped: true, stripeCount: 4 }
   transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/var/log/app.log",
-             destServer: "backup", destRemotePath: "/backup/app.log" }`,
+             destServer: "backup", destRemotePath: "/backup/app.log" }
+  transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/data/dump.tar",
+             destServer: "backup", destRemotePath: "/backup/dump.tar", strategy: "auto" }`,
 
   "workspace-run": `workspace-run — Launch an entrypoint on a remote server under a configured runProfiles.<name> entry, durably.
 

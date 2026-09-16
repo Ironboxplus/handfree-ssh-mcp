@@ -14,6 +14,8 @@ export type ToolErrorCode =
   | "INVALID_CONFIGURATION"
   | "BATCH_TOO_LARGE"
   | "BATCH_TARGET_COLLISION"
+  | "DIRECT_TRANSFER_UNAVAILABLE"
+  | "DIRECT_TRANSFER_FAILED"
   | "UNKNOWN_ERROR";
 
 export class ToolError extends Error {
