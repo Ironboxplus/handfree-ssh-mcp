@@ -162,6 +162,12 @@ export function buildSweepGrid() {
     { label: "c256 x 128KiB", sftpConcurrency: 256, chunkSize: 128 * 1024, connections: 1 },
     { label: "c64 x 32KiB x 2 CONNECTIONS", sftpConcurrency: 64, chunkSize: 32 * 1024, connections: 2 },
     { label: "c64 x 32KiB x 4 CONNECTIONS", sftpConcurrency: 64, chunkSize: 32 * 1024, connections: 4 },
+    // The SHIPPING feature: one download() call with connections=N, which
+    // splits ONE file into N ranges over N connections. The rows above are a
+    // proxy (N whole-file downloads in parallel); this is the real thing.
+    { label: "PRODUCT connections=2 (single file)", product: 2 },
+    { label: "PRODUCT connections=4 (single file)", product: 4 },
+    { label: "PRODUCT connections=8 (single file)", product: 8 },
   ];
 }
 
@@ -641,7 +647,7 @@ async function main() {
         // not N channels on one connection (which is what was removed).
         const names = [];
         const config = {};
-        for (let i = 0; i < point.connections; i += 1) {
+        for (let i = 0; i < (point.connections ?? 1); i += 1) {
           const n = `${serverName}-conn${i}`;
           names.push(n);
           config[n] = { ...baseServerConfig };
@@ -649,6 +655,27 @@ async function main() {
         manager.setConfig(config, names);
         const svc = manager.getTransferService();
         const opts = { fast: true, reuseConnection: true, timeout: 1_800_000, sftpConcurrency: point.sftpConcurrency, chunkSize: point.chunkSize };
+
+        if (point.product) {
+          const runOnceProduct = async () => {
+            const local = path.join(scratchDir, "sweep-product.bin");
+            if (fs.existsSync(local)) fs.rmSync(local);
+            const started = process.hrtime.bigint();
+            await svc.download(remotePath, local, names[0], { connections: point.product, timeout: 1_800_000 });
+            const ms = Number(process.hrtime.bigint() - started) / 1e6;
+            if (sha256File(local) !== expectedSha256) throw new Error(`${point.label}: SHA-256 mismatch`);
+            fs.rmSync(local);
+            return ms;
+          };
+          for (let i = 0; i < profile.warmups; i += 1) await runOnceProduct();
+          const productSamples = [];
+          for (let i = 0; i < profile.runs; i += 1) productSamples.push(await runOnceProduct());
+          const productThroughput = throughput(profile.fileBytes, median(productSamples));
+          rows.push({ ...point, connections: point.product, samples: productSamples, aggregateBytesPerSec: productThroughput, perConnectionBytesPerSec: productThroughput / point.product });
+          log(`  ${point.label.padEnd(30)} ${(productThroughput / (1024 * 1024)).toFixed(2)} MiB/s`);
+          manager.disconnect();
+          continue;
+        }
 
         const runOnce = async () => {
           const started = process.hrtime.bigint();

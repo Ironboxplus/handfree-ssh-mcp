@@ -1024,7 +1024,35 @@ PLAN 正文 §2 要的是「多连接单文件分片」，`PLAN.MD:81` 甚至专
 
 **顺带修掉的报告缺陷**：`impliedInFlightBytes`/`bdpBytes` 原本用 `measuredRttMs`（TCP connect 时间）计算，而 local 模式下握手不走被整形的 egress 路径，该值是亚毫秒级，导致这两个数字小了约两个数量级（日志里出现过 "0.01 MiB in flight vs BDP 0.03 MiB"）。已改为在整形开启时用实际施加的 delay 计算，`measuredRttMs` 仅作为上下文保留在 artifact 里。吞吐数字本身不受影响（不依赖 RTT）。
 
-**处置：未做，等决策。** 把 striped 按原意重做成多连接是一个真实可得的 ~3.4× 加速，但它是重新引入一个刚删掉的特性，范围远超本轮「只保留 fast」的交付边界，不自行开工。
+**处置：已做，见下方 P1-04d。**
+
+### P1-04d 多连接单文件下载（已交付，2026-09-16）
+
+`download` / `transfer mode=download` 新增 `connections`（默认 1 = 现有行为逐字节不变，上限 8）。>1 时把文件切成 N 个不重叠区间，**每个区间走一条独立的 SSH/TCP 连接**（`acquireSshClient({reuseConnection:false})` → `connectOneShotClient`），定位写入预分配的 temp 文件，校验后原子 rename。**不复用 `striped`/`stripeCount`/`maxBufferBytes` 这三个名字**——它们是作为破坏性变更删掉的，用同名承载不同语义比换名更糟。
+
+正确性（15 个测试，全部真实执行，无 mock）：区间穷举白盒、真实 READ 请求的**不重叠且精确覆盖**（灰盒，服务器自己的请求日志——1 字节重叠即使 SHA 相同也会被抓）、乱序落地仍字节一致、单连接失败取消其余并删 temp、原子 rename、小文件/空文件边界、参数校验、`connections=1` 响应文本不变。
+
+**最关键的那条**：`connections=4` 必须产生 **4 条真实且互不相同的 TCP+SSH 连接**，而不是一条连接上的 4 个 channel。这正是当年 striped 失败的地方，必须被断言守住。子代理自己做变异验证时把 4 个 worker 改成共用 `first.client`，该测试立刻变红——复核者接手时这个变异还留在源码里（代理被中止在变异态），等于反向证明了断言有效。
+
+**真实 netem lab 实测（128 MiB，50 ms/1 Gbps，median of 3，每次校验 SHA-256）**：
+
+| | 吞吐 | 相对 baseline |
+|---|---|---|
+| `fast` 单连接 baseline | 17.88 MiB/s | 1.00× |
+| `connections=2` | 25.18 MiB/s | **1.41×** |
+| `connections=4` | 26.50 MiB/s | **1.48×** |
+| `connections=8` | 17.81 MiB/s | 1.00×（**更差，不要用**） |
+| 参照：4 条连接各跑 ssh2 fastGet | 58.58 MiB/s | 3.28× |
+
+**必须诚实记下的缺口**：本实现只拿到 1.48×，而**同样 4 条连接**改用 ssh2 自己的 `fastGet` 能到 3.28×。即每连接 6.6 vs 14.6 MiB/s，**我们的区间 worker 比 ssh2 自己的实现慢约 2 倍**。这不是协议或窗口上限，是实现差距。
+
+已定位到原因（`node_modules/ssh2/lib/protocol/SFTP.js:2379`）：`fastXfer` 用 `while (pdst < fsize && reads < concurrency)` **持续**把读请求补满到 concurrency，写入与读取解耦；而本实现的每个流水线槽位是 `读 → 写 → 读` 耦合的，槽位在写的时候不发读，有效在途深度因此低于标称的 64。修法是把读写解耦（读端只管把 concurrency 填满，写端独立消费），本轮**未做**。
+
+排查过程中否定掉的两个假设（都靠实测，不靠推理）：
+1. **chunk 大小**：原为 256 KiB，而 `sftpReadRelayChunk` 会循环直到读满、SFTP 单次 READ 响应通常上限 32 KiB —— 所以一次「256 KiB 读」其实是 ~8 次**串行**往返，标称深度 8 实际只有 8 × 32 KiB = 256 KiB 在途。改为 32 KiB × 深度 64（= 2 MiB，正好是 ssh2 的 MAX_WINDOW）后：23.37 → 26.11 MiB/s。有效但不足以解释缺口。
+2. **同步写阻塞事件循环**：`fs.writeSync` 改为异步 `fs.write`（4 × 64 = 256 个并发写确实会卡住事件循环，且 `connections=8` 反而更慢与此假设吻合）。实测 26.11 → 26.50，**几乎无差别，假设被否定**。`connections=8` 更慢的真正原因仍未定位。
+
+**产品内的说法**：工具描述只写行为（「通过 N 条独立连接拉取各自的字节区间」），并明确写出「8 实测比 4 更慢」。不写任何倍数承诺——倍数依赖链路 RTT 与带宽，上表只对这条 50 ms/1 Gbps 的 lab 链路成立。
 
 ### P1-05 Capability-gated striped upload 〔2026-09-16 作废〕
 

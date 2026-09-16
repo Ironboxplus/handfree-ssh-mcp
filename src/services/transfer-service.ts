@@ -62,6 +62,14 @@ export type SftpOptions = {
   sftpConcurrency?: number;
   chunkSize?: number;
   fileConcurrency?: number;
+  /**
+   * Multi-connection single-file download only (see TransferService.download).
+   * 1 (default) is exactly today's single-connection behavior, unchanged.
+   * >1 pulls the file over that many independent SSH/TCP connections, each
+   * fetching its own non-overlapping byte range. Ignored/rejected outside
+   * download (see registerTransferTool's validation).
+   */
+  connections?: number;
 };
 
 export type ArchiveCompression = "none" | "gzip" | "bzip2" | "xz" | "zstd";
@@ -252,6 +260,40 @@ export function buildLocalTarArgv(args: readonly string[], platform: NodeJS.Plat
   return ["--force-local", ...args.map((arg) => arg.replace(/\\/g, "/"))];
 }
 
+/**
+ * Multi-connection single-file download: split [0, fileSize) into up to
+ * `connections` contiguous, non-overlapping byte ranges that exactly cover
+ * the file. Pure -- no I/O, no connection knowledge, so this is exhaustively
+ * white-box testable on its own.
+ *
+ * Never returns more ranges than there are bytes to fetch: a file smaller
+ * than `connections` bytes gets one 1-byte range per byte rather than
+ * padding out empty workers (each worker owning a real, independent SSH/TCP
+ * connection, an empty one would be a wasted handshake for zero bytes). A
+ * zero-byte (or non-positive) size, or a non-positive `connections`, yields
+ * no ranges at all -- the caller is expected to handle an empty file as a
+ * plain "no workers needed" case, not by rounding up to 1.
+ */
+export function computeDownloadByteRanges(
+  fileSize: number,
+  connections: number,
+): Array<{ offset: number; length: number }> {
+  if (fileSize <= 0 || connections <= 0) {
+    return [];
+  }
+  const workerCount = Math.min(connections, fileSize);
+  const base = Math.floor(fileSize / workerCount);
+  const remainder = fileSize % workerCount;
+  const ranges: Array<{ offset: number; length: number }> = [];
+  let offset = 0;
+  for (let index = 0; index < workerCount; index += 1) {
+    const length = base + (index < remainder ? 1 : 0);
+    ranges.push({ offset, length });
+    offset += length;
+  }
+  return ranges;
+}
+
 export class TransferService {
   constructor(private readonly pool: SshConnectionPool) {}
 
@@ -376,6 +418,43 @@ export class TransferService {
   // under the common default instead of assuming operators raised it.
   private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = 8;
   private static readonly ARCHIVE_ERROR_OUTPUT_BYTES = 16 * 1024;
+
+  // Multi-connection single-file download (see download()/downloadMultiConnection
+  // below). Each connection is a full independent TCP+SSH handshake, not an
+  // extra channel on a shared connection -- the relevant remote limit is
+  // sshd's MaxStartups (concurrent unauthenticated connection attempts), not
+  // MaxSessions (channels per connection, which is what
+  // MAX_RECURSIVE_FILE_CONCURRENCY above is sized against). 8 is a
+  // conservative ceiling given MaxStartups' common default (10); operators
+  // running many concurrent multi-connection downloads against the same host
+  // may need to raise it.
+  private static readonly MAX_DOWNLOAD_CONNECTIONS = 8;
+  // Per-connection read chunk size for multi-connection download. Deliberately
+  // its own constant rather than reusing the `chunkSize` fast-download option:
+  // this path never calls ssh2 fastGet, so overloading that option's meaning
+  // here would make one field mean two unrelated things depending on an
+  // unrelated flag (connections vs fast). Small enough that a mid-transfer
+  // failure aborts promptly instead of one worker being stuck mid-chunk for a
+  // long time.
+  // 32 KiB, deliberately equal to ssh2's own fastGet chunk size and at or
+  // under what an SFTP server returns for a single READ.
+  //
+  // This is NOT a free tuning knob. sftpReadRelayChunk loops until the full
+  // requested length arrives, and an SFTP server caps one READ response
+  // (commonly 32 KiB) -- so a 256 KiB "chunk" is really ~8 SERIAL round trips
+  // inside one call. With that chunk size, a pipeline of depth 8 held only
+  // 8 x 32 KiB = 256 KiB genuinely in flight, an eighth of the window, and
+  // measured 23.37 MiB/s at 4 connections where the same 4 connections
+  // running ssh2 fastGet reached 60.62. Keeping the chunk to one round trip
+  // makes DEPTH x CHUNK the true in-flight figure.
+  private static readonly MULTI_CONNECTION_READ_CHUNK_BYTES = 32 * 1024;
+  // Concurrent SFTP READs kept outstanding per connection. DEPTH x CHUNK =
+  // 64 x 32 KiB = 2 MiB, which is exactly ssh2's hardcoded per-connection SSH
+  // channel window (MAX_WINDOW, lib/Channel.js:15) and exactly the shape
+  // fastGet uses. Filling that window is the point; exceeding it is pointless
+  // because the peer may not send past it. See the long comment in
+  // downloadByteRangeWorker for why a serial loop here would undo the feature.
+  private static readonly MULTI_CONNECTION_PIPELINE_DEPTH = 64;
 
   // upload() returns a human-readable string, and uploadBatch() has to
   // classify each file's outcome from it (the single-file return shape is
@@ -814,6 +893,29 @@ export class TransferService {
       );
     }
     return concurrency;
+  }
+
+  /**
+   * Resolve the requested connection count for a multi-connection download.
+   * Validated (and, on failure, rejected) BEFORE any connection is opened, so
+   * an invalid request never opens even one extra TCP/SSH handshake.
+   */
+  private resolveDownloadConnections(options?: SftpOptions): number {
+    const requested = options?.connections;
+    if (requested === undefined) {
+      return 1;
+    }
+    if (!Number.isInteger(requested) || requested < 1) {
+      throw new ToolError("INVALID_CONFIGURATION", "connections must be a positive integer", false);
+    }
+    if (requested > TransferService.MAX_DOWNLOAD_CONNECTIONS) {
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `connections must not exceed ${TransferService.MAX_DOWNLOAD_CONNECTIONS}`,
+        false,
+      );
+    }
+    return requested;
   }
 
   /**
@@ -1730,6 +1832,31 @@ export class TransferService {
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
     const validatedLocalPath = this.validateLocalPath(localPath, resolvedName);
     const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
+    // Validated BEFORE anything else opens a connection, so a request for an
+    // invalid connection count never opens even one extra handshake.
+    const connections = this.resolveDownloadConnections(options);
+
+    if (connections > 1) {
+      debug?.(`[mcp] sftp multi-connection download on [${resolvedName}], connections=${connections}`);
+      try {
+        const message = await this.downloadMultiConnection(
+          resolvedName,
+          validatedRemotePath,
+          validatedLocalPath,
+          connections,
+          options?.timeout,
+          debug,
+        );
+        return appendDebugOutput(message, debugCollector);
+      } catch (error) {
+        // Every connection this path opens is a fresh one-shot connection
+        // (see downloadMultiConnection) -- there is no cached client for
+        // this server that a failure here could have poisoned, so unlike
+        // the branches below this never calls this.pool.closeClient().
+        throw appendDebugToError(error as Error, debugCollector);
+      }
+    }
+
     debug?.(`[mcp] sftp download on [${resolvedName}], reuseConnection=${reuseConnection}`);
     let connection: AcquiredSshClient | null = null;
     try {
@@ -1784,6 +1911,295 @@ export class TransferService {
     }
   }
 
+  /**
+   * Multi-connection single-file download. Splits the remote file into
+   * `connections` non-overlapping byte ranges (computeDownloadByteRanges)
+   * and pulls each range over its OWN independent, freshly-handshaked
+   * SSH/TCP connection (this.pool.acquireSshClient(..., { reuseConnection:
+   * false })) rather than opening `connections` SFTP channels on one shared
+   * connection.
+   *
+   * This distinction is the entire point: every channel opened on one SSH
+   * connection shares that connection's single SSH channel flow-control
+   * window (ssh2 hardcodes MAX_WINDOW at 2 MiB with no Client option to
+   * raise it -- see node_modules/ssh2/lib/Channel.js), so N channels on one
+   * connection cannot move more in-flight data than one channel already
+   * could. N independent connections each get their own window, which is
+   * what actually raises the achievable in-flight byte count on a
+   * high-latency link. See PLAN.MD's P1-04b/P1-04c real netem measurements.
+   *
+   * Correctness properties, all provable in-process:
+   *   - Ranges are non-overlapping and cover the file exactly (pure function,
+   *     white-box tested; also provable as wire truth from the real READ
+   *     requests a test server received).
+   *   - Ranges may complete in any order: each worker writes its own range at
+   *     its own absolute offset via a positional fs.write, so completion
+   *     order never affects the result.
+   *   - Any worker failing ends every open SFTP session, which aborts the
+   *     others' in-flight reads instead of letting them run to completion on
+   *     a temp file about to be deleted; the temp file is then removed and
+   *     the destination path is never touched.
+   *   - The destination is only ever reached via one atomic fs.renameSync,
+   *     performed after the whole temp file's size has been verified -- it
+   *     never exists in a partially-written state.
+   */
+  private async downloadMultiConnection(
+    resolvedName: string,
+    remotePath: string,
+    localPath: string,
+    connections: number,
+    timeout: number | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<string> {
+    const acquired: AcquiredSshClient[] = [];
+    const sftpSessions: SFTPWrapper[] = [];
+    let tempPath: string | null = null;
+
+    // Ending every open SFTP session both lets a healthy worker's in-flight
+    // READ fail fast (so it stops promptly instead of finishing its whole
+    // range into a temp file that is about to be deleted) and releases the
+    // underlying one-shot connections below.
+    const closeAll = (): void => {
+      for (const sftp of sftpSessions) {
+        try { sftp.end(); } catch { /* already gone */ }
+      }
+      for (const acquiredConnection of acquired) {
+        try { acquiredConnection.close(); } catch { /* already gone */ }
+      }
+    };
+
+    try {
+      // The very first connection is not a separate "control" connection --
+      // it doubles as the connection for range 0 once ranges are known, so a
+      // request for `connections=N` opens exactly N connections total, never
+      // N+1. Every connection here is a fresh one-shot handshake regardless
+      // of the caller's reuseConnection option: independent connections are
+      // this feature's entire mechanism, not something reuseConnection could
+      // meaningfully toggle off.
+      const first = await this.pool.acquireSshClient(resolvedName, {
+        reuseConnection: false,
+        timeout,
+        debug,
+        purpose: "sftp",
+      });
+      acquired.push(first);
+      sftpSessions.push(await this.openSftp(first.client, "multi-download-0", timeout, debug));
+
+      const fileSize = (await this.sftpStat(sftpSessions[0], remotePath, "source")).size;
+      const ranges = computeDownloadByteRanges(fileSize, connections);
+
+      for (let index = 1; index < ranges.length; index += 1) {
+        const acquiredConnection = await this.pool.acquireSshClient(resolvedName, {
+          reuseConnection: false,
+          timeout,
+          debug,
+          purpose: "sftp",
+        });
+        acquired.push(acquiredConnection);
+        sftpSessions.push(
+          await this.openSftp(acquiredConnection.client, `multi-download-${index}`, timeout, debug),
+        );
+      }
+      debug?.(
+        `[mcp] multi-connection download: fileSize=${fileSize}, ${ranges.length} connection(s)/range(s)`,
+      );
+
+      tempPath = `${localPath}.handfree-download-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tmp`;
+      const localFd = fs.openSync(tempPath, "w");
+      try {
+        if (fileSize > 0) {
+          fs.ftruncateSync(localFd, fileSize);
+        }
+
+        if (ranges.length > 0) {
+          // aborted is a COOPERATIVE flag: a worker checks it before starting
+          // its NEXT chunk read, so failing fast here stops OTHER workers
+          // from scheduling any further work. It cannot reach back into a
+          // read that is already in flight at the moment of failure -- ssh2
+          // does not reliably reject an outstanding SFTP request just
+          // because this side ended the channel/connection mid-request (no
+          // Client/SFTP option changes that), so an already-in-flight
+          // request on another worker can be left permanently unsettled by
+          // closeAll() below. That is exactly why this does NOT use
+          // Promise.all/allSettled to wait for every worker: settling this
+          // whole step (resolve on full success, reject on first failure) as
+          // soon as the OUTCOME is known -- the same fail-fast style
+          // relayWithPrefetchWindow above uses for its own worker pool --
+          // means an abandoned worker's dangling promise is simply never
+          // awaited, instead of hanging the entire download on it. The
+          // inactivity watchdog below is the backstop for the remaining
+          // gap: the ONE worker whose failure we are actually waiting on
+          // getting stuck with no response at all.
+          let aborted = false;
+          await this.runWithInactivityTimeout<void>(
+            (onProgress) =>
+              new Promise<void>((resolve, reject) => {
+                let settled = false;
+                let remaining = ranges.length;
+                const fail = (error: unknown) => {
+                  if (settled) return;
+                  settled = true;
+                  aborted = true;
+                  closeAll();
+                  reject(error);
+                };
+                const succeed = () => {
+                  if (settled) return;
+                  remaining -= 1;
+                  if (remaining === 0) {
+                    settled = true;
+                    resolve();
+                  }
+                };
+                for (const [index, range] of ranges.entries()) {
+                  this.downloadByteRangeWorker(
+                    sftpSessions[index],
+                    remotePath,
+                    localFd,
+                    range,
+                    () => aborted,
+                    onProgress,
+                  ).then(succeed, fail);
+                }
+              }),
+            this.transferStallTimeout(timeout),
+            `multi-connection download ${remotePath}`,
+            debug,
+            () => {
+              aborted = true;
+              closeAll();
+            },
+          );
+        }
+      } finally {
+        fs.closeSync(localFd);
+      }
+
+      const finalStat = fs.statSync(tempPath);
+      if (finalStat.size !== fileSize) {
+        throw new ToolError(
+          "SFTP_ERROR",
+          `Multi-connection download size mismatch: expected ${fileSize} bytes, got ${finalStat.size}`,
+          false,
+        );
+      }
+
+      fs.renameSync(tempPath, localPath);
+      tempPath = null; // Renamed -- the finally block below must not delete it.
+      return `File downloaded successfully via ${ranges.length} independent connection(s)`;
+    } finally {
+      closeAll();
+      if (tempPath) {
+        try { fs.unlinkSync(tempPath); } catch { /* best-effort cleanup */ }
+      }
+    }
+  }
+
+  /**
+   * Pull one byte range over one already-open SFTP session, writing each
+   * received chunk to `localFd` at its absolute file offset via a
+   * positional fs.write. Reuses sftpReadRelayChunk's "a short SFTP READ is
+   * normal, keep asking until the requested length arrives" retry loop --
+   * the relay path already needed exactly this for its own ranged reads.
+   *
+   * Checks `isAborted()` before starting each new chunk (not just once at
+   * entry) so a failure on a DIFFERENT worker stops this one from
+   * scheduling any further reads -- see the "aborted" comment at the call
+   * site in downloadMultiConnection for why this is a cooperative, not
+   * preemptive, cancellation.
+   */
+  /**
+   * Positional write into an already-open local fd, promisified.
+   *
+   * Async on purpose: many pipelined readers across several connections call
+   * this concurrently, and fs.writeSync would block the event loop and stall
+   * inbound SSH traffic for every connection at once. Passing an explicit
+   * position makes each call independent of the fd's shared cursor, so
+   * concurrent writes to disjoint offsets never race.
+   */
+  private writeLocalPositional(fd: number, chunk: Buffer, offset: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      fs.write(fd, chunk, 0, chunk.length, offset, (error) => {
+        if (error) {
+          reject(this.makeSftpError(`Failed to write downloaded data at offset ${offset}`, error));
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  private async downloadByteRangeWorker(
+    sftp: SFTPWrapper,
+    remotePath: string,
+    localFd: number,
+    range: { offset: number; length: number },
+    isAborted: () => boolean,
+    onProgress: () => void,
+  ): Promise<void> {
+    const handle = await this.sftpOpenFile(sftp, remotePath, "r", (error) =>
+      this.makeSftpError("Source open error", error),
+    );
+    try {
+      // PIPELINE DEPTH IS LOAD-BEARING. A serial `while { await read; write }`
+      // loop here would silently throw away the entire point of this feature.
+      //
+      // Throughput ~= bytes-in-flight / RTT. A serial loop keeps exactly ONE
+      // read outstanding per connection, so N connections carry only
+      // N x chunkSize in flight -- for N=4 at 256 KiB that is 1 MiB, which is
+      // what the DELETED multi-channel striped implementation already managed,
+      // and it measured 2.3x SLOWER than plain `fast`. Putting that same
+      // serial loop on separate connections reproduces the original defect one
+      // layer down: the connections are real, but each one sits idle for a
+      // full round trip between chunks.
+      //
+      // ssh2 caps each connection's SSH channel window at MAX_WINDOW = 2 MiB
+      // (lib/Channel.js:15), so ~2 MiB per connection is all that window can
+      // hold: DEPTH x CHUNK = 8 x 256 KiB = 2 MiB fills it exactly. Issuing
+      // several concurrent reads on one SFTP handle is precisely what ssh2's
+      // own fastGet does, and it is what made the measured 4-connection case
+      // reach 59.93 MiB/s rather than ~20 (PLAN.MD P1-04c).
+      const chunkSize = TransferService.MULTI_CONNECTION_READ_CHUNK_BYTES;
+      const chunkCount = Math.ceil(range.length / chunkSize);
+      const depth = Math.min(TransferService.MULTI_CONNECTION_PIPELINE_DEPTH, Math.max(1, chunkCount));
+      let nextRelativeOffset = 0;
+
+      const runPipelinedReader = async (): Promise<void> => {
+        for (;;) {
+          if (isAborted()) {
+            throw new ToolError("SFTP_ERROR", "Multi-connection download cancelled: another connection failed", false);
+          }
+          const relativeOffset = nextRelativeOffset;
+          if (relativeOffset >= range.length) return;
+          nextRelativeOffset += chunkSize;
+          const wantLength = Math.min(chunkSize, range.length - relativeOffset);
+          const readOffset = range.offset + relativeOffset;
+          const chunk = await this.sftpReadRelayChunk(sftp, handle, readOffset, wantLength);
+          // Positional write: chunks land at the right place whatever order
+          // they complete in, which is exactly what pipelining makes possible.
+          //
+          // ASYNC, not fs.writeSync. writeSync blocks the event loop, and with
+          // `connections` x DEPTH readers (4 x 64 = 256) all writing 32 KiB
+          // synchronously, the loop cannot service inbound SSH packets while a
+          // write is in progress -- which throttles every connection at once
+          // and made more connections actively WORSE (connections=8 measured
+          // below the single-connection baseline).
+          await this.writeLocalPositional(localFd, chunk, readOffset);
+          onProgress();
+        }
+      };
+
+      // Promise.all rejects on the first failure, propagating to
+      // downloadMultiConnection's cancel/cleanup path.
+      await Promise.all(Array.from({ length: depth }, () => runPipelinedReader()));
+    } finally {
+      try {
+        await this.sftpCloseFile(sftp, handle);
+      } catch {
+        // Best-effort close; the session itself may already be ending.
+      }
+    }
+  }
 
   /**
    * Transfer a file between two remote servers by piping SFTP streams

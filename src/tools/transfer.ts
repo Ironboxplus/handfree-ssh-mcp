@@ -112,6 +112,9 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
       fileConcurrency: z.number().int().positive().optional().describe(
         "Recursive upload/download only: maximum independent files transferred in parallel. Default 4, maximum 8. Each file transferred in parallel opens its own SFTP channel on the same SSH connection, and the cap is kept under OpenSSH's common default MaxSessions=10 so it does not reliably fail against a default-configured remote sshd. This improves directory trees with many small files without creating an archive.",
       ),
+      connections: z.number().int().positive().optional().describe(
+        "mode=\"download\" only, single file (not recursive, not archive, not batch). Default 1 (today's single-connection behavior, unchanged). A value above 1 pulls the file over that many independent SSH/TCP connections, each fetching its own non-overlapping byte range; maximum 8. Each connection is a separate TCP+SSH handshake, not an extra channel on one connection -- the relevant remote limit is sshd's MaxStartups (concurrent connection attempts), not MaxSessions. 4 measured best on a 50ms/1Gbps link; 8 measured SLOWER than 4 and no better than a single connection, so do not raise it without measuring your own link. Check MaxStartups before going higher. Ignores fast/sftpConcurrency/chunkSize and reuseConnection when above 1.",
+      ),
       archive: z.boolean().optional().describe(
         "When true, package the source file/directory into one temporary tar, transfer it, extract it into the destination directory, then clean both temporary archives. Default false.",
       ),
@@ -124,7 +127,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
     },
     async (params) => {
       try {
-        const { mode, archive, archiveCompression, localPath, onError } = params;
+        const { mode, archive, archiveCompression, localPath, onError, connections } = params;
         if (!archive && archiveCompression !== undefined) {
           throw new ToolError(
             "INVALID_CONFIGURATION",
@@ -138,6 +141,23 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
             "archive=true is not supported with a batch (array) localPath",
             false,
           );
+        }
+        // connections is single-file download only -- reject it up front for
+        // every other mode/shape rather than silently ignoring it.
+        if (connections !== undefined) {
+          if (mode !== "download") {
+            throw new ToolError(
+              "INVALID_CONFIGURATION",
+              `connections is only supported for mode="download", not mode="${mode}"`,
+              false,
+            );
+          }
+          if (archive) {
+            throw new ToolError("INVALID_CONFIGURATION", "connections is not supported with archive=true", false);
+          }
+          if (params.recursive) {
+            throw new ToolError("INVALID_CONFIGURATION", "connections is not supported with recursive=true", false);
+          }
         }
         const compression = archiveCompression ?? "none";
 
@@ -209,6 +229,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
           sftpConcurrency,
           chunkSize,
           ...(fileConcurrency === undefined ? {} : { fileConcurrency }),
+          ...(connections === undefined ? {} : { connections }),
         };
         const uploadOptions = { skipIfIdentical: skipIfIdentical !== false, ...sftpOptions };
 

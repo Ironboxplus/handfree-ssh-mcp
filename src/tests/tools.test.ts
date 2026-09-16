@@ -650,6 +650,7 @@ describe("MCP tool handlers", () => {
         fast: true,
         sftpConcurrency: 4,
         chunkSize: 131072,
+        connections: 3,
       });
 
       assert.deepStrictEqual(result, { content: [{ type: "text", text: "downloaded" }] });
@@ -663,6 +664,7 @@ describe("MCP tool handlers", () => {
         fast: true,
         sftpConcurrency: 4,
         chunkSize: 131072,
+        connections: 3,
       });
     } finally {
       manager.resolveServer = originalResolveServer;

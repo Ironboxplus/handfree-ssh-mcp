@@ -47,6 +47,17 @@ export interface RealSshServerStats {
   // "prove it with a real counter" discipline maxActiveSftpChannels already
   // applies to SFTP.
   execCommandCount: number;
+  // Multi-connection download: cumulative count of real, distinct TCP+SSH
+  // connections this instance has accepted (incremented once per accepted
+  // socket, before the SSH handshake even starts) -- never decrements, and
+  // critically NOT the same thing as activeSftpChannels/maxActiveSftpChannels
+  // above. A design that opens N SFTP *channels* on ONE shared connection
+  // would show N there too; only this counter distinguishes "N independent
+  // connections" (the property multi-connection download depends on for any
+  // possible speedup) from "N channels on one connection" (the previously
+  // deleted striped design, which shared one connection's SSH channel
+  // window and could not speed anything up). See resetConnectionCount().
+  connectionCount: number;
 }
 
 const { Server } = ssh2;
@@ -119,6 +130,7 @@ export class RealSshTestServer {
     openDirRequests: 0,
     readRequests: [],
     execCommandCount: 0,
+    connectionCount: 0,
   };
 
   public port = 0;
@@ -133,6 +145,25 @@ export class RealSshTestServer {
   // progress (and others then genuinely cancelled) is reproducible without
   // any sleep/poll race.
   private failReadsAfterCount: number | null = null;
+  // Multi-connection download (out-of-order-completion proof): when set,
+  // overrides readResponseDelayMs on a per-CONNECTION basis -- index K is
+  // the delay (ms) applied to READ responses on the K-th connection this
+  // instance has accepted since the last resetConnectionCount() (0-based).
+  // Undefined/missing entries fall back to the constant readResponseDelayMs.
+  // This lets a test force a specific connection to finish its range LAST
+  // even though it was opened FIRST and assigned the file's first range --
+  // a real, deterministic out-of-order completion, rather than hoping local
+  // disk I/O happens to race unpredictably.
+  private connectionReadDelaysMs: number[] | null = null;
+  // Multi-connection download ("cancel the rest" proof): when set, every
+  // READ on one of these connection indices fails immediately (regardless
+  // of failReadsAfterCount's global request-count threshold above). Lets a
+  // test fail exactly ONE connection while every other connection stays
+  // genuinely healthy, so "the healthy ones got cancelled" can be told apart
+  // from "the healthy ones failed anyway because the fault was global" --
+  // failReadsAfterCount alone cannot make that distinction, since it fails
+  // every connection's next read once the shared counter is past threshold.
+  private failReadsForConnectionIndex: Set<number> | null = null;
   // PLAN.MD P1-08a: parsed once in the constructor from
   // directExecOptions.authorizedPublicKeyPem (see below), or undefined when
   // that option is omitted -- `any` because ssh2's ParsedKey type isn't
@@ -199,6 +230,12 @@ export class RealSshTestServer {
     this.authorizedKey = authorizedKey && !(authorizedKey instanceof Error) ? authorizedKey : undefined;
     this.hostPrivateKeyPem = privateKey;
     this.server = new Server({ hostKeys: [privateKey] }, (client) => {
+      // Counted here, on raw socket accept, before the SSH handshake even
+      // starts -- this is the real, wire-level "one distinct TCP+SSH
+      // connection" event. connectionIndex is this connection's own 0-based
+      // position among connections since the last resetConnectionCount().
+      const connectionIndex = this.stats.connectionCount;
+      this.stats.connectionCount++;
       this.clients.add(client);
       client.once("close", () => this.clients.delete(client));
       // PLAN.MD P1-08a: this fixture now routinely runs several real ssh2
@@ -261,7 +298,7 @@ export class RealSshTestServer {
               this.stats.activeSftpChannels,
             );
             session.once("close", () => { this.stats.activeSftpChannels--; });
-            this.attachSftp(acceptSftp());
+            this.attachSftp(acceptSftp(), connectionIndex);
           });
           session.on("exec", (acceptExec, _rejectExec, info) => {
             if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
@@ -341,6 +378,37 @@ export class RealSshTestServer {
     this.failReadsAfterCount = null;
   }
 
+  /**
+   * Reset the cumulative connection counter (and, since a new connection's
+   * index is derived from this counter's current value, the per-connection
+   * index the NEXT accepted connection will get) to 0. Call immediately
+   * before the transfer under test, same reasoning as resetReadLog(): an
+   * earlier test's connections must not be attributable to this one, and a
+   * test that wants to control specific connection indices (see
+   * setConnectionReadDelaysMs) needs those indices to start at 0.
+   */
+  public resetConnectionCount(): void {
+    this.stats.connectionCount = 0;
+  }
+
+  /** See connectionReadDelaysMs above. */
+  public setConnectionReadDelaysMs(delaysMs: number[]): void {
+    this.connectionReadDelaysMs = delaysMs;
+  }
+
+  public clearConnectionReadDelaysMs(): void {
+    this.connectionReadDelaysMs = null;
+  }
+
+  /** See failReadsForConnectionIndex above. */
+  public injectReadFailureForConnectionIndex(indices: number[]): void {
+    this.failReadsForConnectionIndex = new Set(indices);
+  }
+
+  public clearReadFailureForConnectionIndex(): void {
+    this.failReadsForConnectionIndex = null;
+  }
+
   public toLocalPath(remotePath: string): string {
     if (!remotePath.startsWith("/")) throw new Error(`Remote path is not absolute: ${remotePath}`);
     const components = remotePath.split("/").filter(Boolean);
@@ -364,7 +432,7 @@ export class RealSshTestServer {
     return `${hostPattern} ${parsed.type} ${publicSsh.toString("base64")}`;
   }
 
-  private attachSftp(sftp: any): void {
+  private attachSftp(sftp: any, connectionIndex = -1): void {
     const trace = (operation: string, detail = ""): void => {
       if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
         process.stderr.write(`[real-sftp ${this.port}] ${operation}${detail ? ` ${detail}` : ""}\n`);
@@ -425,6 +493,9 @@ export class RealSshTestServer {
       if (this.failReadsAfterCount !== null && this.stats.readRequests.length > this.failReadsAfterCount) {
         return sftp.status(requestId, STATUS_CODE.FAILURE, "injected read failure (test)");
       }
+      if (this.failReadsForConnectionIndex?.has(connectionIndex)) {
+        return sftp.status(requestId, STATUS_CODE.FAILURE, "injected per-connection read failure (test)");
+      }
       const state = lookupHandle(handle);
       if (!state || state.kind !== "file") return sftp.status(requestId, STATUS_CODE.FAILURE);
       const buffer = Buffer.alloc(length);
@@ -434,7 +505,8 @@ export class RealSshTestServer {
         sftp.data(requestId, buffer.subarray(0, bytesRead));
       };
       fs.read(state.fd, buffer, 0, length, offset, (error, bytesRead) => {
-        if (this.readResponseDelayMs > 0) setTimeout(() => respond(error, bytesRead), this.readResponseDelayMs);
+        const delayMs = this.connectionReadDelaysMs?.[connectionIndex] ?? this.readResponseDelayMs;
+        if (delayMs > 0) setTimeout(() => respond(error, bytesRead), delayMs);
         else respond(error, bytesRead);
       });
     });

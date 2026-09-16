@@ -24,8 +24,11 @@ export function registerDownloadTool(server: McpServer): void {
       fast: z.boolean().optional().describe("Default true. Use ssh2 fastGet for a single-file download, which performs parallel SFTP reads for better throughput. Set false for the buffered compatibility path."),
       sftpConcurrency: z.number().int().positive().optional().describe("Only used when fast=true. Number of concurrent SFTP chunks for ssh2 fastGet; omitted uses ssh2's default."),
       chunkSize: z.number().int().positive().optional().describe("Only used when fast=true. Bytes per SFTP request. Omitted uses the mode's default."),
+      connections: z.number().int().positive().optional().describe(
+        "Default 1 (today's single-connection behavior, unchanged). A value above 1 pulls the file over that many independent SSH/TCP connections, each fetching its own non-overlapping byte range; maximum 8. Each connection is a separate TCP+SSH handshake, not an extra channel on one connection -- the relevant remote limit is sshd's MaxStartups (concurrent connection attempts), not MaxSessions. 4 measured best on a 50ms/1Gbps link; 8 measured SLOWER than 4 and no better than a single connection, so do not raise it without measuring your own link. Check MaxStartups before going higher. Ignores fast/sftpConcurrency/chunkSize and reuseConnection when above 1.",
+      ),
     },
-    async ({ remotePath, localPath, connectionName, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize }) => {
+    async ({ remotePath, localPath, connectionName, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, connections }) => {
       try {
         const resolvedName = sshManager.resolveServer(connectionName);
         const result = await transferService.download(remotePath, localPath, resolvedName, {
@@ -35,6 +38,7 @@ export function registerDownloadTool(server: McpServer): void {
           fast: fast !== false,
           sftpConcurrency,
           chunkSize,
+          connections,
         });
         return {
           content: [{ type: "text", text: result }],
