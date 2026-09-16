@@ -288,6 +288,156 @@ Examples:
   transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/var/log/app.log",
              destServer: "backup", destRemotePath: "/backup/app.log" }`,
 
+  "workspace-run": `workspace-run — Launch an entrypoint on a remote server under a configured runProfiles.<name> entry, durably.
+
+The launched process survives SSH disconnect and MCP adapter restart: all
+state (meta.json/stdout.log/stderr.log/pid/heartbeat/exit.json) lives under
+~/.handfree-runs/<runId>/ on the remote filesystem, not locally. There is no
+local cache of run state — status/logs/cancel require the remote server to
+be reachable.
+
+This delivery round implements the LAUNCH phase only (PLAN.MD Phase 2):
+  • push must be false. Omitting it (true default) or passing true returns
+    PUSH_NOT_AVAILABLE — the push phase is not implemented yet; the code
+    must already exist under the profile's remoteRoot.
+  • collect must be empty/omitted. A non-empty array returns
+    COLLECT_NOT_AVAILABLE — use download/transfer for artifacts instead.
+  • sync only accepts "none"/omitted; "flush" returns SYNC_NOT_AVAILABLE
+    (Phase 3).
+  • Only environment.type venv/executable profiles are supported;
+    conda/module/slurm and gpu.required/secretEnv profiles return a
+    *_NOT_AVAILABLE error.
+
+Parameters:
+  profile         (string, required)   runProfiles.<name> from YAML config.
+  entrypoint      (string, required)   Path relative to the profile's
+                  remoteRoot. Must match one of the profile's
+                  allowedEntrypoints glob patterns.
+  args            (string[], optional) Positional arguments. Each is quoted
+                  individually on the remote shell — never interpreted,
+                  safe for arbitrary strings.
+  env             (object, optional)   Overrides. Every key must already be
+                  declared in the profile's own env map (allowlist);
+                  otherwise ENV_KEY_NOT_ALLOWED.
+  server          (string, optional)   Defaults to the profile's configured
+                  server.
+  push            (boolean, optional)  Must be false. See above.
+  collect         (string[], optional) Must be empty/omitted. See above.
+  sync            (string, optional)   "none" (default) or "flush" (rejected
+                  with SYNC_NOT_AVAILABLE).
+
+Returns: { ok, jobId, state, message, next, details } — jobId equals the
+returned runId. details.status is the same shape run-status returns.
+
+Example:
+  workspace-run { profile: "qwen-dev", entrypoint: "train.py",
+                  args: ["--epochs", "3"], push: false }`,
+
+  "run-status": `run-status — Query a workspace-run's current status by runId.
+
+Reads directly from the remote state directory over SFTP every call — no
+local cache, so the remote server must be reachable, and an MCP adapter
+that just restarted can query exactly as well as one that never stopped.
+
+Parameters:
+  runId           (string, required)   runId returned by workspace-run.
+  connectionName  (string, see below)  Server the run was launched on.
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Returns: { ok, jobId, state, message, details } where details is
+{ runId, server, profile, state, phase, createdAt, exitCode, signal,
+  cancelled, heartbeatAt, orphaned? }. state is one of running, completed,
+failed, cancelled, recovering (heartbeat stale/missing — ambiguous until
+confirmed), orphaned.
+
+Example:
+  run-status { runId: "run_20260915T120000Z_ab12cd34" }`,
+
+  "run-logs": `run-logs — Read a byte-offset window of a run's stdout/stderr.
+
+Fetched over SFTP directly from the remote log file. Correctly handles a
+multi-byte UTF-8 character split across the window boundary — sequential
+calls chained via nextOffset never duplicate or drop bytes.
+
+Parameters:
+  runId           (string, required)   runId returned by workspace-run.
+  connectionName  (string, see below)  Server the run was launched on.
+  stream          (string, optional)   "stdout" (default) or "stderr".
+  offset          (number, optional)   Byte offset to start from. Default 0.
+                  Use the previous response's nextOffset to continue.
+  maxOutputBytes  (number, optional)   Max bytes this call returns.
+                  Default 65536.
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Returns: { ok, jobId, state, message, details } where details is
+{ runId, stream, text, startOffset, nextOffset, fileSize, hasMore }.
+Poll again with offset=nextOffset while hasMore=true.
+
+Example:
+  run-logs { runId: "run_20260915T120000Z_ab12cd34", offset: 0 }
+  run-logs { runId: "run_20260915T120000Z_ab12cd34", stream: "stderr" }`,
+
+  "run-list": `run-list — List workspace-run runs on a server, newest first.
+
+Reads ~/.handfree-runs/ over SFTP (no local cache). Bounded to 200 entries
+max regardless of the requested limit. A run whose state directory is
+corrupt or mid-write is silently omitted (query it directly with run-status
+for the detailed error).
+
+Parameters:
+  connectionName  (string, see below)  Target server.
+  profile         (string, optional)   Only runs launched under this profile.
+  state           (string, optional)   running/completed/failed/cancelled/
+                  recovering/orphaned.
+  limit           (number, optional)   Default 50, max 200.
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Returns: { ok, jobId: "run-list", state: "completed", message, details }
+where details.runs is an array of the same shape run-status returns.
+
+Example:
+  run-list { profile: "qwen-dev", state: "running" }`,
+
+  "run-cancel": `run-cancel — Cancel a workspace-run.
+
+Sends TERM to the run's whole remote process group, waits graceMs, then
+KILL if it is still alive. Re-verifies the recorded process identity (boot
+id, pid, pgid, /proc start ticks, wrapper token read back from the live
+process's own environment) against what is actually running right now
+before sending any signal — on a mismatch (pid reuse, host reboot) the run
+moves to "orphaned" instead, and nothing is signalled. Idempotent:
+cancelling an already-finished or already-orphaned run just reports that
+outcome again without sending anything.
+
+Parameters:
+  runId           (string, required)   runId returned by workspace-run.
+  connectionName  (string, see below)  Server the run was launched on.
+  graceMs         (number, optional)   Wait after TERM before KILL.
+                  Default 5000.
+
+connectionName rule:
+  • If only one server is enabled → optional (auto-selected).
+  • If multiple servers are enabled → REQUIRED.
+
+Returns: { ok, jobId, state, message, details } where details is
+{ runId, outcome, reason? }. outcome is one of terminated, killed,
+already-exited, orphaned. state is "cancelling" for terminated/killed
+(poll run-status for the final exit record), "orphaned" for orphaned, or
+the run's real final state for already-exited.
+
+Example:
+  run-cancel { runId: "run_20260915T120000Z_ab12cd34" }
+  run-cancel { runId: "run_20260915T120000Z_ab12cd34", graceMs: 10000 }`,
+
   "help": `help — Show detailed usage for one or all tools.
 
 Parameters:
@@ -309,6 +459,11 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   upload            Upload a single file, or a batch of files, to a remote server.
   download          Download a single file from a remote server.
   transfer          Move files: single, recursive, batch upload, or cross-server relay.
+  workspace-run     Launch an entrypoint on a remote server under a runProfiles.<name> entry (launch only in this delivery round).
+  run-status        Query a workspace-run's current status by runId.
+  run-logs          Read a byte-offset window of a run's stdout/stderr.
+  run-list          List runs on a server, newest first.
+  run-cancel        Cancel a run (TERM, then KILL after graceMs; identity-verified).
   help              Show this help or detailed per-tool usage.
 
 Quick start:

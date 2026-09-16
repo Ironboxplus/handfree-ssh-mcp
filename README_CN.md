@@ -27,6 +27,11 @@ handfree-ssh-mcp 使 AI 助手能够通过标准化的 MCP 接口执行远程 SS
 | download | 从远程服务器下载文件；支持 `striped` 多通道分片下载（见下方"多通道分片下载"） |
 | transfer | 上传、下载或在两台远端服务器之间 relay；支持碎文件并发、批量上传（`localPath` 数组）、临时 tar 打包、可选压缩、多通道分片下载和分块预取 |
 | list-servers | 列出所有可用的 SSH 服务器配置 |
+| workspace-run | 在配置好的 `runProfiles.<name>` 下，于远端服务器启动一个入口程序，持久运行：所有状态都写在远端文件系统（不落本机），可扛住 SSH 断线与 MCP adapter 重启。**本轮交付只实现 launch 阶段**（见下方"workspace-run（远程运行，仅 launch 阶段）"） |
+| run-status | 按 `runId` 查询 `workspace-run` 运行状态（每次都经 SFTP 读远端状态目录，无本机缓存） |
+| run-logs | 按字节偏移读取运行的 stdout/stderr，跨多次调用正确处理被截断在窗口边界上的多字节 UTF-8 字符 |
+| run-list | 列出某服务器上的运行记录，按时间倒序 |
+| run-cancel | 取消一次运行：先向进程组发 TERM，等待 `graceMs` 后仍存活则发 KILL；信号前会重新核对进程身份 |
 
 ## 📚 使用方法
 
@@ -162,6 +167,26 @@ servers:
 ### 🧵 多通道分片下载（`striped`）
 
 `download` 与 `transfer mode=download` 支持 `striped: true`（默认 `false`，不开启时单文件下载行为与之前完全一致）：将同一个远程文件切分为 `stripeCount`（默认 4，上限 8，与 `fileConcurrency` 相同的 OpenSSH `MaxSessions` 余量考量）个不重叠的字节区间，每个区间各自使用独立的 SFTP channel 并发拉取，通过定位写（positional write）直接写入本地预分配的 temp 文件，各区间完成顺序互不影响。`chunkSize`（默认 262144 字节）限制单个区间一次读入内存的字节数，`maxBufferBytes`（默认 64 MiB）硬性限制 `stripeCount * chunkSize`，即任意时刻 MCP 进程内存中缓冲的数据总量上限——大文件不会被整个装入内存。全部区间写完后先校验本地 temp 文件大小（远端暴露 `md5sum` 时还会尽力校验 MD5），通过后才原子 rename 到目标路径；任一分片失败或校验失败都会删除 temp 文件，从不触碰最终目标路径。同时设置 `fast` 时 `striped` 优先生效。该开关只改变字节的搬运方式，不改变工具的返回内容。
+
+### 🏃 workspace-run（远程运行，仅 launch 阶段）
+
+在 YAML 中声明 `runProfiles.<name>`（`server`、`remoteRoot`、`environment.type: venv|executable`、`allowedEntrypoints`、`env` 白名单等）后即可用 `workspace-run` 启动。远端 wrapper 用 `setsid` 使目标进程脱离本次 SSH 会话、拥有独立进程组，并把 `meta.json`/`stdout.log`/`stderr.log`/`pid`/`heartbeat`/`exit.json` 原子写入 `~/.handfree-runs/<runId>/`——**没有本机 JobStore、没有常驻 daemon**，MCP adapter 重启不会丢任何东西，因为它本来就没持有任何权威状态；代价是查询状态/日志/取消都需要能连上远端，没有离线缓存视图。
+
+```json
+{ "tool": "workspace-run", "params": { "profile": "qwen-dev", "entrypoint": "train.py", "push": false } }
+{ "tool": "run-status", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
+{ "tool": "run-cancel", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
+```
+
+**本轮明确未实现**（均返回明确的 `*_NOT_AVAILABLE` 错误，不会被静默忽略）：
+
+- `push`（预推送阶段，P2-02）：必须显式传 `false`，代码需已存在于 `remoteRoot`；省略（默认 true）或传 `true` 返回 `PUSH_NOT_AVAILABLE`。
+- `collect`（跑完拉回产物，P2-06）：必须为空/省略，请改用 `download`/`transfer`；非空数组返回 `COLLECT_NOT_AVAILABLE`。
+- `sync: "flush"`（Phase 3 的常驻同步屏障）：只支持 `"none"`/省略；`"flush"` 返回 `SYNC_NOT_AVAILABLE`。
+- `run-retry`：本轮完全未实现。
+- `environment.type: conda | module | slurm`、`gpu.required`、`secretEnv`：配置可以解析成功，但启动时会分别返回 `ENVIRONMENT_ADAPTER_NOT_AVAILABLE` / `GPU_VALIDATION_NOT_AVAILABLE` / `SECRET_ENV_NOT_AVAILABLE`。仅 `environment.type: venv`（直接调用 `<path>/bin/python`，不依赖 `source activate`）与 `executable` 可用。
+
+`run-cancel` 会向整个远端进程组发 `TERM`，等待 `graceMs`（默认 5000ms）后仍存活再发 `KILL`；发信号前会重新核对远端 boot id、pid、pgid、`/proc` 启动 tick 以及从存活进程自身环境变量中读回的 wrapper token，任一不匹配（PID 复用、主机重启）都会转入 `orphaned` 而不是冒险向可能已被复用的 PID 发信号。
 
 ## 🛡️ 安全注意事项
 

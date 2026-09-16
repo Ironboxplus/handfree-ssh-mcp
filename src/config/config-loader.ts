@@ -9,6 +9,7 @@ import {
   loadSshConfigFiles,
   SshConfigLoadResult,
 } from "./ssh-config-loader.js";
+import { parseRunProfiles } from "./run-profiles-loader.js";
 
 /**
  * YAML config file structure
@@ -45,6 +46,10 @@ interface YamlConfig {
   outputLogDir?: string;
   sshConfig?: boolean | YamlSshConfigOptions;
   servers?: Record<string, YamlServerConfig>;
+  // PLAN.MD P2-01/§5.1. Validated via src/config/run-profiles-loader.ts
+  // (Zod) before it reaches LoadedConfig/ParsedArgs; raw/untyped here since
+  // this interface just mirrors the YAML document shape pre-validation.
+  runProfiles?: Record<string, unknown>;
 }
 
 interface YamlParseResult extends ParsedArgs {
@@ -107,6 +112,7 @@ export function loadConfigFromSources(options: ConfigSourceOptions = {}): Loaded
     configs,
     preConnect: yamlParsed?.preConnect === true,
     outputLogDir: yamlParsed?.outputLogDir,
+    runProfiles: yamlParsed?.runProfiles ?? {},
     watchPaths: [
       ...(resolvedYamlConfigPath ? [resolvedYamlConfigPath] : []),
       ...sshConfigResult.files,
@@ -173,6 +179,7 @@ function loadYamlConfig(configPath: string, options: { requireServers: boolean }
     preConnect: config.preConnect === true,
     outputLogDir,
     sshConfig: config.sshConfig,
+    runProfiles: parseRunProfiles(config.runProfiles),
   };
 }
 

@@ -24,6 +24,29 @@ import crypto from "crypto";
 // configuration, or any transfer/archive/SFTP logic -- those remain on
 // SSHConnectionManager (transfer/archive extraction is a later P0-04 step).
 
+/**
+ * `privateKey` in this project's config is always a PATH to a key file -- every
+ * call site does `fs.readFileSync(config.privateKey)`. Inline key material is
+ * not supported, but pasting the key itself into that field is an easy
+ * misconfiguration to make, since several other SSH tools do accept it there.
+ *
+ * When that happens, Node's ENOENT message contains the value it tried to open
+ * -- i.e. the entire private key -- and interpolating that message into a
+ * ToolError puts the key verbatim into logs and into the tool response handed
+ * back to the caller. Observed for real while running the P2 Linux acceptance.
+ *
+ * So: never echo the OS message when the configured value looks like key
+ * material; say what is actually wrong instead.
+ */
+const INLINE_PEM_PRIVATE_KEY = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/;
+
+export function describePrivateKeyReadFailure(configuredPath: string, error: Error): string {
+  if (INLINE_PEM_PRIVATE_KEY.test(configuredPath)) {
+    return "the configured privateKey looks like inline key material, but this field must be a filesystem path to a key file (the value itself is withheld here so it does not reach logs)";
+  }
+  return error.message;
+}
+
 export type SshDebugSink = (line: string) => void;
 export type AcquiredSshClient = { client: Client; close: () => void };
 export type SshClientPurpose = "command" | "sftp";
@@ -591,7 +614,7 @@ export class SshConnectionPool {
             new ToolError(
               "LOCAL_FILE_READ_FAILED",
               `Failed to read private key file for [${key}]: ${
-                (err as Error).message
+                describePrivateKeyReadFailure(config.privateKey, err as Error)
               }`,
               false,
             )
@@ -814,7 +837,7 @@ export class SshConnectionPool {
         } catch (err) {
           throw new ToolError(
             "LOCAL_FILE_READ_FAILED",
-            `Failed to read private key file for [${key}]: ${(err as Error).message}`,
+            `Failed to read private key file for [${key}]: ${describePrivateKeyReadFailure(config.privateKey, err as Error)}`,
             false,
           );
         }
@@ -1180,7 +1203,7 @@ export class SshConnectionPool {
           jumpSsh.privateKey = fs.readFileSync(jumpConfig.privateKey, "utf8");
           if (jumpConfig.passphrase) jumpSsh.passphrase = jumpConfig.passphrase;
         } catch (err) {
-          return reject(new Error(`read jump private key failed: ${(err as Error).message}`));
+          return reject(new Error(`read jump private key failed: ${describePrivateKeyReadFailure(jumpConfig.privateKey, err as Error)}`));
         }
       } else if (jumpConfig.password) {
         jumpSsh.password = jumpConfig.password;

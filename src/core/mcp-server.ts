@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
+import { RunProfileRegistry } from "../run/run-profile-registry.js";
 import { registerAllTools } from "../tools/index.js";
 import { SERVER_CONFIG, SERVER_INSTRUCTIONS } from "../config/server.js";
 import {
@@ -114,6 +115,7 @@ export class SshMcpServer {
         }
         this.sshManager.replaceConfig(fresh.configs, fresh.enabledServers);
         this.sshManager.setOutputLogRoot(fresh.outputLogDir);
+        RunProfileRegistry.getInstance().setProfiles(fresh.runProfiles ?? {});
         this.reconcileConfigWatchers(fresh.watchPaths, scheduleReload);
       } catch (error) {
         Logger.log(
@@ -181,6 +183,7 @@ export class SshMcpServer {
     const parsedArgs = this.loadConfig();
     this.sshManager.setConfig(parsedArgs.configs, parsedArgs.enabledServers);
     this.sshManager.setOutputLogRoot(parsedArgs.outputLogDir);
+    RunProfileRegistry.getInstance().setProfiles(parsedArgs.runProfiles ?? {});
 
     // Pre-connect to enabled servers if flag is set
     if (parsedArgs.preConnect) {

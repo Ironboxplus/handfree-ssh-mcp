@@ -1103,20 +1103,24 @@ P2-03 要求「SSH 断开或 MCP adapter 重启不能杀死已启动的 durable 
 
 ### P2-01 Run profile 和环境预检
 
-- [ ] 解析 `runProfiles`，引用不存在的 server profile 时启动即失败；本阶段 `syncProfile` 字段解析但拒绝启用（返回 `SYNC_PROFILE_NOT_AVAILABLE`），Phase 3 才放开。
-- [ ] working directory、executable、entrypoint、args 和 env 分开建模并逐项 quote；禁止把用户参数拼进未经约束的 shell 模板。
-- [ ] venv 直接调用 `<venv>/bin/python` 或 Windows 对应 executable，不依赖 `source activate`。
-- [ ] conda/module/Slurm 通过受配置控制的 adapter；每个 adapter 有 capability probe。
-- [ ] GPU required 时验证远端 GPU/CUDA；失败不得静默回退 CPU。
-- [ ] `allowedEntrypoints` glob 相对规范化 remoteRoot，复用 P1-02 的大小写语义与路径身份校验，只匹配 regular file；最终 executable/entrypoint 在启动瞬间再次验证。
-- [ ] `env` 覆盖只允许 profile 声明的 key 或 allowlist。
-- [ ] 普通 `env` 才可持久化；`secretEnv` 只保存 `{provider,key,version}` 引用。首批 provider 为 Controller process environment 和权限受控 secret file。
-- [ ] 调用时提交的临时 secret 是 write-only、不回显、不持久化；依赖临时 secret 的 run 在 daemon 重启后不能自动 retry，必须重新提交。
-- [ ] 远端 secret 通过 mode `0600` 的短期 env file 交给 wrapper，启动后立即删除；文档明确同一远端用户仍可从 `/proc` 等位置观察进程环境，这是权限边界而不是可消除的秘密隔离。
+> **本轮实施范围note（2026-09-15，runner core 交付）**：本节与 P2-03/P2-04/P2-05 的 launch-only 子集已实现并有真实测试证据，见文末汇总；`push`/`collect`（P2-02/P2-06）、`conda`/`module`/`slurm`/`gpu.required`/`secretEnv`、`run-retry` 均**未实现**，均返回明确的 `*_NOT_AVAILABLE`/`SECRET_REQUIRED` 之外的专属错误码，不静默忽略。勾选项只标记本轮**已用真实手段验证**的部分；等待 `.88` 真实 Linux 验收的条目保持未勾选并写明原因。
 
-- [ ] **P2-01-A1**：真实 Linux venv 中运行脚本，脚本打印 `sys.executable`、cwd、非秘密 env 和参数，全部与不可变 profile snapshot 一致；secret 仅断言存在，不输出值。
+- [ ] 解析 `runProfiles`，引用不存在的 server profile 时启动即失败；本阶段 `syncProfile` 字段解析但拒绝启用（返回 `SYNC_PROFILE_NOT_AVAILABLE`），Phase 3 才放开。**部分完成**：`runProfiles` 解析（复用 `src/contracts/config-schema.ts` 的 `runProfileSchema`，接入 `src/config/config-loader.ts` + `src/config/run-profiles-loader.ts`）与 `syncProfile` → `SYNC_PROFILE_NOT_AVAILABLE`（`src/run/run-service.ts` 的 `resolveProfileServer`）均已实现并有真实测试（`run-config-loader-real.test.ts`、`run-tools-wiring.test.ts`）。**未做**：「引用不存在的 server profile 时启动即失败」——本实现把该校验推迟到首次 `workspace-run` 调用时（`SERVER_NOT_FOUND`），不在 MCP 进程启动时校验，避免让一个写错的 profile 影响整个 server 的可用性；这是本轮的有意取舍，非疏漏，请在下一轮决定是否需要收紧为启动即失败。
+- [x] working directory、executable、entrypoint、args 和 env 分开建模并逐项 quote；禁止把用户参数拼进未经约束的 shell 模板。`src/run/posix-quote.ts` + `src/run/wrapper-script.ts`；真实证据：`run-pure-units.test.ts`（含真实 bash 往返测试，涵盖 `$()`、反引号、分号、管道、引号、换行、unicode 等注入样本）、`run-wrapper-script.test.ts`（含恶意 args/env 样本的 `bash -n` 真实语法校验）。
+- [ ] venv 直接调用 `<venv>/bin/python` 或 Windows 对应 executable，不依赖 `source activate`。**部分完成**：`resolveExecutable` 对 `environment.type: venv` 只拼接 `<path>/bin/<executable ?? python>`，代码里从未出现 `source activate`；但本轮没有为这条路径单独写值测试（只在 tools-wiring 的错误分支测试中间接被调用过、未断言其返回值），也没有验证过 Windows 远端场景（本项目远端目标始终假定 POSIX/Linux）。真实调用 `<venv>/bin/python` 本身是 P2-03-A1 的一部分，Linux-pending。
+- [ ] conda/module/Slurm 通过受配置控制的 adapter；每个 adapter 有 capability probe。**未实现**，本轮明确排除；`environment.type` 为这三者时启动返回 `ENVIRONMENT_ADAPTER_NOT_AVAILABLE`（config 解析仍然放行，见下方枚举测试）。
+- [ ] GPU required 时验证远端 GPU/CUDA；失败不得静默回退 CPU。**未实现**，本轮明确排除；`gpu.required` 时返回 `GPU_VALIDATION_NOT_AVAILABLE`，不回退。
+- [ ] `allowedEntrypoints` glob 相对规范化 remoteRoot，复用 P1-02 的大小写语义与路径身份校验，只匹配 regular file；最终 executable/entrypoint 在启动瞬间再次验证。**部分完成**：glob 匹配与遍历/绝对路径/盘符拒绝为纯函数并穷举测试（`src/run/entrypoint-glob.ts`，`run-pure-units.test.ts`）。**未做**：P1-02 尚未交付，因此没有真正的大小写语义/路径身份校验（只有纯字符串层面的安全检查）；也没有实现「只匹配 regular file」——远端 wrapper 目前只对 `executable` 做 `[ -x ]` 检查，没有对 `entrypoint` 做单独的 `[ -f ]`/regular-file 校验，这是一个真实缺口，留给下一轮或本轮收尾修补。
+- [x] `env` 覆盖只允许 profile 声明的 key 或 allowlist。`src/run/env-allowlist.ts`；真实证据：`run-pure-units.test.ts` 穷举值测试 + `run-tools-wiring.test.ts` 的真实 MCP 黑盒 `ENV_KEY_NOT_ALLOWED` 分支。
+- [ ] 普通 `env` 才可持久化；`secretEnv` 只保存 `{provider,key,version}` 引用...。**未实现**，本轮明确排除；`secretEnv` 非空时返回 `SECRET_ENV_NOT_AVAILABLE`。
+- [ ] 调用时提交的临时 secret...。**未实现**，本轮无任何 secret 支持。
+- [ ] 远端 secret 通过 mode `0600` 的短期 env file...。**未实现**。
+
+- [ ] **P2-01-A1**：真实 Linux venv 中运行脚本...。**Linux-pending**：本轮没有实现 secret，因此 P2-01-A1 原始验收项（含 secret 存在性断言）无法按原样验收；`sys.executable`/cwd/非秘密 env/参数与 profile 一致这部分由 P2-03-A1（见下）覆盖，同样等待 `.88` 真实执行。
 
 ### P2-02 push phase 与 run revision
+
+> **本轮未交付**（2026-09-15 runner core 分派明确排除，留给下一轮）。`workspace-run` 本轮要求调用方显式传 `push: false`；省略（默认 true 语义）或显式传 `true` 都返回 `PUSH_NOT_AVAILABLE`，不静默跳过或静默执行旧逻辑。以下清单原样保留，未动。
 
 - [ ] 实现 `push` phase：按 profile 声明的本地源，经 TransferService 推送到 `remoteRoot`。`push` 默认 `true`（可由 profile 的 `defaultPush` 覆盖）。
 - [ ] push 复用 P1-09 的批量/递归上传与 skip-if-identical；未变化的文件不重传。
@@ -1131,29 +1135,59 @@ P2-03 要求「SSH 断开或 MCP adapter 重启不能杀死已启动的 durable 
 
 ### P2-03 持久远端 runner
 
-- [ ] 每个 run 创建 `~/.handfree-runs/<runId>/` 或 profile 指定 state root。
-- [ ] 写入 `meta.json/stdout.log/stderr.log/pid/heartbeat/exit.json`。
-- [ ] 普通 Linux 使用独立进程组；支持的环境优先 `systemd-run --user`，Slurm profile 使用真实 job ID。
-- [ ] 远端 wrapper 原子写状态；exit code 和 signal 都可恢复。
-- [ ] 进程身份至少保存 remote boot ID、PID、PGID、`/proc` start ticks、随机 wrapper token 和 executable identity；systemd/Slurm 则保存唯一 scope/job ID。
-- [ ] SSH 断开或 MCP adapter 重启不能自动杀死已成功启动的 durable run。
-- [ ] Controller 重启后从远端状态恢复运行记录并校正数据库。
+> **实现状态（2026-09-15 runner core 交付）**：远端 wrapper（`src/run/wrapper-script.ts`）与 launch 传输（`src/run/launch-command.ts`，base64+quoted-heredoc，outer exec 命令只含 base64 字母表，真实测试见 `run-wrapper-script.test.ts`）已实现并通过 `bash -n` 对真实 bash（本机 git-bash）的语法校验，包括恶意 args/env 样本；`meta.json` 的静态字段由 TS 端 `JSON.stringify` 生成、身份字段由远端 splice，splice 正确性有真实测试覆盖（`run-wrapper-script.test.ts`）。status/logs/list 的**读取**一侧已针对真实 SFTP（`RealSshTestServer`）用手工播种、与本实现 schema 完全一致的状态文件做了真实验证（`run-service-real.test.ts`、`run-tools-wiring.test.ts`）。**没有验证的是远端 wrapper 的真实执行**（`setsid`、`/proc`、`ps -o pgid=`、真实原子写）——这些是 Linux-only 语义，本 Windows 开发机无法真实提供，也未伪造；全部等待 `.88` 验收，见下方 P2-03-A1 与 `run-acceptance-linux-pending.test.ts`。
 
-- [ ] **P2-03-A1**：启动 30 秒真实 Python 程序，关闭 adapter 和 daemon 后重启，仍能查询运行状态与增量日志，并最终获得真实 exit code。
+- [ ] 每个 run 创建 `~/.handfree-runs/<runId>/` 或 profile 指定 state root。**部分完成**：默认 `.handfree-runs` 路径运算是纯函数且穷举测试（`src/run/remote-run-paths.ts`，含自定义 state root 归一化/遍历拒绝）；但 `runProfileSchema` 未新增 per-profile state root 字段，因此「profile 指定 state root」这半句本轮**未接线**，所有 profile 都用同一个默认根。真实远端目录创建（`mkdir -p`）Linux-pending。
+- [ ] 写入 `meta.json/stdout.log/stderr.log/pid/heartbeat/exit.json`。**部分完成**：六个文件的生成逻辑齐全（wrapper 脚本 + 原子 write-temp-then-rename），静态部分的 JSON 正确性、身份 splice、UTF-8-safe 日志读取均有真实测试；**真实远端写入未验证**，Linux-pending。
+- [ ] 普通 Linux 使用独立进程组；支持的环境优先 `systemd-run --user`，Slurm profile 使用真实 job ID。**部分完成**：`setsid` + 后台 supervisor 的进程组方案已实现（见 wrapper-script.ts 顶部设计说明），真实生效 Linux-pending；`systemd-run --user`/Slurm 路径**未实现**（超出本轮范围，`environment.type: slurm` 直接返回 `ENVIRONMENT_ADAPTER_NOT_AVAILABLE`）。
+- [ ] 远端 wrapper 原子写状态；exit code 和 signal 都可恢复。**部分完成**：exit code/signal 的**解释**逻辑（128+N 惯例、`interpretWaitStatus`）已实现且穷举测试+变异测试通过；「远端 wrapper 原子写」本身 Linux-pending。
+- [ ] 进程身份至少保存 remote boot ID、PID、PGID、`/proc` start ticks、随机 wrapper token 和 executable identity；...。**部分完成**：`bootId/pid/pgid/startTicks/wrapperToken` 五项字段齐全并有 schema+真实 SFTP 读取测试；**executable identity 未实现**——meta.json 只记录 `executable` 路径字符串，没有对其内容做 hash 或其他身份校验，这是一个真实缺口。systemd/Slurm scope/job ID 不适用（未实现该 adapter）。
+- [x] SSH 断开或 MCP adapter 重启不能自动杀死已成功启动的 durable run。**已在真实 `.88` 验证**（P2-03-A1，见「Linux 验收执行记录」）。
+- [ ] Controller 重启后从远端状态恢复运行记录并校正数据库。**不适用于本设计**：按 Rev.5/Rev.4 的架构决定，本轮没有 Controller daemon 也没有本机数据库（见本节前「Phase 2 与 Rev.4 取消 P0-05/P0-06 的关系」）；等价能力是「MCP adapter 重启后直接查远端文件即得到完整状态，无需任何本机校正」，这正是 P2-03-A1 要验收的内容。
+
+- [ ] **P2-03-A1**：启动 30 秒真实 Python 程序，关闭 adapter 和 daemon 后重启，仍能查询运行状态与增量日志，并最终获得真实 exit code。**Linux-pending，未由本次交付执行**。测试已写好并可真实运行：`src/tests/run-acceptance-linux-pending.test.ts`，用 `SSH_LAB_HOST`/`SSH_LAB_USER`/`SSH_LAB_KEY_PATH或SSH_LAB_PASSWORD`（可选 `SSH_LAB_REMOTE_DIR`、`SSH_LAB_PYTHON`、`SSH_LAB_P2_SLEEP_SECONDS`）指向 `.88` 或其上一个带真实 python3 的容器/主机后，`npm run build && node --test build/tests/run-acceptance-linux-pending.test.js` 即可真实运行；不设置这些变量时该文件的三个用例会明确以 `MISSING CAPABILITY` 原因 skip（exit 0），已在本机验证过 skip 路径本身工作正常，但**从未连接过 `.88`**。
 
 ### P2-04 Run logs、cancel 和 retry
 
-- [ ] logs 使用 byte offset，处理 UTF-8 半字符，不重复、不跳字节。
-- [ ] cancel 先向远端进程组发 TERM，等待 `graceMs`，仍存活再 KILL。
-- [ ] cancel 前重新核对 boot ID/start ticks/wrapper token/scope；不匹配进入 `orphaned`，绝不向可能复用的 PID/PGID 发信号。
-- [ ] 取消只影响指定 run，不得误杀同用户其他 Python 进程。
-- [ ] retry 复制原 run 的非秘密 config snapshot，重新解析 secret reference；临时 secret 缺失时返回 `SECRET_REQUIRED`，生成新 runId 并记录 parentRunId。
-- [ ] Slurm cancel 使用 `scancel <exactJobId>`；不允许模糊匹配进程名。
+- [x] logs 使用 byte offset，处理 UTF-8 半字符，不重复、不跳字节。`src/run/log-offset.ts`（纯函数，穷举含 2/3/4 字节字符跨窗口边界、cap=0、真正在缓冲区末尾截断等场景，并做过变异测试）+ `src/run/remote-sftp.ts` 的真实 SFTP ranged READ（`run-service-real.test.ts` 用真实 3 字节字符跨窗口边界样本、两次真实 SFTP 请求首尾拼接验证无重复无丢字节，并用 `RealSshTestServer.stats.readRequests` 断言请求确实是按字节范围发出的）。
+- [ ] cancel 先向远端进程组发 TERM，等待 `graceMs`，仍存活再 KILL。**部分完成**：远端脚本已生成并通过真实 `bash -n` 语法校验（`src/run/cancel-script.ts` 的 `buildSignalScript`，见 `run-wrapper-script.test.ts`）；真实信号投递 Linux-pending，即 P2-04-A1。
+- [ ] cancel 前重新核对 boot ID/start ticks/wrapper token/scope；不匹配进入 `orphaned`，绝不向可能复用的 PID/PGID 发信号。**部分完成**：决策函数 `decideCancelAction`（`src/run/identity.ts`）逐字段穷举测试 + 变异测试（人为去掉 pgid 比对，确认对应测试真实变红），且代码审查确认 `RunService.cancel()` 严格在这个决策之后才可能构建/发送信号脚本（先做一次只读 probe，`action:"orphaned"` 分支直接落盘 `orphaned.json`，从不触达 `buildSignalScript`）；真实远端 `/proc` probe 与信号发送 Linux-pending，即 P2-04-A2。`cancel()` 对已有 `exit.json`/`orphaned.json` 的幂等短路分支（完全不触达任何远端信号）已用真实 SFTP 验证（`run-service-real.test.ts`、`run-tools-wiring.test.ts`）。
+- [ ] 取消只影响指定 run，不得误杀同用户其他 Python 进程。**Linux-pending**，即 P2-04-A1（`run-acceptance-linux-pending.test.ts` 会额外启动一个带 marker 的无关 `sleep` 进程，cancel 后断言其仍存活）。
+- [ ] retry 复制原 run 的非秘密 config snapshot...。**本轮明确不实现** `run-retry`（dispatch 范围排除），未注册对应 tool。
+- [ ] Slurm cancel 使用 `scancel <exactJobId>`...。**不适用**：Slurm adapter 本轮未实现。
 
-- [ ] **P2-04-A1**：真实子进程再派生孙进程，cancel 后整个目标进程组退出；无关同名进程保持运行。
-- [ ] **P2-04-A2**：构造旧 PID identity 不匹配/PID reuse，cancel 进入 orphaned 且无关进程仍存活。
+- [x] **P2-04-A1**：**达成，2026-09-15 由复核者在真实 `.88` 上执行**（见下方「Linux 验收执行记录」）。
+- [x] **P2-04-A2**：**达成，2026-09-15 由复核者在真实 `.88` 上执行**（见下方「Linux 验收执行记录」）。
+
+### Linux 验收执行记录（2026-09-15，复核者亲自执行）
+
+子代理按要求编写了 `src/tests/run-acceptance-linux-pending.test.ts` 但**未自行接触 `.88`**（交办时明确禁止）。由复核者执行：
+
+```
+SSH_LAB_HOST=10.100.100.88 SSH_LAB_USER=arc SSH_LAB_KEY_PATH=<key> \
+  node --test build/tests/run-acceptance-linux-pending.test.js
+→ tests 3, pass 3, fail 0
+  ✔ P2-03-A1  (31.9s)  ✔ P2-04-A1  (6.9s)  ✔ P2-04-A2  (2.1s)
+```
+
+三项均为真实 Linux 语义：真实 `setsid` 分离、真实 `/proc` 身份捕获、真实进程组信号投递、真实 30 秒 Python 程序跨 SSH 客户端缓存重置后仍可查询并取回真实 exit code。
+
+**执行前复核者必须先修的问题（共享真机安全）**，均在放上 `.88` 之前发现并修复：
+
+1. **无差别 `pkill`**：清理逻辑里有 `pkill -f 'sleep 300'`，会杀掉该账号下**所有**匹配的进程，不只是测试自己起的。根因是其中一个背景进程启动时没带唯一标记，导致无法精确清理。已改为每个背景进程都带唯一 marker、清理只按 marker 匹配。这直接违反 §P0-02 写明的「`.88` 是共享真机……禁止触碰前缀之外的任何路径、容器或网络」。
+2. **run 状态目录不在清理范围内**：`~/.handfree-runs/<runId>/` 在 `remoteRoot` 之外，原 `after()` 只清 `remoteRoot`，每跑一次就在账号家目录留一份。已改为登记每次 launch 的 runId 并按精确路径删除（绝不用通配）。
+3. **`privateKey` 传了内容而非路径**：该字段在本项目中恒为文件路径（所有调用点都是 `fs.readFileSync(config.privateKey)`）。测试读出文件内容再传入，导致把密钥正文当文件名去打开。
+
+**首次真实执行中新发现、并已修复的两个问题**：
+
+4. **私钥泄漏进日志（安全）**：承接上一条，Node 的 ENOENT 错误消息包含它尝试打开的值——即**完整私钥**——而连接池把该消息原样拼进 `ToolError`，于是私钥进入日志与返回给调用方的 tool response。实测已在终端打印出一把真实 ed25519 私钥。修复：新增 `describePrivateKeyReadFailure`（`ssh-connection-pool.ts`），检测到值形似密钥材料时改报「该字段必须是文件路径」且不回显该值；普通路径错误仍原样透出以免影响排障。三处调用点（主连接两处 + jump host 一处）统一使用。回归测试 `src/tests/private-key-error-redaction.test.ts`，覆盖 OpenSSH/RSA/EC/DSA/PKCS8/加密 PKCS8 六种 PEM 头，并断言普通路径错误不被过度脱敏。
+5. **清理被产品自身的命令黑名单挡掉**：`rm -rf` 命中内建危险命令黑名单（recursive force rm），清理命令被拒，而 `catch {}` 把拒绝吞掉——**一次全绿的运行仍然在共享机器上留下了 3 个 run 目录和 1 个 workspace 目录**（已手动清除）。修复：改用 `find <精确路径> -mindepth 0 -delete`（不命中黑名单），删除后**逐个复查是否真的消失**，仍有残留则**抛错而非静默**。修复后重跑，`.88` 实测零残留。
+
+第 5 条值得单独记：清理失败被静默吞掉，比不写清理更危险——它让「全绿」与「干净」脱钩。凡是对共享资源的清理，失败必须可见。
 
 ### P2-06 collect phase
+
+> **本轮未交付**（2026-09-15 runner core 分派明确排除，留给下一轮）。`workspace-run` 本轮要求 `collect` 为空/省略；非空数组返回 `COLLECT_NOT_AVAILABLE`，不静默忽略、不回退为全拉 remoteRoot。以下清单原样保留，未动。
 
 按 5.8 的 collect 约束实现。
 
@@ -1171,13 +1205,13 @@ P2-03 要求「SSH 断开或 MCP adapter 重启不能杀死已启动的 durable 
 
 ### P2-05 Workspace run tools
 
-- [ ] 注册 `workspace-run/run-status/run-logs/run-list/run-cancel/run-retry`。
-- [ ] 更新 `help`、README、README_CN 和 server instructions。
-- [ ] Web/MCP 调用同一个 RunService，不复制业务逻辑。
+- [ ] 注册 `workspace-run/run-status/run-logs/run-list/run-cancel/run-retry`。**部分完成**：`workspace-run`（仅 launch，见 P2-02/P2-06 note）、`run-status`、`run-logs`、`run-list`、`run-cancel` 五个 tool 已注册（`src/tools/{workspace-run,run-status,run-logs,run-list,run-cancel}.ts`，接入 `src/tools/index.ts`）并有真实 MCP 黑盒测试（`run-tools-wiring.test.ts`，18 个用例，覆盖每个 `*_NOT_AVAILABLE`/`*_NOT_ALLOWED`/`*_NOT_FOUND` 分支 + 对真实 SFTP 播种状态文件的读取）。`run-retry` **本轮未注册**（dispatch 范围排除）。
+- [x] 更新 `help`、README、README_CN 和 server instructions。`src/tools/help.ts`（五个 tool 的详细帮助 + overview 一行）、`README.md`/`README_CN.md`（新增 workspace-run 小节 + `runProfiles` YAML 示例）、`src/config/server.ts` 的 `SERVER_INSTRUCTIONS` 第 13 条。均明确写出本轮 launch-only 的边界与理由，未做「同步以后会做」式的隐藏承诺。
+- [x] Web/MCP 调用同一个 RunService，不复制业务逻辑。`src/run/run-service.ts` 是唯一的业务逻辑落点；五个 tool 文件都只做参数校验/envelope 包装，直接委托 `RunService` 的方法。Web 未在本轮范围内，此条陈述对「未来 Web 不会另起一份逻辑」成立。
 
-- [ ] **P2-05-A1**：从真实 stdio MCP 完成 run start/status/log/cancel/retry，HTTP 尚未启用时也能全流程工作；响应的 `runId === jobId`。
+- [ ] **P2-05-A1**：从真实 stdio MCP 完成 run start/status/log/cancel/retry，HTTP 尚未启用时也能全流程工作；响应的 `runId === jobId`。**部分完成，真实 stdio MCP 黑盒已跑（`run-tools-wiring.test.ts`），但仅覆盖 status/logs/list/cancel 的读取路径与 launch 的 preflight 错误分支**——一次成功的 `start`（真实远端进程真正跑起来）需要 Linux 语义，本次未执行，见 P2-03-A1。`runId === jobId` 不变量在代码层面成立（`workspace-run` 响应的 `jobId: result.runId`，`run-service.ts` 内部只有 `runId` 这一个 id，从不生成第二个），但**没有专门写一条断言 `jobId===runId` 的测试**——这是本轮遗漏，下一轮应补一条直接断言。`run-retry` 不适用（未实现）。
 
-- [ ] **PHASE-2-GATE**：一次 tool 调用完成 `push → preflight → launching → remote-running → collect` 全流水线；run 在 adapter 与 daemon 双重启后仍可查询与取消；phase 可见、失败按 phase 反序清理；通用 venv gate 必过，GPU/Slurm 等按已声明 C 类 adapter qualification 验收。常驻同步引擎的 `flush` 屏障不在本 gate 范围内。
+- [ ] **PHASE-2-GATE**：**未达成**（预期内——push/collect 未交付，Linux 执行未验收）。一次 tool 调用完成 `push → preflight → launching → remote-running → collect` 全流水线做不到，因为 push/collect 本轮不存在；`run` 在 adapter 双重启后仍可查询与取消——**adapter 重启这一半已用真实手段验证**（读取远端文件不依赖任何进程内状态，`run-service-real.test.ts`/`run-tools-wiring.test.ts` 的每个用例都是全新调用、不依赖前序调用留下的内存态），但「daemon 双重启」不适用于本设计（无 daemon）；「phase 可见、失败按 phase 反序清理」——launch 失败时确实不产生任何远端副作用（preflight 阶段的错误发生在任何 exec/SFTP 调用之前，代码审查确认），但没有走 `src/contracts/run-contract.ts` 里已经写好的 `computeCleanupOrder` 通用清理框架，因为本轮唯一会失败并需要清理的阶段就是 preflight 本身（无副作用可清理）；GPU/Slurm 等 C 类 adapter 未声明可用，不参与本 gate。**该 gate 的完整达成需要 push/collect（下一轮）与一次真实 `.88` venv 全流程验收。**
 
 ## Phase 3：三模式同步引擎（Rev.3 暂缓，设计保留）
 

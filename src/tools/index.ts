@@ -8,6 +8,11 @@ import { registerCloseConnectionTool } from "./close-connection.js";
 import { registerCommandStatusTool } from "./command-status.js";
 import { registerTransferTool } from "./transfer.js";
 import { registerHelpTool } from "./help.js";
+import { registerWorkspaceRunTool } from "./workspace-run.js";
+import { registerRunStatusTool } from "./run-status.js";
+import { registerRunLogsTool } from "./run-logs.js";
+import { registerRunListTool } from "./run-list.js";
+import { registerRunCancelTool } from "./run-cancel.js";
 
 /**
  * Register all tools
@@ -22,5 +27,10 @@ export function registerAllTools(server: McpServer): void {
   registerCloseConnectionTool(server);
   registerCommandStatusTool(server);
   registerTransferTool(server);
+  registerWorkspaceRunTool(server);
+  registerRunStatusTool(server);
+  registerRunLogsTool(server);
+  registerRunListTool(server);
+  registerRunCancelTool(server);
   registerHelpTool(server);
 }

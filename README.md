@@ -120,6 +120,11 @@ The AI can now execute commands on your servers. All within your defined securit
 | `download` | Download remote file to local disk (optional `reuseConnection`, `vvv`, `fast`, or `striped` for a multi-channel single-file download — see [Striped (multi-channel) download](#striped-multi-channel-download)) |
 | `transfer` | Unified upload / download / server-to-server relay. Supports recursive small-file concurrency (`fileConcurrency`), batch upload (array `localPath`), temporary tar packing (`archive`, `archiveCompression`), fast SFTP by default, striped multi-channel download, and a bounded relay read-ahead window. |
 | `list-servers` | List configured (enabled) servers. Lean by default; `verbose:true` adds cached system status, `refresh:true` re-collects it (implies verbose). |
+| `workspace-run` | Launch an entrypoint on a remote server under a configured `runProfiles.<name>` entry. Durable: survives SSH disconnect and MCP adapter restart because all state lives on the remote filesystem, not locally. **Launch phase only in this delivery round** — see [workspace-run (remote runner)](#workspace-run-remote-runner-launch-phase-only). |
+| `run-status` | Query a `workspace-run` run's current status by `runId` (reads the remote state directory over SFTP; no local cache). |
+| `run-logs` | Read a byte-offset window of a run's stdout/stderr, UTF-8-boundary-safe across sequential calls. |
+| `run-list` | List runs on a server, newest first. |
+| `run-cancel` | Cancel a run: TERM to its process group, then KILL after `graceMs`; re-verifies process identity before signalling. |
 | `help` | Self-describing help text for the MCP client |
 
 ### show-whitelist
@@ -178,6 +183,31 @@ Returns command mode, built-in command guards, configured whitelist/blacklist pa
 ```
 
 Closes the cached SSH client for a configured server. This is useful after a timeout or suspected stale reused connection when you want the next default `reuseConnection: true` command to reconnect cleanly. Closing a jump host also closes cached targets whose jump chain uses that host. `reuseConnection: false` commands do not need this because their one-shot SSH clients close after each command.
+
+### workspace-run (remote runner, launch phase only)
+
+Launches an entrypoint on a remote server under a `runProfiles.<name>` entry declared in your YAML config (see [YAML Config Reference](#-yaml-config-reference)). The launched process is detached from the SSH session (its own process group, `setsid`) and writes its own state atomically to `~/.handfree-runs/<runId>/meta.json` / `stdout.log` / `stderr.log` / `pid` / `heartbeat` / `exit.json` on the remote filesystem. There is **no local job store or daemon** — an MCP adapter restart loses nothing because it held nothing, but this also means status/logs/cancel require the remote server to be reachable; there is no offline/cached view of run state.
+
+```json
+{ "tool": "workspace-run", "params": {
+  "profile": "qwen-dev", "entrypoint": "train.py", "args": ["--epochs", "3"],
+  "push": false
+} }
+{ "tool": "run-status", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
+{ "tool": "run-logs", "params": { "runId": "run_20260915T120000Z_ab12cd34", "offset": 0 } }
+{ "tool": "run-list", "params": { "profile": "qwen-dev" } }
+{ "tool": "run-cancel", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
+```
+
+**This delivery round implements the launch phase only** (PLAN.MD Phase 2). Explicitly **not yet implemented** — each returns a specific `*_NOT_AVAILABLE` error rather than being silently ignored:
+
+- `push` — the pre-launch upload phase. Must be passed as `false`; the code must already exist under the profile's `remoteRoot`. Omitting it (true default) or passing `true` returns `PUSH_NOT_AVAILABLE`.
+- `collect` — pulling artifacts back after the run finishes. Must be empty/omitted; use `download`/`transfer` instead. A non-empty array returns `COLLECT_NOT_AVAILABLE`.
+- `sync: "flush"` — the persistent sync barrier (Phase 3). Only `"none"`/omitted works; `"flush"` returns `SYNC_NOT_AVAILABLE`.
+- `run-retry` — not implemented at all in this delivery round.
+- `environment.type: conda | module | slurm`, `gpu.required`, and `secretEnv` — parse successfully in config but are rejected at launch time with `ENVIRONMENT_ADAPTER_NOT_AVAILABLE` / `GPU_VALIDATION_NOT_AVAILABLE` / `SECRET_ENV_NOT_AVAILABLE`. Only `environment.type: venv` (invokes `<path>/bin/python` directly, never `source activate`) and `environment.type: executable` are supported.
+
+`run-cancel` sends `TERM` to the run's whole remote process group, waits `graceMs` (default 5000), then `KILL` if it's still alive. Before signalling anything it re-verifies the recorded process identity (remote boot id, pid, pgid, `/proc` start ticks, and a wrapper token read back from the live process's own environment) against what is actually running right now; a mismatch (pid reuse, host reboot) moves the run to `orphaned` instead of risking a signal to an unrelated process.
 
 ## 📄 YAML Config Reference
 
@@ -250,6 +280,22 @@ servers:
       - /path/to/extra/local/dir
     # Bypasses both the remote allowlist and the local directory check entirely.
     # disableSftpPathPolicy: true
+
+# Optional: workspace-run profiles (PLAN.MD Phase 2). See "workspace-run
+# (remote runner, launch phase only)" above for what is and isn't
+# implemented yet in this delivery round.
+runProfiles:
+  qwen-dev:
+    server: server_name          # must match a servers: entry above
+    remoteRoot: /data/arc/qwen   # working directory the entrypoint runs from
+    environment:
+      type: venv                 # venv | executable (conda/module/slurm parse but are rejected at launch)
+      path: /data/arc/venvs/qwen # invokes /data/arc/venvs/qwen/bin/python directly
+    allowedEntrypoints:
+      - train.py
+      - benchmarks/*.py
+    env:
+      PYTHONUNBUFFERED: "1"      # caller-supplied env overrides may only use keys declared here
 ```
 
 ### Security note: command policy

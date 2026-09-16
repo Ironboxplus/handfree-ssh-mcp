@@ -110,4 +110,9 @@ export interface ParsedArgs {
   preConnect: boolean;
   enabledServers?: string[]; // List of enabled server names (if not set, all servers are enabled)
   outputLogDir?: string; // Absolute host path; root dir for execute-command full-output logs. Defaults to <cwd>/.handfree-output
+  // PLAN.MD P2-01: parsed `runProfiles:` YAML section (see
+  // src/config/run-profiles-loader.ts), already validated via the real Zod
+  // schema (src/contracts/config-schema.ts's runProfileSchema) by the time
+  // it lands here. Absent entirely when the config has no `runProfiles:` key.
+  runProfiles?: import("../config/run-profiles-loader.js").RunProfilesConfig;
 }
