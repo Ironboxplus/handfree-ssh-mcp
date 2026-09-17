@@ -13,6 +13,11 @@ import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
  * already uses to reach a live ssh2 Client.
  */
 
+/** Per-request bound for SFTP operations here. Generous: these read small
+ * state files and directory listings, never bulk data (bulk transfers go
+ * through TransferService, which has its own budgets). */
+export const DEFAULT_SFTP_OPERATION_TIMEOUT_MS = 30_000;
+
 /**
  * `reuseConnection` (default true) goes through SSHConnectionManager's
  * acquireSshClient -- the SAME reuseConnection=false one-shot-client escape
@@ -22,22 +27,56 @@ import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
  * force a fresh one -- a run-* tool call stuck behind a stale cached
  * connection (e.g. after a keepalive timeout) had no escape, unlike every
  * other SFTP-using tool in this codebase.
+ *
+ * `timeoutMs` bounds the SFTP channel open AND the caller's request, using
+ * the same withConnectionTimeout wrapper TransferService already uses for
+ * its own channel opens. Without it there was NO per-request timeout at all:
+ * a silently-dropped connection (routine on cloud GPU hosts behind NAT/proxy
+ * idle reaping) leaves an SFTP callback that never fires, and RunService's
+ * collect wait loop checks its own deadline only BETWEEN polls -- so one
+ * wedged read hung an entire workspace-run call past any timeout its caller
+ * set. Deliberately NOT passed to acquireSshClient: ensureConnected's own
+ * timeout path calls closeClient() on the SHARED CACHED client, so reusing
+ * this value there would let a slow connect tear down a connection other
+ * in-flight operations are using.
+ *
+ * Scope note: one acquisition + one SFTP channel per REQUEST, deliberately.
+ * Batching several reads onto one longer-lived session was tried and
+ * reverted: it couples N reads to one socket lifetime, so a single socket
+ * death (which is exactly what happens on the flaky links this work is
+ * about) takes out the whole logical operation instead of one read that the
+ * next call transparently re-acquires. Measured on the real lab host:
+ * per-request 3/3 clean acceptance runs, session-scoped failed 3 of 7.
  */
 async function withSftp<T>(
   serverName: string | undefined,
   fn: (sftp: SFTPWrapper) => Promise<T>,
   reuseConnection?: boolean,
+  timeoutMs: number = DEFAULT_SFTP_OPERATION_TIMEOUT_MS,
 ): Promise<T> {
   const manager = SSHConnectionManager.getInstance();
   const resolvedName = manager.resolveServer(serverName);
   const acquired = await manager.acquireSshClient(resolvedName, { reuseConnection, purpose: "sftp" });
   try {
     const client: Client = acquired.client;
-    const sftp = await new Promise<SFTPWrapper>((resolve, reject) => {
-      client.sftp((err, wrapper) => (err ? reject(err) : resolve(wrapper)));
-    });
+    const sftp = await manager.withOperationTimeout(
+      new Promise<SFTPWrapper>((resolve, reject) => {
+        client.sftp((err, wrapper) => (err ? reject(err) : resolve(wrapper)));
+      }),
+      timeoutMs,
+      `SFTP channel open for [${resolvedName}]`,
+      // A channel arriving after the timeout already fired would leak
+      // otherwise -- nothing else holds a reference to it.
+      (wrapper) => {
+        try {
+          wrapper.end();
+        } catch {
+          // Ignore late SFTP cleanup errors.
+        }
+      },
+    );
     try {
-      return await fn(sftp);
+      return await manager.withOperationTimeout(fn(sftp), timeoutMs, `SFTP request on [${resolvedName}]`);
     } finally {
       try {
         sftp.end();
@@ -62,10 +101,10 @@ function isMissingFileError(error: Error): boolean {
  * rather than guessed, matching how a normal (non-chroot) sftp-server's
  * starting directory always equals the login shell's home directory.
  */
-export async function resolveRemoteHomeDir(serverName?: string, reuseConnection?: boolean): Promise<string> {
+export async function resolveRemoteHomeDir(serverName?: string, reuseConnection?: boolean, timeoutMs?: number): Promise<string> {
   return withSftp(serverName, (sftp) => new Promise<string>((resolve, reject) => {
     sftp.realpath(".", (err, absolutePath) => (err ? reject(err) : resolve(absolutePath)));
-  }), reuseConnection);
+  }), reuseConnection, timeoutMs);
 }
 
 /** Reads a whole remote text file. Returns null if it does not exist (yet --
@@ -77,6 +116,7 @@ export async function readRemoteTextFile(
   absolutePath: string,
   maxBytes = 1_000_000,
   reuseConnection?: boolean,
+  timeoutMs?: number,
 ): Promise<string | null> {
   return withSftp(serverName, (sftp) => new Promise<string | null>((resolve, reject) => {
     sftp.open(absolutePath, "r", (openErr, handle) => {
@@ -102,7 +142,7 @@ export async function readRemoteTextFile(
         });
       });
     });
-  }), reuseConnection);
+  }), reuseConnection, timeoutMs);
 }
 
 export interface RemoteByteRange {
@@ -120,6 +160,7 @@ export async function readRemoteByteRange(
   offset: number,
   maxLength: number,
   reuseConnection?: boolean,
+  timeoutMs?: number,
 ): Promise<RemoteByteRange | null> {
   return withSftp(serverName, (sftp) => new Promise<RemoteByteRange | null>((resolve, reject) => {
     sftp.open(absolutePath, "r", (openErr, handle) => {
@@ -148,7 +189,7 @@ export async function readRemoteByteRange(
         });
       });
     });
-  }), reuseConnection);
+  }), reuseConnection, timeoutMs);
 }
 
 export interface RemoteDirEntry {
@@ -176,6 +217,7 @@ export async function listRemoteDirectory(
   serverName: string | undefined,
   absolutePath: string,
   reuseConnection?: boolean,
+  timeoutMs?: number,
 ): Promise<RemoteDirEntry[]> {
   return withSftp(serverName, (sftp) => new Promise<RemoteDirEntry[]>((resolve, reject) => {
     sftp.readdir(absolutePath, (err, list) => {
@@ -189,7 +231,7 @@ export async function listRemoteDirectory(
         isSymlink: (entry.attrs.mode & S_IFMT) === S_IFLNK,
       })));
     });
-  }), reuseConnection);
+  }), reuseConnection, timeoutMs);
 }
 
 export interface RemoteFileStat {
@@ -206,6 +248,7 @@ export async function statRemoteFile(
   serverName: string | undefined,
   absolutePath: string,
   reuseConnection?: boolean,
+  timeoutMs?: number,
 ): Promise<RemoteFileStat | null> {
   return withSftp(serverName, (sftp) => new Promise<RemoteFileStat | null>((resolve, reject) => {
     sftp.stat(absolutePath, (err, stats) => {
@@ -215,5 +258,5 @@ export async function statRemoteFile(
       }
       resolve({ size: stats.size, isFile: (stats.mode & S_IFMT) !== S_IFDIR });
     });
-  }), reuseConnection);
+  }), reuseConnection, timeoutMs);
 }

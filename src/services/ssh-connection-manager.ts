@@ -275,6 +275,23 @@ export class SSHConnectionManager {
     return this.pool.acquireSshClient(key, options);
   }
 
+  /**
+   * Public so src/run/remote-sftp.ts can bound each individual SFTP request
+   * with the SAME timeout mechanism TransferService already uses for its own
+   * SFTP channel opens -- rather than inventing a second one. Without this,
+   * a wedged SFTP callback never settles and no caller-supplied timeout can
+   * ever fire (the run tools' poll loops check their deadline only BETWEEN
+   * requests, so one hung request hangs the whole call indefinitely).
+   */
+  public withOperationTimeout<T>(
+    operation: Promise<T>,
+    timeoutMs: number | undefined,
+    description: string,
+    onLateResolve?: (value: T) => void,
+  ): Promise<T> {
+    return this.pool.withConnectionTimeout(operation, timeoutMs, description, undefined, undefined, onLateResolve);
+  }
+
   private withConnectionTimeout<T>(
     operation: Promise<T>,
     timeoutMs: number | undefined,
