@@ -397,6 +397,11 @@ Parameters:
   timeout         (number, optional)   Only meaningful when collect actually
                   runs: ms to wait for a terminal state before giving up on
                   collect. Default the profile's timeout, else 600000 (10m).
+  reuseConnection (boolean, optional)  Default true. Applies to every remote
+                  call this launch makes (push upload, entrypoint stat/hash,
+                  the launch exec, and collect if requested). Set false
+                  after a timeout or suspected stale/bad cached connection
+                  to force fresh ones for this call.
 
 Returns: { ok, jobId, state, message, next, details } — jobId equals the
 returned runId. details.status is the same shape run-status returns.
@@ -429,6 +434,9 @@ that just restarted can query exactly as well as one that never stopped.
 Parameters:
   runId           (string, required)   runId returned by workspace-run.
   connectionName  (string, see below)  Server the run was launched on.
+  reuseConnection (boolean, optional)  Default true. Set false after a
+                  timeout or suspected stale/bad cached connection to force
+                  a fresh one for this call.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -457,6 +465,9 @@ Parameters:
                   Use the previous response's nextOffset to continue.
   maxOutputBytes  (number, optional)   Max bytes this call returns.
                   Default 65536.
+  reuseConnection (boolean, optional)  Default true. Set false after a
+                  timeout or suspected stale/bad cached connection to force
+                  a fresh one for this call.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -486,6 +497,9 @@ Parameters:
   state           (string, optional)   running/completed/failed/cancelled/
                   recovering/orphaned.
   limit           (number, optional)   Default 50, max 200.
+  reuseConnection (boolean, optional)  Default true. Set false after a
+                  timeout or suspected stale/bad cached connection to force
+                  a fresh one for this call.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -514,6 +528,9 @@ Parameters:
   connectionName  (string, see below)  Server the run was launched on.
   graceMs         (number, optional)   Wait after TERM before KILL.
                   Default 5000.
+  reuseConnection (boolean, optional)  Default true. Set false after a
+                  timeout or suspected stale/bad cached connection to force
+                  a fresh one for this call.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -552,6 +569,9 @@ Parameters:
                   force a re-push — only meaningful if the snapshot has push
                   sources, else INVALID_CONFIGURATION — or false to reuse
                   code already on remoteRoot.
+  reuseConnection (boolean, optional)  Default true. Set false after a
+                  timeout or suspected stale/bad cached connection to force
+                  a fresh one for this call.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).

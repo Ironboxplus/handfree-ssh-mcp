@@ -13,23 +13,42 @@ import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
  * already uses to reach a live ssh2 Client.
  */
 
-async function withSftp<T>(serverName: string | undefined, fn: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
+/**
+ * `reuseConnection` (default true) goes through SSHConnectionManager's
+ * acquireSshClient -- the SAME reuseConnection=false one-shot-client escape
+ * hatch executeCommand/upload/download/transfer already have (see
+ * SshConnectionPool.acquireSshClient). Previously this always used
+ * manager.connect()+getClient(), the shared cached client, with no way to
+ * force a fresh one -- a run-* tool call stuck behind a stale cached
+ * connection (e.g. after a keepalive timeout) had no escape, unlike every
+ * other SFTP-using tool in this codebase.
+ */
+async function withSftp<T>(
+  serverName: string | undefined,
+  fn: (sftp: SFTPWrapper) => Promise<T>,
+  reuseConnection?: boolean,
+): Promise<T> {
   const manager = SSHConnectionManager.getInstance();
   const resolvedName = manager.resolveServer(serverName);
-  await manager.connect(resolvedName);
-  const client: Client = manager.getClient(resolvedName);
-  const sftp = await new Promise<SFTPWrapper>((resolve, reject) => {
-    client.sftp((err, wrapper) => (err ? reject(err) : resolve(wrapper)));
-  });
+  const acquired = await manager.acquireSshClient(resolvedName, { reuseConnection, purpose: "sftp" });
   try {
-    return await fn(sftp);
-  } finally {
+    const client: Client = acquired.client;
+    const sftp = await new Promise<SFTPWrapper>((resolve, reject) => {
+      client.sftp((err, wrapper) => (err ? reject(err) : resolve(wrapper)));
+    });
     try {
-      sftp.end();
-    } catch {
-      // Ignore SFTP channel close errors -- the underlying client connection
-      // is shared/cached and must not be torn down here.
+      return await fn(sftp);
+    } finally {
+      try {
+        sftp.end();
+      } catch {
+        // Ignore SFTP channel close errors -- the underlying client
+        // connection's lifetime is owned by `acquired.close()` below, not
+        // by the SFTP channel itself.
+      }
     }
+  } finally {
+    acquired.close();
   }
 }
 
@@ -43,10 +62,10 @@ function isMissingFileError(error: Error): boolean {
  * rather than guessed, matching how a normal (non-chroot) sftp-server's
  * starting directory always equals the login shell's home directory.
  */
-export async function resolveRemoteHomeDir(serverName?: string): Promise<string> {
+export async function resolveRemoteHomeDir(serverName?: string, reuseConnection?: boolean): Promise<string> {
   return withSftp(serverName, (sftp) => new Promise<string>((resolve, reject) => {
     sftp.realpath(".", (err, absolutePath) => (err ? reject(err) : resolve(absolutePath)));
-  }));
+  }), reuseConnection);
 }
 
 /** Reads a whole remote text file. Returns null if it does not exist (yet --
@@ -57,6 +76,7 @@ export async function readRemoteTextFile(
   serverName: string | undefined,
   absolutePath: string,
   maxBytes = 1_000_000,
+  reuseConnection?: boolean,
 ): Promise<string | null> {
   return withSftp(serverName, (sftp) => new Promise<string | null>((resolve, reject) => {
     sftp.open(absolutePath, "r", (openErr, handle) => {
@@ -82,7 +102,7 @@ export async function readRemoteTextFile(
         });
       });
     });
-  }));
+  }), reuseConnection);
 }
 
 export interface RemoteByteRange {
@@ -99,6 +119,7 @@ export async function readRemoteByteRange(
   absolutePath: string,
   offset: number,
   maxLength: number,
+  reuseConnection?: boolean,
 ): Promise<RemoteByteRange | null> {
   return withSftp(serverName, (sftp) => new Promise<RemoteByteRange | null>((resolve, reject) => {
     sftp.open(absolutePath, "r", (openErr, handle) => {
@@ -127,7 +148,7 @@ export async function readRemoteByteRange(
         });
       });
     });
-  }));
+  }), reuseConnection);
 }
 
 export interface RemoteDirEntry {
@@ -151,7 +172,11 @@ const S_IFDIR = 0o040000;
 
 /** Lists a remote directory. Returns an empty array if it does not exist
  * (e.g. no runs have ever been launched for this server yet). */
-export async function listRemoteDirectory(serverName: string | undefined, absolutePath: string): Promise<RemoteDirEntry[]> {
+export async function listRemoteDirectory(
+  serverName: string | undefined,
+  absolutePath: string,
+  reuseConnection?: boolean,
+): Promise<RemoteDirEntry[]> {
   return withSftp(serverName, (sftp) => new Promise<RemoteDirEntry[]>((resolve, reject) => {
     sftp.readdir(absolutePath, (err, list) => {
       if (err) {
@@ -164,7 +189,7 @@ export async function listRemoteDirectory(serverName: string | undefined, absolu
         isSymlink: (entry.attrs.mode & S_IFMT) === S_IFLNK,
       })));
     });
-  }));
+  }), reuseConnection);
 }
 
 export interface RemoteFileStat {
@@ -177,7 +202,11 @@ export interface RemoteFileStat {
  * lstat-based `isSymlink` instead, before ever calling this). Returns null
  * if the path does not exist. Used by the push phase (entrypoint revision)
  * and the collect phase (byte-cap accounting before downloading). */
-export async function statRemoteFile(serverName: string | undefined, absolutePath: string): Promise<RemoteFileStat | null> {
+export async function statRemoteFile(
+  serverName: string | undefined,
+  absolutePath: string,
+  reuseConnection?: boolean,
+): Promise<RemoteFileStat | null> {
   return withSftp(serverName, (sftp) => new Promise<RemoteFileStat | null>((resolve, reject) => {
     sftp.stat(absolutePath, (err, stats) => {
       if (err) {
@@ -186,5 +215,5 @@ export async function statRemoteFile(serverName: string | undefined, absolutePat
       }
       resolve({ size: stats.size, isFile: (stats.mode & S_IFMT) !== S_IFDIR });
     });
-  }));
+  }), reuseConnection);
 }

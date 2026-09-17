@@ -8,6 +8,11 @@ import { registerTransferTool } from "../tools/transfer.js";
 import { registerUploadTool } from "../tools/upload.js";
 import { registerHelpTool, TOOL_HELP_FOR_TEST, TOOL_OVERVIEW_FOR_TEST } from "../tools/help.js";
 import { registerWorkspaceRunTool } from "../tools/workspace-run.js";
+import { registerRunStatusTool } from "../tools/run-status.js";
+import { registerRunLogsTool } from "../tools/run-logs.js";
+import { registerRunListTool } from "../tools/run-list.js";
+import { registerRunCancelTool } from "../tools/run-cancel.js";
+import { registerRunRetryTool } from "../tools/run-retry.js";
 import { SERVER_INSTRUCTIONS } from "../config/server.js";
 
 /**
@@ -38,6 +43,11 @@ async function listRegisteredTools(): Promise<Map<string, string[]>> {
   registerTransferTool(server);
   registerUploadTool(server);
   registerWorkspaceRunTool(server);
+  registerRunStatusTool(server);
+  registerRunLogsTool(server);
+  registerRunListTool(server);
+  registerRunCancelTool(server);
+  registerRunRetryTool(server);
   registerHelpTool(server);
   const client = new Client({ name: "doc-coverage-client", version: "0.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -57,11 +67,21 @@ async function listRegisteredTools(): Promise<Map<string, string[]>> {
 }
 
 describe("documentation coverage: every tool parameter appears in that tool's help text", () => {
-  test("download / transfer / upload parameters are all documented in help", async () => {
+  test("download / transfer / upload / run-* parameters are all documented in help", async () => {
     const tools = await listRegisteredTools();
     const missing: string[] = [];
 
-    for (const toolName of ["download", "transfer", "upload", "workspace-run"]) {
+    for (const toolName of [
+      "download",
+      "transfer",
+      "upload",
+      "workspace-run",
+      "run-status",
+      "run-logs",
+      "run-list",
+      "run-cancel",
+      "run-retry",
+    ]) {
       const parameters = tools.get(toolName);
       assert.ok(parameters && parameters.length > 0, `expected ${toolName} to expose parameters`);
       const helpText = TOOL_HELP_FOR_TEST[toolName];
@@ -82,6 +102,23 @@ describe("documentation coverage: every tool parameter appears in that tool's he
         `Adding a parameter without documenting it makes \`help\` an incomplete list of that tool's own options -- ` +
         `exactly how \`connections\` shipped undocumented in 2.0.0.`,
     );
+  });
+
+  test("every run-* tool actually exposes reuseConnection, not just workspace-run", async () => {
+    // execute-command/upload/download/transfer have always had reuseConnection
+    // as an escape hatch from a stale cached connection. The whole run-*
+    // family (built later, on top of remote-sftp.ts's withSftp, which had NO
+    // such escape hatch at all) never got it -- caught for real on .88 when
+    // workspace-run itself hung on "Timed out while waiting for handshake"
+    // behind a connection a prior command had already wedged, with no
+    // parameter to force a fresh one short of calling close-connection first.
+    // This is the retrofit: same param, same default, same wording, applied
+    // to the whole family in one pass instead of one tool at a time.
+    const tools = await listRegisteredTools();
+    for (const toolName of ["workspace-run", "run-status", "run-logs", "run-list", "run-cancel", "run-retry"]) {
+      const parameters = tools.get(toolName);
+      assert.ok(parameters?.includes("reuseConnection"), `expected ${toolName}'s real MCP schema to expose reuseConnection`);
+    }
   });
 
   test("workspace-run is documented as usable without any YAML config", () => {

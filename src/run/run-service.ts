@@ -117,6 +117,12 @@ export interface LaunchParams extends AdHocProfileParams {
    * reach a terminal state before giving up on collect (without cancelling
    * the run itself, which keeps running regardless). */
   timeout?: number;
+  /** Whether to reuse the cached SSH connection for every remote call this
+   * launch makes (push upload, entrypoint stat/hash, the launch exec itself,
+   * and collect if requested). Default true, same convention as
+   * execute-command/upload/download/transfer. Set false after a timeout or
+   * suspected stale cached connection to force fresh ones for this call. */
+  reuseConnection?: boolean;
 }
 
 export interface CollectFileResult {
@@ -309,7 +315,12 @@ export class RunService {
    * failures (which DO throw, via runBoundedTransfers) are re-wrapped so the
    * failing local source is always named.
    */
-  private async runPush(server: string, remoteRoot: string, pushConfig: RunProfilePushConfig): Promise<string[]> {
+  private async runPush(
+    server: string,
+    remoteRoot: string,
+    pushConfig: RunProfilePushConfig,
+    reuseConnection?: boolean,
+  ): Promise<string[]> {
     const files: string[] = [];
     const dirs: string[] = [];
     for (const localPath of pushConfig.paths) {
@@ -330,7 +341,7 @@ export class RunService {
     const transferService = this.sshManager.getTransferService();
 
     if (files.length > 0) {
-      const result = await transferService.uploadBatch(files, remoteRoot, server);
+      const result = await transferService.uploadBatch(files, remoteRoot, server, { reuseConnection });
       const failed = result.results.filter((r) => r.status === "failed");
       if (failed.length > 0) {
         throw new RunServiceError(
@@ -353,7 +364,7 @@ export class RunService {
       // a colliding relative path between two entries is last-write-wins,
       // same tradeoff any directory-overlay push makes.
       try {
-        const uploaded = await this.sshManager.uploadDirectory(localDir, remoteRoot, server);
+        const uploaded = await this.sshManager.uploadDirectory(localDir, remoteRoot, server, { reuseConnection });
         pushedRemotePaths.push(...uploaded);
       } catch (error) {
         throw new RunServiceError(
@@ -371,8 +382,13 @@ export class RunService {
    * is actually about to run), so a corrupt/missing remote entrypoint is
    * caught here as a real preflight failure instead of surfacing later as an
    * opaque wrapper-script exit code. */
-  private async computeEntrypointRevision(server: string, entrypointAbsolute: string, pushedRemotePaths: string[]): Promise<RunRevision> {
-    const stat = await statRemoteFile(server, entrypointAbsolute);
+  private async computeEntrypointRevision(
+    server: string,
+    entrypointAbsolute: string,
+    pushedRemotePaths: string[],
+    reuseConnection?: boolean,
+  ): Promise<RunRevision> {
+    const stat = await statRemoteFile(server, entrypointAbsolute, reuseConnection);
     if (stat === null) {
       throw new RunServiceError(
         "ENTRYPOINT_NOT_FOUND",
@@ -382,7 +398,7 @@ export class RunService {
     if (!stat.isFile) {
       throw new RunServiceError("ENTRYPOINT_NOT_ALLOWED", `entrypoint '${entrypointAbsolute}' is not a regular file`);
     }
-    const entrypointHash = await this.remoteContentHash(server, entrypointAbsolute);
+    const entrypointHash = await this.remoteContentHash(server, entrypointAbsolute, reuseConnection);
     return {
       entrypointHash,
       entrypointBytes: stat.size,
@@ -394,9 +410,10 @@ export class RunService {
    * TransferService already uses (its private remoteMd5) for skip-if-
    * identical, reused here at the exec layer this service already owns
    * rather than reaching into TransferService for a second, private copy. */
-  private async remoteContentHash(server: string, remotePath: string): Promise<string> {
+  private async remoteContentHash(server: string, remotePath: string, reuseConnection?: boolean): Promise<string> {
     const output = await this.sshManager.executeCommand(`md5sum ${posixShellQuote(remotePath)}`, server, {
       timeout: HASH_EXEC_TIMEOUT_MS,
+      reuseConnection,
     });
     const hash = output.trim().split(/\s+/)[0];
     if (!hash || hash.length !== 32) {
@@ -444,9 +461,9 @@ export class RunService {
    * missing" gate the plan calls for, rather than silently launching with
    * secrets it has no way to provide.
    */
-  public async retry(server: string | undefined, runId: string, push?: boolean): Promise<LaunchResult> {
+  public async retry(server: string | undefined, runId: string, push?: boolean, reuseConnection?: boolean): Promise<LaunchResult> {
     const resolvedServer = this.sshManager.resolveServer(server);
-    const { meta } = await this.loadMetaOrThrow(resolvedServer, runId);
+    const { meta } = await this.loadMetaOrThrow(resolvedServer, runId, reuseConnection);
     if (!meta.configSnapshot || !meta.configRevision || !meta.entrypointRelative) {
       throw new RunServiceError(
         "RETRY_SNAPSHOT_UNAVAILABLE",
@@ -469,6 +486,7 @@ export class RunService {
       env: meta.env,
       push,
       sync: "none",
+      reuseConnection,
     };
     return this.launchWithProfile(snapshot, meta.configRevision, params, runId);
   }
@@ -508,18 +526,18 @@ export class RunService {
     let pushOutcome: PhaseOutcome;
     let pushedRemotePaths: string[] = [];
     if (effectivePush) {
-      pushedRemotePaths = await this.runPush(server, remoteRoot, profile.push!);
+      pushedRemotePaths = await this.runPush(server, remoteRoot, profile.push!, params.reuseConnection);
       pushOutcome = { phase: "push", status: "completed" };
     } else {
       pushOutcome = { phase: "push", status: "skipped", reason: "push:false -- code must already exist under remoteRoot" };
     }
 
-    const revision = await this.computeEntrypointRevision(server, entrypointAbsolute, pushedRemotePaths);
+    const revision = await this.computeEntrypointRevision(server, entrypointAbsolute, pushedRemotePaths, params.reuseConnection);
     const configSnapshot = this.buildConfigSnapshot(profile);
 
     const runId = generateRunId();
     const paths = computeRunPaths(runId);
-    const homeDir = await resolveRemoteHomeDir(server);
+    const homeDir = await resolveRemoteHomeDir(server, params.reuseConnection);
     const absolutePaths = this.toAbsolutePaths(homeDir, paths);
 
     const wrapperToken = crypto.randomBytes(16).toString("hex");
@@ -547,6 +565,7 @@ export class RunService {
 
     const output = await this.sshManager.executeCommand(buildLaunchExecCommand(script), server, {
       timeout: LAUNCH_EXEC_TIMEOUT_MS,
+      reuseConnection: params.reuseConnection,
     });
 
     const errorLine = findSentinelLine(output, "HANDFREE_LAUNCH_ERROR:");
@@ -583,7 +602,7 @@ export class RunService {
           reason: `run did not reach a terminal state within ${waitTimeoutMs}ms (still '${wait.status.state}'); collect was not attempted. The run itself keeps running -- poll run-status.`,
         };
       } else {
-        collectResult = await this.runCollect(server, remoteRoot, profile.collect!.localDir!, effectiveCollectPaths, profile.collect?.maxBytes ?? DEFAULT_COLLECT_MAX_BYTES, profile.collect?.maxFiles ?? DEFAULT_COLLECT_MAX_FILES);
+        collectResult = await this.runCollect(server, remoteRoot, profile.collect!.localDir!, effectiveCollectPaths, profile.collect?.maxBytes ?? DEFAULT_COLLECT_MAX_BYTES, profile.collect?.maxFiles ?? DEFAULT_COLLECT_MAX_FILES, params.reuseConnection);
         collectOutcome = { phase: "collect", status: collectResult.status, reason: collectResult.reason };
       }
     }
@@ -608,6 +627,13 @@ export class RunService {
    * tool already uses is the whole mechanism; "terminal" mirrors the states
    * run-status/run-list already recognize as final. */
   private async waitForTerminalStatus(server: string, runId: string, timeoutMs: number): Promise<{ status: RunStatusSummary; terminal: boolean }> {
+    // Deliberately does NOT take a reuseConnection override: this polls
+    // getStatus every COLLECT_POLL_INTERVAL_MS for up to `timeoutMs` (default
+    // 10 minutes -- hundreds of iterations). Forcing a fresh one-shot
+    // SSH/SFTP connection on every poll would hammer the remote host's own
+    // connection-accept path (the exact sshd MaxStartups pressure `connections`
+    // already documents), for a caller intent ("this ONE call is stuck behind
+    // a stale cache") that a single request already satisfies.
     const terminalStates: ReadonlySet<RunState> = new Set(["completed", "failed", "cancelled", "orphaned"]);
     const deadline = Date.now() + Math.max(0, timeoutMs);
     for (;;) {
@@ -640,10 +666,11 @@ export class RunService {
     patterns: string[],
     maxBytes: number,
     maxFiles: number,
+    reuseConnection?: boolean,
   ): Promise<CollectPhaseResult> {
     let matches: CollectMatch[];
     try {
-      matches = await findRemoteCollectFiles(server, remoteRoot, patterns);
+      matches = await findRemoteCollectFiles(server, remoteRoot, patterns, reuseConnection);
     } catch (error) {
       return {
         status: "failed",
@@ -659,7 +686,7 @@ export class RunService {
       const localPath = path.join(localDir, ...match.relativePath.split("/"));
       fs.mkdirSync(path.dirname(localPath), { recursive: true });
       try {
-        await this.sshManager.download(match.absolutePath, localPath, server);
+        await this.sshManager.download(match.absolutePath, localPath, server, { reuseConnection });
       } catch (error) {
         return {
           status: "failed",
@@ -764,15 +791,19 @@ export class RunService {
     return Date.now() - parsed < HEARTBEAT_STALE_THRESHOLD_MS;
   }
 
-  private async loadMetaOrThrow(server: string, runId: string): Promise<{ meta: RunMeta; absolutePaths: RunPaths }> {
+  private async loadMetaOrThrow(
+    server: string,
+    runId: string,
+    reuseConnection?: boolean,
+  ): Promise<{ meta: RunMeta; absolutePaths: RunPaths }> {
     if (!isValidRunId(runId)) {
       throw new RunServiceError("INVALID_RUN_ID", `'${runId}' is not a valid runId`);
     }
     const resolvedServer = this.sshManager.resolveServer(server);
     const paths = computeRunPaths(runId);
-    const homeDir = await resolveRemoteHomeDir(resolvedServer);
+    const homeDir = await resolveRemoteHomeDir(resolvedServer, reuseConnection);
     const absolutePaths = this.toAbsolutePaths(homeDir, paths);
-    const metaRaw = await readRemoteTextFile(resolvedServer, absolutePaths.metaPath);
+    const metaRaw = await readRemoteTextFile(resolvedServer, absolutePaths.metaPath, undefined, reuseConnection);
     if (metaRaw === null) {
       throw new RunServiceError("RUN_NOT_FOUND", `no run '${runId}' found on server '${resolvedServer}'`);
     }
@@ -783,13 +814,13 @@ export class RunService {
     return { meta: parsed.value, absolutePaths };
   }
 
-  public async getStatus(server: string | undefined, runId: string): Promise<RunStatusSummary> {
+  public async getStatus(server: string | undefined, runId: string, reuseConnection?: boolean): Promise<RunStatusSummary> {
     const resolvedServer = this.sshManager.resolveServer(server);
-    const { meta, absolutePaths } = await this.loadMetaOrThrow(resolvedServer, runId);
+    const { meta, absolutePaths } = await this.loadMetaOrThrow(resolvedServer, runId, reuseConnection);
     const [exitRaw, orphanedRaw, heartbeatRaw] = await Promise.all([
-      readRemoteTextFile(resolvedServer, absolutePaths.exitPath),
-      readRemoteTextFile(resolvedServer, absolutePaths.orphanedPath),
-      readRemoteTextFile(resolvedServer, absolutePaths.heartbeatPath),
+      readRemoteTextFile(resolvedServer, absolutePaths.exitPath, undefined, reuseConnection),
+      readRemoteTextFile(resolvedServer, absolutePaths.orphanedPath, undefined, reuseConnection),
+      readRemoteTextFile(resolvedServer, absolutePaths.heartbeatPath, undefined, reuseConnection),
     ]);
     return this.statusFromMeta(resolvedServer, meta, exitRaw, orphanedRaw, heartbeatRaw);
   }
@@ -800,13 +831,14 @@ export class RunService {
     stream: "stdout" | "stderr" = "stdout",
     offset = 0,
     maxOutputBytes: number = DEFAULT_LOG_MAX_BYTES,
+    reuseConnection?: boolean,
   ): Promise<LogChunk> {
     const resolvedServer = this.sshManager.resolveServer(server);
-    const { absolutePaths } = await this.loadMetaOrThrow(resolvedServer, runId);
+    const { absolutePaths } = await this.loadMetaOrThrow(resolvedServer, runId, reuseConnection);
     const logPath = stream === "stderr" ? absolutePaths.stderrPath : absolutePaths.stdoutPath;
     const cap = Math.max(0, Math.floor(maxOutputBytes));
     const overread = cap + 3;
-    const range = await readRemoteByteRange(resolvedServer, logPath, Math.max(0, Math.floor(offset)), overread);
+    const range = await readRemoteByteRange(resolvedServer, logPath, Math.max(0, Math.floor(offset)), overread, reuseConnection);
     if (range === null) {
       return { text: "", startOffset: offset, nextOffset: offset, fileSize: 0, hasMore: false };
     }
@@ -822,12 +854,12 @@ export class RunService {
 
   public async list(
     server: string | undefined,
-    opts: { profile?: string; state?: RunState; limit?: number } = {},
+    opts: { profile?: string; state?: RunState; limit?: number; reuseConnection?: boolean } = {},
   ): Promise<RunStatusSummary[]> {
     const resolvedServer = this.sshManager.resolveServer(server);
-    const homeDir = await resolveRemoteHomeDir(resolvedServer);
+    const homeDir = await resolveRemoteHomeDir(resolvedServer, opts.reuseConnection);
     const stateRootAbsolute = joinPosix(homeDir, computeStateRootPath());
-    const entries = await listRemoteDirectory(resolvedServer, stateRootAbsolute);
+    const entries = await listRemoteDirectory(resolvedServer, stateRootAbsolute, opts.reuseConnection);
     const runIds = entries
       .filter((entry) => entry.isDirectory && isValidRunId(entry.filename))
       .map((entry) => entry.filename)
@@ -840,7 +872,7 @@ export class RunService {
     const statuses: RunStatusSummary[] = [];
     for (const runId of candidates) {
       try {
-        statuses.push(await this.getStatus(resolvedServer, runId));
+        statuses.push(await this.getStatus(resolvedServer, runId, opts.reuseConnection));
       } catch {
         // A corrupt/partial run directory should not fail the whole list;
         // it's simply omitted (run-status on that specific runId will
@@ -854,13 +886,18 @@ export class RunService {
     );
   }
 
-  public async cancel(server: string | undefined, runId: string, graceMs: number = DEFAULT_CANCEL_GRACE_MS): Promise<CancelResult> {
+  public async cancel(
+    server: string | undefined,
+    runId: string,
+    graceMs: number = DEFAULT_CANCEL_GRACE_MS,
+    reuseConnection?: boolean,
+  ): Promise<CancelResult> {
     const resolvedServer = this.sshManager.resolveServer(server);
-    const { meta, absolutePaths } = await this.loadMetaOrThrow(resolvedServer, runId);
+    const { meta, absolutePaths } = await this.loadMetaOrThrow(resolvedServer, runId, reuseConnection);
 
     const [exitRaw, orphanedRaw] = await Promise.all([
-      readRemoteTextFile(resolvedServer, absolutePaths.exitPath),
-      readRemoteTextFile(resolvedServer, absolutePaths.orphanedPath),
+      readRemoteTextFile(resolvedServer, absolutePaths.exitPath, undefined, reuseConnection),
+      readRemoteTextFile(resolvedServer, absolutePaths.orphanedPath, undefined, reuseConnection),
     ]);
     if (exitRaw !== null) {
       return { runId, outcome: "already-exited" };
@@ -873,7 +910,7 @@ export class RunService {
     const probeOutput = await this.sshManager.executeCommand(
       buildRemoteScriptExecCommand(buildProbeScript(meta.identity.pid)),
       resolvedServer,
-      { timeout: CANCEL_EXEC_TIMEOUT_MS },
+      { timeout: CANCEL_EXEC_TIMEOUT_MS, reuseConnection },
     );
     const probe: ProcessProbe | null = parseProbeLine(probeOutput);
     if (probe === null) {
@@ -886,7 +923,7 @@ export class RunService {
       await this.sshManager.executeCommand(
         buildRemoteScriptExecCommand(buildWriteOrphanedMarkerScript(absolutePaths.orphanedPath, decision.reason, detectedAt)),
         resolvedServer,
-        { timeout: CANCEL_EXEC_TIMEOUT_MS },
+        { timeout: CANCEL_EXEC_TIMEOUT_MS, reuseConnection },
       );
       return { runId, outcome: "orphaned", reason: decision.reason };
     }
@@ -896,7 +933,7 @@ export class RunService {
         buildSignalScript({ paths: absolutePaths, pgid: meta.identity.pgid, pid: meta.identity.pid, graceMs }),
       ),
       resolvedServer,
-      { timeout: CANCEL_EXEC_TIMEOUT_MS + graceMs },
+      { timeout: CANCEL_EXEC_TIMEOUT_MS + graceMs, reuseConnection },
     );
     const outcome = parseCancelOutcome(signalOutput);
     if (outcome === null) {

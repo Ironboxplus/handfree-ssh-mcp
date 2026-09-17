@@ -44,8 +44,9 @@ export function registerWorkspaceRunTool(server: McpServer): void {
       collect: z.array(z.string()).optional().describe("Glob patterns (relative to remoteRoot) of artifacts to pull back after the run finishes. Defaults to the profile's collect.paths; an empty array explicitly disables collect for this call. Requesting collect makes this call wait (bounded by timeout) for the run to finish. Needs a local destination: the profile's collect.localDir, or collectLocalDir inline."),
       sync: z.enum(["none", "flush"]).optional().describe("Only 'none' (or omitted) is available. 'flush' returns SYNC_NOT_AVAILABLE (Phase 3)."),
       timeout: z.number().int().positive().optional().describe("Only meaningful when collect actually runs: milliseconds to wait for the run to reach a terminal state before giving up on collect (the run itself keeps running regardless). Defaults to the profile's timeout, or 600000ms (10 minutes)."),
+      reuseConnection: z.boolean().optional().describe("Whether to reuse the cached SSH connection for every remote call this launch makes (push upload, entrypoint stat/hash, the launch exec itself, and collect if requested). Default true. Set false after a timeout or suspected stale/bad cached connection to force fresh ones for this call."),
     },
-    async ({ profile, remoteRoot, venv, executable, pushPaths, collectLocalDir, entrypoint, args, env, server, push, collect, sync, timeout }) => {
+    async ({ profile, remoteRoot, venv, executable, pushPaths, collectLocalDir, entrypoint, args, env, server, push, collect, sync, timeout, reuseConnection }) => {
       try {
         const result = await runService.launch({
           profile,
@@ -62,6 +63,7 @@ export function registerWorkspaceRunTool(server: McpServer): void {
           collect,
           sync,
           timeout,
+          reuseConnection,
         });
         return toToolResult({
           ok: true,

@@ -393,5 +393,35 @@ describe("P2-05 black-box: workspace-run / run-status / run-logs / run-list / ru
       assert.equal(body.state, "completed");
       assert.equal(body.details.outcome, "already-exited");
     });
+
+    // Grey-box, real connection counting (same technique multi-connection
+    // download's fixture already uses): proves reuseConnection is wired all
+    // the way through to a real accepted TCP+SSH connection at the SFTP
+    // layer that run-status/run-logs/run-list/run-cancel all share
+    // (remote-sftp.ts's withSftp), not just plumbed through and ignored.
+    // This is the exact layer that had no escape hatch at all before this
+    // change -- a run-status call stuck behind a stale cached connection
+    // (as actually happened testing workspace-run for real on .88) had no
+    // parameter to force a fresh one, unlike every SFTP-using tool in the
+    // rest of this codebase.
+    test("reuseConnection:false opens a genuinely new SFTP connection; default reuses the cached one", async () => {
+      const runId = "run_20260915T120000Z_a0000001"; // seeded above, terminal (exit.json present)
+
+      // Warm the cache: an ordinary default-reuseConnection call first, so
+      // "default reuses" is measured against a connection that already
+      // exists, not against the suite's very first connect.
+      await mcpClient.callTool({ name: "run-status", arguments: { runId } });
+
+      server.resetConnectionCount();
+      await mcpClient.callTool({ name: "run-status", arguments: { runId } });
+      assert.equal(server.stats.connectionCount, 0, "default reuseConnection must not open a new TCP+SSH connection");
+
+      server.resetConnectionCount();
+      await mcpClient.callTool({ name: "run-status", arguments: { runId, reuseConnection: false } });
+      assert.ok(
+        server.stats.connectionCount >= 1,
+        `reuseConnection:false must open at least one real new TCP+SSH connection, got ${server.stats.connectionCount}`,
+      );
+    });
   });
 });

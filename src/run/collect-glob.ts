@@ -70,6 +70,7 @@ export async function findRemoteCollectFiles(
   serverName: string | undefined,
   remoteRootAbsolute: string,
   patterns: readonly string[],
+  reuseConnection?: boolean,
 ): Promise<CollectMatch[]> {
   if (patterns.length === 0) {
     throw new Error("findRemoteCollectFiles: patterns must not be empty (caller must skip collect instead)");
@@ -82,7 +83,7 @@ export async function findRemoteCollectFiles(
   while (queue.length > 0) {
     const relativeDir = queue.shift()!;
     const absoluteDir = relativeDir.length > 0 ? `${remoteRootAbsolute}/${relativeDir}` : remoteRootAbsolute;
-    const entries: RemoteDirEntry[] = await listRemoteDirectory(serverName, absoluteDir);
+    const entries: RemoteDirEntry[] = await listRemoteDirectory(serverName, absoluteDir, reuseConnection);
 
     for (const entry of entries) {
       visitedEntries += 1;
@@ -101,7 +102,7 @@ export async function findRemoteCollectFiles(
         continue;
       }
       const absolutePath = `${remoteRootAbsolute}/${relativePath}`;
-      const stat = await statRemoteFile(serverName, absolutePath);
+      const stat = await statRemoteFile(serverName, absolutePath, reuseConnection);
       if (stat === null || !stat.isFile) {
         continue; // vanished or changed type between readdir and stat
       }

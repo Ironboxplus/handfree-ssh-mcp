@@ -12,10 +12,11 @@ export function registerRunStatusTool(server: McpServer): void {
     {
       runId: z.string().min(1).describe("runId returned by workspace-run."),
       connectionName: z.string().optional().describe("Target server name from list-servers (the server the run was launched on). Required when multiple servers are enabled; optional when only one server is enabled."),
+      reuseConnection: z.boolean().optional().describe("Whether to reuse the cached SSH connection for this server. Default true. Set false after a timeout or suspected stale/bad cached connection to force a fresh one for this call."),
     },
-    async ({ runId, connectionName }) => {
+    async ({ runId, connectionName, reuseConnection }) => {
       try {
-        const status = await runService.getStatus(connectionName, runId);
+        const status = await runService.getStatus(connectionName, runId, reuseConnection);
         return toToolResult({
           ok: true,
           jobId: status.runId,

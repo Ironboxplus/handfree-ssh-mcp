@@ -261,7 +261,14 @@ export class SSHConnectionManager {
     return this.pool.connect(name, timeout);
   }
 
-  private async acquireSshClient(
+  /**
+   * Public so callers outside this class -- currently src/run/remote-sftp.ts
+   * -- can get the same reuseConnection=false one-shot-client escape hatch
+   * that executeCommand/upload/download/transfer already have (see
+   * SshConnectionPool.acquireSshClient), instead of the run-* tools being
+   * permanently stuck on a cached client with no way to force a fresh one.
+   */
+  public async acquireSshClient(
     key: string,
     options: SshAcquireOptions = {},
   ): Promise<AcquiredSshClient> {

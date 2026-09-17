@@ -15,12 +15,13 @@ export function registerRunLogsTool(server: McpServer): void {
       stream: z.enum(["stdout", "stderr"]).optional().describe("Default stdout."),
       offset: z.number().int().nonnegative().optional().describe("Byte offset to start reading from. Default 0 (from the start of the file). Use the previous response's nextOffset to continue."),
       maxOutputBytes: z.number().int().positive().optional().describe(`Maximum bytes to return in this call. Default ${DEFAULT_LOG_MAX_BYTES}.`),
+      reuseConnection: z.boolean().optional().describe("Whether to reuse the cached SSH connection for this server. Default true. Set false after a timeout or suspected stale/bad cached connection to force a fresh one for this call."),
     },
-    async ({ runId, connectionName, stream, offset, maxOutputBytes }) => {
+    async ({ runId, connectionName, stream, offset, maxOutputBytes, reuseConnection }) => {
       try {
         const [chunk, status] = await Promise.all([
-          runService.getLogs(connectionName, runId, stream, offset, maxOutputBytes),
-          runService.getStatus(connectionName, runId),
+          runService.getLogs(connectionName, runId, stream, offset, maxOutputBytes, reuseConnection),
+          runService.getStatus(connectionName, runId, reuseConnection),
         ]);
         return toToolResult({
           ok: true,

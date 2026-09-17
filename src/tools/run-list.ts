@@ -14,10 +14,11 @@ export function registerRunListTool(server: McpServer): void {
       profile: z.string().optional().describe("Only return runs launched under this runProfiles.<name>. Runs launched inline (no profile -- remoteRoot + venv/executable passed straight to workspace-run) are all recorded under the literal label \"(ad-hoc)\", so pass that to list them."),
       state: z.enum(["running", "completed", "failed", "cancelled", "recovering", "orphaned"]).optional().describe("Only return runs in this state."),
       limit: z.number().int().positive().max(MAX_RUN_LIST_LIMIT).optional().describe(`Default ${DEFAULT_RUN_LIST_LIMIT}, max ${MAX_RUN_LIST_LIMIT}.`),
+      reuseConnection: z.boolean().optional().describe("Whether to reuse the cached SSH connection for this server. Default true. Set false after a timeout or suspected stale/bad cached connection to force a fresh one for this call."),
     },
-    async ({ connectionName, profile, state, limit }) => {
+    async ({ connectionName, profile, state, limit, reuseConnection }) => {
       try {
-        const runs = await runService.list(connectionName, { profile, state, limit });
+        const runs = await runService.list(connectionName, { profile, state, limit, reuseConnection });
         return toToolResult({
           ok: true,
           jobId: "run-list",
