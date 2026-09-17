@@ -1,6 +1,6 @@
 export const SERVER_CONFIG = {
   name: "ssh-mcp-server",
-  version: "2.1.0",
+  version: "2.1.1",
 };
 
 export const SERVER_INSTRUCTIONS = `This server provides SSH access to servers loaded from OpenSSH config (~/.ssh/config by default) and optional YAML config/policy overlays.

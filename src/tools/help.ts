@@ -480,6 +480,9 @@ for the detailed error).
 Parameters:
   connectionName  (string, see below)  Target server.
   profile         (string, optional)   Only runs launched under this profile.
+                  Inline runs (no profile — remoteRoot + venv/executable
+                  passed straight to workspace-run) are all recorded under
+                  the literal label "(ad-hoc)"; pass that to list them.
   state           (string, optional)   running/completed/failed/cancelled/
                   recovering/orphaned.
   limit           (number, optional)   Default 50, max 200.
@@ -492,7 +495,8 @@ Returns: { ok, jobId: "run-list", state: "completed", message, details }
 where details.runs is an array of the same shape run-status returns.
 
 Example:
-  run-list { profile: "qwen-dev", state: "running" }`,
+  run-list { profile: "qwen-dev", state: "running" }
+  run-list { profile: "(ad-hoc)" }`,
 
   "run-cancel": `run-cancel — Cancel a workspace-run.
 
@@ -541,9 +545,13 @@ Parameters:
   runId           (string, required)   runId of the run to retry.
   connectionName  (string, see below)  Server the original run was launched
                   on.
-  push            (boolean, optional)  Default the snapshot's own default
-                  (profile defaultPush, or true — re-pushes). Pass false to
-                  reuse code already on remoteRoot.
+  push            (boolean, optional)  Default the snapshot's own default:
+                  true for a profile-backed run that declared push.paths,
+                  FALSE for a run launched inline without pushPaths (it
+                  never pushed, so its retry does not either). Pass true to
+                  force a re-push — only meaningful if the snapshot has push
+                  sources, else INVALID_CONFIGURATION — or false to reuse
+                  code already on remoteRoot.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -577,7 +585,7 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   upload            Upload a single file, or a batch of files, to a remote server.
   download          Download a single file from a remote server.
   transfer          Move files: single, recursive, batch upload, or cross-server relay.
-  workspace-run     Launch an entrypoint on a remote server under a runProfiles.<name> entry ([push] -> preflight -> launching -> remote-running -> [collect]).
+  workspace-run     Launch an entrypoint on a remote server -- no YAML config needed (remoteRoot + venv/executable inline, or a saved runProfiles.<name> preset). [push] -> preflight -> launching -> remote-running -> [collect].
   run-status        Query a workspace-run's current status by runId.
   run-logs          Read a byte-offset window of a run's stdout/stderr.
   run-list          List runs on a server, newest first.
@@ -602,6 +610,11 @@ Quick start:
  * clients actually receive.
  */
 export const TOOL_HELP_FOR_TEST: Readonly<Record<string, string>> = TOOL_HELP;
+/** The bare `help` (no tool argument) index — the first and often only
+ * description of a tool a client ever reads. Exported so doc-coverage can
+ * assert it, after it was missed: the per-tool help said workspace-run needs
+ * no YAML while this one-liner still said "under a runProfiles.<name> entry". */
+export const TOOL_OVERVIEW_FOR_TEST: string = TOOL_OVERVIEW;
 
 export function registerHelpTool(server: McpServer): void {
   server.tool(

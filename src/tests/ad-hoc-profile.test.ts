@@ -173,6 +173,23 @@ describe("buildAdHocProfile: workspace-run without any YAML config", () => {
     assert.equal(roundTripped.timeout, 1800000);
   });
 
+  test("run-retry of an inline run defaults push to false, exactly as its help now claims", () => {
+    // RunService.retry() passes the stored snapshot straight into
+    // resolvePushCollectPlan, which computes
+    // `params.push ?? profile.defaultPush ?? true`. For a profile-backed run
+    // that lands on true; for an inline run with no pushPaths it must land on
+    // false, because that run never pushed in the first place. run-retry's
+    // help said "profile defaultPush, or true" until this was checked.
+    const inlineSnapshot = JSON.parse(JSON.stringify(buildAdHocProfile({ remoteRoot: "/data/proj", venv: "/env" })));
+    const retryPush: boolean | undefined = undefined;
+    assert.equal(retryPush ?? inlineSnapshot.defaultPush ?? true, false);
+
+    const inlineWithPush = JSON.parse(
+      JSON.stringify(buildAdHocProfile({ remoteRoot: "/data/proj", venv: "/env", pushPaths: ["./src"] })),
+    );
+    assert.equal(retryPush ?? inlineWithPush.defaultPush ?? true, true);
+  });
+
   test("the ad-hoc label is a display label that can never collide with a real profile name", () => {
     // meta.profile is a free-form string; run-retry never feeds it back into
     // the registry. The parentheses keep it out of the namespace anyway,

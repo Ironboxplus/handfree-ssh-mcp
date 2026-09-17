@@ -1,6 +1,6 @@
 {
   "name": "@aaarc/handfree-ssh-mcp",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Handfree SSH MCP Server - A hands-free SSH automation tool via MCP protocol",
   "main": "build/index.js",
   "type": "module",

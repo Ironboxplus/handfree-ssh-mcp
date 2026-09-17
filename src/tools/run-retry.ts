@@ -20,7 +20,7 @@ export function registerRunRetryTool(server: McpServer): void {
     {
       runId: z.string().min(1).describe("runId of the run to retry (returned by an earlier workspace-run or run-retry call)."),
       connectionName: z.string().optional().describe("Target server name from list-servers (the server the original run was launched on). Required when multiple servers are enabled; optional when only one server is enabled."),
-      push: z.boolean().optional().describe("Defaults to the snapshot's own default (profile defaultPush, or true). Pass false to skip re-pushing and reuse whatever code is already on remoteRoot."),
+      push: z.boolean().optional().describe("Defaults to the snapshot's own default: true for a profile-backed run that declared push.paths, but FALSE for a run launched inline without pushPaths (an inline run never pushed in the first place, so its retry does not either). Pass true to force a re-push -- only meaningful if the snapshot actually has push sources, otherwise it returns INVALID_CONFIGURATION -- or false to reuse whatever code is already on remoteRoot."),
     },
     async ({ runId, connectionName, push }) => {
       try {

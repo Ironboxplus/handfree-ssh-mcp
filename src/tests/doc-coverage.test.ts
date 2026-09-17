@@ -6,7 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerDownloadTool } from "../tools/download.js";
 import { registerTransferTool } from "../tools/transfer.js";
 import { registerUploadTool } from "../tools/upload.js";
-import { registerHelpTool, TOOL_HELP_FOR_TEST } from "../tools/help.js";
+import { registerHelpTool, TOOL_HELP_FOR_TEST, TOOL_OVERVIEW_FOR_TEST } from "../tools/help.js";
 import { registerWorkspaceRunTool } from "../tools/workspace-run.js";
 import { SERVER_INSTRUCTIONS } from "../config/server.js";
 
@@ -102,6 +102,28 @@ describe("documentation coverage: every tool parameter appears in that tool's he
           `discover that workspace-run runs without a configured profile`,
       );
     }
+  });
+
+  test("the no-config path reaches the sibling run tools' prose, not just workspace-run's own", () => {
+    // Updating workspace-run's description and leaving its neighbours alone
+    // is the actual mistake this guards: the bare `help` index still read
+    // "under a runProfiles.<name> entry", run-list never said inline runs are
+    // labelled "(ad-hoc)", and run-retry's push default was stated as
+    // "profile defaultPush, or true" -- wrong for an inline run, which
+    // defaults to false. A parameter-name check cannot catch prose that is
+    // present but says the wrong thing, so these are asserted by content.
+    assert.doesNotMatch(
+      TOOL_OVERVIEW_FOR_TEST,
+      /workspace-run\s+Launch an entrypoint on a remote server under a runProfiles/,
+      "the bare `help` index must not describe workspace-run as requiring a configured profile",
+    );
+    assert.match(TOOL_OVERVIEW_FOR_TEST, /workspace-run[\s\S]*?no YAML config needed/);
+    assert.match(TOOL_HELP_FOR_TEST["run-list"], /\(ad-hoc\)/, "run-list must say how to list inline runs");
+    assert.match(
+      TOOL_HELP_FOR_TEST["run-retry"],
+      /FALSE for a run launched inline/,
+      "run-retry must state the inline push default, which differs from the profile-backed one",
+    );
   });
 
   test("the parameters that change how bytes move are also surfaced in SERVER_INSTRUCTIONS", () => {
