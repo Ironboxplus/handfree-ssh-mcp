@@ -176,6 +176,17 @@ Parameters:
                   single-file download throughput. Not multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
+  connections     (number, optional)   Default 1 (unchanged behavior). Above 1,
+                  split the file into that many non-overlapping byte ranges and
+                  pull each over its OWN independent SSH/TCP connection, then
+                  reassemble, verify and atomically rename. Maximum 8.
+                  Helps on high-latency links, where one connection is capped by
+                  the SSH channel's flow-control window; pointless on a fast LAN.
+                  Each connection is a separate SSH handshake, so the remote
+                  limit that matters is sshd's MaxStartups, not MaxSessions.
+                  Measured on a 50 ms / 1 Gbps link: 4 was best, and 8 was
+                  SLOWER than a single connection. Measure your own link before
+                  raising it.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -184,7 +195,8 @@ connectionName rule:
 Example:
   download { remotePath: "/var/log/app.log", localPath: "app.log" }
   download { remotePath: "/tmp/big.bin", localPath: "big.bin", fast: true,
-             sftpConcurrency: 32, chunkSize: 131072 }`,
+             sftpConcurrency: 32, chunkSize: 131072 }
+  download { remotePath: "/tmp/huge.bin", localPath: "huge.bin", connections: 4 }`,
 
   "transfer": `transfer — Move files between hosts (single/recursive/cross-server).
 
@@ -211,6 +223,15 @@ Parameters for upload / download:
   connectionName  (string, see below)  Target server name.
   recursive       (boolean, optional)  True to transfer a whole directory tree.
                   Not combinable with an array localPath.
+  skipIfIdentical (boolean, optional)  Default true. Skip the transfer when the
+                  destination already matches the source. Upload: byte-compare
+                  for files <= 256 MiB, MD5 otherwise; shell scripts
+                  (.sh/.bash/.zsh) ignore CRLF<->LF differences. Relay: size +
+                  md5sum on both servers when available, falling back to
+                  transferring. Download is never skipped. Set false to force.
+  archiveCompression (string, optional) Only with archive=true. One of "none"
+                  (default), "gzip", "bzip2", "xz", "zstd". The remote must
+                  have the matching tool available for the chosen codec.
   reuseConnection (boolean, optional)  Default true. Set false after timeout.
   timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
@@ -219,6 +240,15 @@ Parameters for upload / download:
                   recursion stays sequential; no multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
+  connections     (number, optional)   mode="download", single file only.
+                  Default 1 (unchanged). Above 1, split the file into that many
+                  non-overlapping byte ranges pulled over that many INDEPENDENT
+                  SSH/TCP connections, reassembled, verified, atomically
+                  renamed. Maximum 8. Helps on high-latency links; pointless on
+                  a fast LAN. Separate handshakes, so sshd's MaxStartups is the
+                  limit that matters, not MaxSessions. Measured on 50 ms /
+                  1 Gbps: 4 best, 8 SLOWER than one connection. Rejected for
+                  upload, recursive=true and archive=true.
   fileConcurrency (number, optional)   Recursive or batch upload only: independent
                   files transferred in parallel. Default 4, maximum 8. Each
                   parallel file opens its own SFTP channel on the same SSH
@@ -282,7 +312,7 @@ Examples:
   transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/data/dump.tar",
              destServer: "backup", destRemotePath: "/backup/dump.tar", strategy: "auto" }`,
 
-  "workspace-run": `workspace-run — Launch an entrypoint on a remote server under a configured runProfiles.<name> entry, durably.
+  "workspace-run": `workspace-run — Launch an entrypoint on a remote server, durably. No YAML config required.
 
 The launched process survives SSH disconnect and MCP adapter restart: all
 state (meta.json/stdout.log/stderr.log/pid/heartbeat/exit.json) lives under
@@ -290,18 +320,28 @@ state (meta.json/stdout.log/stderr.log/pid/heartbeat/exit.json) lives under
 local cache of run state — status/logs/cancel require the remote server to
 be reachable.
 
-Full pipeline this round (PLAN.MD Phase 2): [push] → preflight → launching →
+Two ways to describe a run; a saved profile is a preset, NOT a prerequisite:
+  • Inline (zero config, works with servers from ~/.ssh/config):
+      remoteRoot + one of venv / executable
+  • Saved: profile: "<name>" — a runProfiles.<name> entry in YAML. Worth
+    configuring when you launch the same job repeatedly, or when you want to
+    NARROW what may run (allowedEntrypoints) or which env keys may be
+    overridden. Inline runs allow any safe relative entrypoint under
+    remoteRoot ('..', absolute paths and drive letters are still rejected).
+
+Full pipeline (PLAN.MD Phase 2): [push] → preflight → launching →
 remote-running → [collect].
-  • push (default true, or the profile's defaultPush) uploads
-    runProfiles.<name>.push.paths to remoteRoot before launch — batch upload
+  • push uploads the push sources to remoteRoot before launch — batch upload
     for individual files, recursive upload for directories, both
-    skip-if-identical. Requires push.paths to be configured on the profile
-    (otherwise INVALID_CONFIGURATION). Pass push:false to skip it and use
-    code already present under remoteRoot.
+    skip-if-identical. Sources are runProfiles.<name>.push.paths for a saved
+    profile, or pushPaths inline. It defaults to true for a profile that
+    declares push.paths (or its defaultPush) and to false for an inline run
+    with no pushPaths, since remoteRoot is assumed to already hold the code.
+    Pass push:false to skip it explicitly.
   • collect (default the profile's collect.paths) pulls artifacts back by
     explicit glob (relative to remoteRoot) after the run finishes, into
-    runProfiles.<name>.collect.localDir — never defaults to pulling the
-    whole remoteRoot. Requesting collect (non-empty, by default or
+    collect.localDir (saved) or collectLocalDir (inline) — never defaults to
+    pulling the whole remoteRoot. Requesting collect (non-empty, by default or
     explicitly) makes this call BLOCK, bounded by timeout, until the run
     reaches a terminal state, then collects; a plain launch (no collect)
     still returns immediately once the process is confirmed started, exactly
@@ -314,24 +354,41 @@ remote-running → [collect].
     it is reported separately in details.collect.
   • sync only accepts "none"/omitted; "flush" returns SYNC_NOT_AVAILABLE
     (Phase 3).
-  • Only environment.type venv/executable profiles are supported;
-    conda/module/slurm and gpu.required/secretEnv profiles return a
-    *_NOT_AVAILABLE error.
+  • Only environment.type venv/executable is supported (inline venv/
+    executable always is); a saved profile using conda/module/slurm or
+    gpu.required/secretEnv returns a *_NOT_AVAILABLE error.
 
 Parameters:
-  profile         (string, required)   runProfiles.<name> from YAML config.
-  entrypoint      (string, required)   Path relative to the profile's
-                  remoteRoot. Must match one of the profile's
-                  allowedEntrypoints glob patterns.
+  profile         (string, optional)   Saved runProfiles.<name> from YAML.
+                  Omit it and use remoteRoot + venv/executable instead.
+  remoteRoot      (string, inline)     Absolute remote directory holding the
+                  entrypoint. Also the process's working directory and the
+                  root entrypoint/collect globs resolve against.
+  venv            (string, inline)     Absolute path to a remote virtualenv.
+                  Runs <venv>/bin/python directly — no "source activate".
+  executable      (string, inline)     Interpreter/program, e.g. "bash",
+                  "python3", "/usr/bin/node". With venv, names the binary
+                  inside <venv>/bin instead. One of venv/executable required
+                  when running inline.
+  pushPaths       (string[], inline)   Local files/dirs to upload into
+                  remoteRoot before launch. Supplying it turns push on.
+  collectLocalDir (string, inline)     Local directory collected artifacts
+                  are written into. Needed if collect is non-empty.
+  entrypoint      (string, required)   Path relative to remoteRoot. Always a
+                  plain relative path (no "..", not absolute); with a saved
+                  profile it must also match its allowedEntrypoints globs.
   args            (string[], optional) Positional arguments. Each is quoted
                   individually on the remote shell — never interpreted,
                   safe for arbitrary strings.
-  env             (object, optional)   Overrides. Every key must already be
-                  declared in the profile's own env map (allowlist);
-                  otherwise ENV_KEY_NOT_ALLOWED.
-  server          (string, optional)   Defaults to the profile's configured
-                  server.
-  push            (boolean, optional)  Default true (or profile defaultPush).
+  env             (object, optional)   Environment for the process. With a
+                  saved profile every key must already be declared in that
+                  profile's env map (allowlist), else ENV_KEY_NOT_ALLOWED;
+                  inline, any key is accepted.
+  server          (string, optional)   With a profile, defaults to the
+                  profile's configured server. Inline, the server to run on
+                  — omittable only when exactly one server is enabled.
+  push            (boolean, optional)  Default true for a profile with
+                  push.paths, false for an inline run without pushPaths.
                   See above.
   collect         (string[], optional) Default the profile's collect.paths.
                   See above.
@@ -345,7 +402,18 @@ Returns: { ok, jobId, state, message, next, details } — jobId equals the
 returned runId. details.status is the same shape run-status returns.
 details.collect (when collect ran) is { status, reason?, files, totalBytes }.
 
-Example:
+Example (inline — nothing configured anywhere):
+  workspace-run { server: "gpu-box", remoteRoot: "/data/proj",
+                  venv: "/data/envs/proj", entrypoint: "train.py",
+                  args: ["--epochs", "3"] }
+  workspace-run { server: "gpu-box", remoteRoot: "/data/proj",
+                  executable: "bash", entrypoint: "scripts/eval.sh" }
+  workspace-run { server: "gpu-box", remoteRoot: "/data/proj",
+                  venv: "/data/envs/proj", entrypoint: "train.py",
+                  pushPaths: ["./src"], collect: ["outputs/*.json"],
+                  collectLocalDir: "./artifacts", timeout: 1800000 }
+
+Example (saved profile):
   workspace-run { profile: "qwen-dev", entrypoint: "train.py",
                   args: ["--epochs", "3"] }
   workspace-run { profile: "qwen-dev", entrypoint: "train.py", push: false }
@@ -527,6 +595,14 @@ Quick start:
 /**
  * Register help tool
  */
+/**
+ * The same help table this tool serves, exposed for the documentation
+ * coverage guard in src/tests/doc-coverage.test.ts. Read-only by convention;
+ * exported rather than duplicated so the test can never drift from what
+ * clients actually receive.
+ */
+export const TOOL_HELP_FOR_TEST: Readonly<Record<string, string>> = TOOL_HELP;
+
 export function registerHelpTool(server: McpServer): void {
   server.tool(
     "help",

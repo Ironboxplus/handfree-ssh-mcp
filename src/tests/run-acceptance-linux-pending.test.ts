@@ -327,6 +327,54 @@ describe("P2-03-A1 / P2-04-A1 / P2-04-A2: real Linux acceptance (SKIPPED unless 
   );
 
   test(
+    "inline acceptance: a real run launches, completes and reports its exit code with NO runProfiles entry anywhere",
+    { skip: skipReason },
+    async () => {
+      // The feature shipped requiring runProfiles.<name>, which made it dead
+      // on arrival for any install whose servers come from ~/.ssh/config --
+      // there is no runProfiles: section in those YAML files, so every call
+      // returned RUN_PROFILE_NOT_FOUND. This is that path end-to-end on a
+      // real Linux host: real setsid fork, real heartbeat, real exit.json.
+      await uploadScript(
+        "p2_inline.py",
+        ["import os, sys", "print('inline ok', flush=True)", "print(os.getcwd(), flush=True)", "sys.exit(7)", ""].join("\n"),
+      );
+
+      // Proves the registry is not consulted: no entry with this name exists,
+      // and none is passed.
+      assert.equal(registry.get("(ad-hoc)"), undefined);
+
+      const launch = await runService.launch({
+        server: SERVER,
+        remoteRoot,
+        executable: python,
+        entrypoint: "p2_inline.py",
+      });
+      createdRunIds.push(launch.runId);
+      assert.equal(launch.status.state, "running");
+      // push must have defaulted OFF for an inline run -- the code is already
+      // under remoteRoot, and there are no pushPaths to upload.
+      assert.equal(launch.phases.find((phase) => phase.phase === "push")?.status, "skipped");
+
+      let status = await runService.getStatus(SERVER, launch.runId);
+      const deadline = Date.now() + 30_000;
+      while (status.state === "running" && Date.now() < deadline) {
+        await sleep(500);
+        status = await runService.getStatus(SERVER, launch.runId);
+      }
+      assert.equal(status.state, "failed", "exit 7 is a real non-zero exit, reported as failed");
+      assert.equal(status.exitCode, 7, "the real remote exit code must survive the wrapper");
+      assert.equal(status.profile, "(ad-hoc)");
+
+      const logs = await runService.getLogs(SERVER, launch.runId, "stdout", 0, 65536);
+      assert.match(logs.text, /inline ok/);
+      // remoteRoot is the process's real working directory, not just a path
+      // prefix used to build the entrypoint.
+      assert.match(logs.text, new RegExp(remoteRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    },
+  );
+
+  test(
     "P2-04-A1: cancel kills the whole process group (child + its own grandchild) and leaves an unrelated process untouched",
     { skip: skipReason },
     async () => {

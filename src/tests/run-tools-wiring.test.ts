@@ -217,6 +217,122 @@ describe("P2-05 black-box: workspace-run / run-status / run-logs / run-list / ru
     });
   });
 
+  // Plug-and-play: workspace-run shipped requiring a runProfiles.<name>
+  // entry, which made it unreachable on any install whose servers come from
+  // ~/.ssh/config -- those YAML files have no runProfiles: section at all, so
+  // every call returned RUN_PROFILE_NOT_FOUND. These are black-box through
+  // the same real MCP transport: nothing here is registered in the profile
+  // registry, and the calls must still get all the way through preflight.
+  describe("workspace-run inline: no runProfiles entry needed", () => {
+    // Chosen as the deterministic end-of-preflight marker: runPush stats its
+    // local sources BEFORE any remote I/O, so a source that cannot exist
+    // fails here and nowhere earlier. Reaching it proves the inline profile
+    // was built and the server, executable, entrypoint, env and push plan all
+    // resolved -- with zero YAML.
+    const unpushableLocalSource = path.join(suiteRoot, "does-not-exist-anywhere");
+
+    test("remoteRoot + venv + pushPaths reaches the push phase -- no profile lookup happens at all", async () => {
+      const result = await mcpClient.callTool({
+        name: "workspace-run",
+        arguments: {
+          server: "remote",
+          remoteRoot: "/data/proj",
+          venv: "/data/venv",
+          entrypoint: "train.py",
+          pushPaths: [unpushableLocalSource],
+        },
+      });
+      const body = responseJson(result);
+      assert.equal(body.ok, false);
+      assert.equal(body.error.code, "RUN_PUSH_FAILED");
+      assert.match(body.error.message, /does-not-exist-anywhere/);
+    });
+
+    test("remoteRoot + executable (non-Python entrypoint) reaches the push phase too", async () => {
+      const result = await mcpClient.callTool({
+        name: "workspace-run",
+        arguments: {
+          server: "remote",
+          remoteRoot: "/data/proj",
+          executable: "bash",
+          entrypoint: "scripts/eval.sh",
+          pushPaths: [unpushableLocalSource],
+        },
+      });
+      const body = responseJson(result);
+      assert.equal(body.error.code, "RUN_PUSH_FAILED");
+    });
+
+    test("arbitrary env keys are accepted inline (the call's own env IS the allowlist)", async () => {
+      const result = await mcpClient.callTool({
+        name: "workspace-run",
+        arguments: {
+          server: "remote",
+          remoteRoot: "/data/proj",
+          venv: "/data/venv",
+          entrypoint: "train.py",
+          env: { NOT_DECLARED_ANYWHERE: "x" },
+          pushPaths: [unpushableLocalSource],
+        },
+      });
+      const body = responseJson(result);
+      // The same env key returns ENV_KEY_NOT_ALLOWED for a profile-backed run
+      // (see the 'good-venv' case above); inline there is no administrator to
+      // have declared an allowlist, so it must pass through to push instead.
+      assert.equal(body.error.code, "RUN_PUSH_FAILED");
+    });
+
+    test("entrypoint traversal is still rejected inline", async () => {
+      // Inline sets allowedEntrypoints: ["**"], which compiles to `.*`. This
+      // is the assertion that inline mode did not become "run any file on the
+      // remote host": the safe-relative-path check still runs first.
+      for (const entrypoint of ["../../etc/passwd", "/etc/passwd"]) {
+        const result = await mcpClient.callTool({
+          name: "workspace-run",
+          arguments: { server: "remote", remoteRoot: "/data/proj", venv: "/data/venv", entrypoint },
+        });
+        assert.equal(responseJson(result).error.code, "ENTRYPOINT_NOT_ALLOWED", `expected '${entrypoint}' to be rejected`);
+      }
+    });
+
+    test("neither profile nor remoteRoot -> INVALID_CONFIGURATION naming both ways to fix it", async () => {
+      const result = await mcpClient.callTool({ name: "workspace-run", arguments: { entrypoint: "train.py" } });
+      const body = responseJson(result);
+      assert.equal(body.error.code, "INVALID_CONFIGURATION");
+      assert.match(body.error.message, /profile/);
+      assert.match(body.error.message, /remoteRoot/);
+    });
+
+    test("remoteRoot but no interpreter -> INVALID_CONFIGURATION naming venv and executable", async () => {
+      const result = await mcpClient.callTool({
+        name: "workspace-run",
+        arguments: { server: "remote", remoteRoot: "/data/proj", entrypoint: "train.py" },
+      });
+      const body = responseJson(result);
+      assert.equal(body.error.code, "INVALID_CONFIGURATION");
+      assert.match(body.error.message, /venv/);
+      assert.match(body.error.message, /executable/);
+    });
+
+    test("an inline run with no pushPaths does NOT demand push sources", async () => {
+      // A profile-backed run defaults push to true, so omitting push.paths is
+      // a config error (asserted above). Inline it must default to false --
+      // remoteRoot is where the code already lives -- so this call has to get
+      // PAST the push gate. It then proceeds into real remote I/O, whose
+      // outcome on this fixture is not the point; the point is which error it
+      // is NOT.
+      const result = await mcpClient.callTool({
+        name: "workspace-run",
+        arguments: { server: "remote", remoteRoot: "/data/proj", venv: "/data/venv", entrypoint: "train.py" },
+      });
+      const body = responseJson(result);
+      if (body.ok === false) {
+        assert.notEqual(body.error.code, "INVALID_CONFIGURATION");
+        assert.notEqual(body.error.code, "RUN_PROFILE_NOT_FOUND");
+      }
+    });
+  });
+
   describe("run-status / run-logs / run-list / run-cancel: real SFTP reads through the tool layer", () => {
     test("run-status on a seeded completed run", async () => {
       const runId = "run_20260915T120000Z_a0000001";

@@ -24,10 +24,10 @@ handfree-ssh-mcp 使 AI 助手能够通过标准化的 MCP 接口执行远程 SS
 | execute-command | 在远程服务器执行 SSH 命令并获取结果 |
 | execute-command-stream | 执行命令并获取实时流式输出 |
 | upload | 上传本地文件到远程服务器；`localPath` 也可传数组以批量上传多个文件到同一个远程目录（见下方"批量上传"） |
-| download | 从远程服务器下载文件 |
+| download | 从远程服务器下载文件；支持 `connections` 多连接分段下载（见下方「多连接下载」） |
 | transfer | 上传、下载或在两台远端服务器之间 relay；支持碎文件并发、批量上传（`localPath` 数组）、临时 tar 打包、可选压缩、分块预取，以及 relay 的 `strategy: "relay" \| "direct" \| "auto"`（源到目标直传，绕过本机） |
 | list-servers | 列出所有可用的 SSH 服务器配置 |
-| workspace-run | 在配置好的 `runProfiles.<name>` 下，于远端服务器启动一个入口程序：`[push] → preflight → launching → remote-running → [collect]`。持久运行：所有状态都写在远端文件系统（不落本机），可扛住 SSH 断线与 MCP adapter 重启。详见下方"workspace-run（远程运行）" |
+| workspace-run | 在远端服务器启动一个入口程序，**无需任何 YAML 配置**（直接传 `remoteRoot` + `venv`/`executable`，也可用 `runProfiles.<name>` 预设）：`[push] → preflight → launching → remote-running → [collect]`。持久运行：所有状态都写在远端文件系统（不落本机），可扛住 SSH 断线与 MCP adapter 重启。详见下方"workspace-run（远程运行）" |
 | run-status | 按 `runId` 查询 `workspace-run` 运行状态（每次都经 SFTP 读远端状态目录，无本机缓存） |
 | run-logs | 按字节偏移读取运行的 stdout/stderr，跨多次调用正确处理被截断在窗口边界上的多字节 UTF-8 字符 |
 | run-list | 列出某服务器上的运行记录，按时间倒序 |
@@ -169,9 +169,41 @@ servers:
 - 数组入参返回结构化 JSON（`{ results, total, uploadedCount, skippedCount, failedCount, crlfFixedCount }`），而不是单文件时的纯文本结果。
 - 本轮 `archive: true` 不支持与数组 `localPath` 同时使用；`download`/`relay` 暂不支持数组形式的 `localPath`。
 
+### 🔀 多连接下载（`connections`）
+
+`download` 与 `transfer mode=download` 支持 `connections`（默认 `1`，上限 `8`）。为 `1` 时行为与之前完全一致。大于 `1` 时，文件被切分为相应数量的不重叠字节区间，**每个区间走一条独立的 SSH/TCP 连接**拉取，通过定位写直接写入本地预分配的 temp 文件，校验大小后原子 rename 到目标路径。任一连接失败都会取消其余连接、删除 temp 文件，且从不触碰最终目标路径。
+
+关键在于是独立的**连接**，而不是更多的 SFTP channel：同一条 SSH 连接上的所有 channel 共享该连接的流控窗口（ssh2 把它写死为 2 MiB），所以多开 channel 换不来任何东西；多一条连接才多一个窗口。
+
+该选项在**高延迟**链路上有效——单连接的吞吐大致被 窗口/RTT 限制；在低延迟局域网上没有意义。每条连接都是一次独立的 SSH 握手，因此对端的相关限制是 sshd 的 `MaxStartups` 而非 `MaxSessions`。
+
+在真实 `tc netem` 环境下实测（50 ms / 1 Gbps，128 MiB 文件，3 次取 median，每次校验 SHA-256）：
+
+| 设置 | 吞吐 |
+|---|---|
+| 默认单连接 | 17.88 MiB/s |
+| `connections: 2` | 25.18 MiB/s |
+| `connections: 4` | 26.50 MiB/s |
+| `connections: 8` | 17.81 MiB/s —— **比单连接还慢** |
+
+以上数字只对那一条被整形的链路成立，实际收益取决于你自己链路的 RTT 与带宽。那里 `4` 最优而 `8` 反而更差，所以调高之前请先实测。`connections` 仅适用于单文件下载，对 upload、`recursive: true`、`archive: true` 均会被拒绝。
+
 ### 🏃 workspace-run（远程运行）
 
-在 YAML 中声明 `runProfiles.<name>`（`server`、`remoteRoot`、`environment.type: venv|executable`、`allowedEntrypoints`、`env` 白名单等）后即可用 `workspace-run` 启动。远端 wrapper 用 `setsid` 使目标进程脱离本次 SSH 会话、拥有独立进程组，并把 `meta.json`/`stdout.log`/`stderr.log`/`pid`/`heartbeat`/`exit.json` 原子写入 `~/.handfree-runs/<runId>/`——**没有本机 JobStore、没有常驻 daemon**，MCP adapter 重启不会丢任何东西，因为它本来就没持有任何权威状态；代价是查询状态/日志/取消都需要能连上远端，没有离线缓存视图。
+**不需要任何 YAML 配置**：直接在调用里传 `remoteRoot` 加 `venv`（或 `executable`）即可，对任何已启用的服务器都能用——包括从 `~/.ssh/config` 读来的那些：
+
+```json
+{ "tool": "workspace-run", "params": {
+  "server": "gpu-box", "remoteRoot": "/data/proj", "venv": "/data/envs/proj",
+  "entrypoint": "train.py", "args": ["--epochs", "3"]
+} }
+```
+
+内联方式下：`entrypoint` 可以是 `remoteRoot` 下任意安全相对路径（`..`、绝对路径、盘符路径仍一律拒绝），`env` 的 key 不受白名单限制，`push` 默认为 **false**（认为代码已经在 `remoteRoot` 上；要上传就传 `pushPaths`），collect 的本地落地目录用 `collectLocalDir` 指定。
+
+YAML 里的 `runProfiles.<name>`（`server`、`remoteRoot`、`environment.type: venv|executable`、`allowedEntrypoints`、`env` 白名单等）是同一批字段的**可选预设**——重复跑同一个任务时更方便，也是唯一能把可运行范围**收紧**（`allowedEntrypoints`、`env` 白名单）的方式，但它不是前置条件。
+
+远端 wrapper 用 `setsid` 使目标进程脱离本次 SSH 会话、拥有独立进程组，并把 `meta.json`/`stdout.log`/`stderr.log`/`pid`/`heartbeat`/`exit.json` 原子写入 `~/.handfree-runs/<runId>/`——**没有本机 JobStore、没有常驻 daemon**，MCP adapter 重启不会丢任何东西，因为它本来就没持有任何权威状态；代价是查询状态/日志/取消都需要能连上远端，没有离线缓存视图。
 
 完整流水线为 `[push] → preflight → launching → remote-running → [collect]`：
 
@@ -182,8 +214,8 @@ servers:
 { "tool": "run-retry", "params": { "runId": "run_20260915T120000Z_ab12cd34" } }
 ```
 
-- **`push`**（默认 `true`，或 profile 的 `defaultPush`）：启动前把 `runProfiles.<name>.push.paths` 声明的本地文件/目录上传到 `remoteRoot`，复用与 `upload`/`transfer` 相同的批量/递归上传逻辑，默认 skip-if-identical——未变化的文件不会重传。必须配置 `push.paths`，否则在触网前即返回 `INVALID_CONFIGURATION`；传 `push: false` 可跳过并使用 `remoteRoot` 上已有的代码。push 失败绝不会进入 launching 阶段，错误信息会指明失败的文件/目录与所处阶段。push 完成（或跳过）后会对远端 entrypoint 做 stat + 内容哈希，连同一份已推送文件清单的摘要一起记为该次运行的 `revision`，事后可据此判断跑的到底是哪一版代码。
-- **`collect`**（默认取 profile 的 `collect.paths`）：运行结束后按显式 glob（相对 `remoteRoot`）把产物拉回本地的 `runProfiles.<name>.collect.localDir`——**绝不会**默认拉取整个 `remoteRoot`。只要 `collect.paths`/调用参数非空，就必须配置 `collect.localDir`。只要实际请求了 collect（无论来自 profile 默认值还是显式参数），`workspace-run` 调用就会**阻塞**（受 `timeout` 限制，默认取 profile 的 `timeout` 或 10 分钟）直到运行进入终态后再执行 collect；不请求 collect 的普通启动行为不变，进程确认起来后立即返回。有总字节上限和文件数上限（`collect.maxBytes`/`collect.maxFiles`），超限会让 collect 阶段失败并报告已经拉取的清单——绝不静默截断。即便运行失败或被取消，collect 默认仍会执行（日志与部分产物往往正是诊断材料）；collect 失败绝不会改写运行本身的 exit code，会在 `details.collect` 中单独呈现。传 `collect: []` 可对某次调用禁用 collect。glob 匹配会拒绝 `..`、绝对路径，且从不穿过符号链接。
+- **`push`**：启动前把声明的本地文件/目录上传到 `remoteRoot`（profile 用 `push.paths`，内联用 `pushPaths`），复用与 `upload`/`transfer` 相同的批量/递归上传逻辑，默认 skip-if-identical——未变化的文件不会重传。声明了 `push.paths` 的 profile 默认为 `true`（或看其 `defaultPush`），未传 `pushPaths` 的内联运行默认为 `false`。打开 push 却没有任何来源，会在触网前返回 `INVALID_CONFIGURATION`；传 `push: false` 可跳过并使用 `remoteRoot` 上已有的代码。push 失败绝不会进入 launching 阶段，错误信息会指明失败的文件/目录与所处阶段。push 完成（或跳过）后会对远端 entrypoint 做 stat + 内容哈希，连同一份已推送文件清单的摘要一起记为该次运行的 `revision`，事后可据此判断跑的到底是哪一版代码。
+- **`collect`**（默认取 profile 的 `collect.paths`）：运行结束后按显式 glob（相对 `remoteRoot`）把产物拉回本地的 `runProfiles.<name>.collect.localDir`（内联则是 `collectLocalDir`）——**绝不会**默认拉取整个 `remoteRoot`。只要 `collect.paths`/调用参数非空，就必须给出本地落地目录。只要实际请求了 collect（无论来自 profile 默认值还是显式参数），`workspace-run` 调用就会**阻塞**（受 `timeout` 限制，默认取 profile 的 `timeout` 或 10 分钟）直到运行进入终态后再执行 collect；不请求 collect 的普通启动行为不变，进程确认起来后立即返回。有总字节上限和文件数上限（`collect.maxBytes`/`collect.maxFiles`），超限会让 collect 阶段失败并报告已经拉取的清单——绝不静默截断。即便运行失败或被取消，collect 默认仍会执行（日志与部分产物往往正是诊断材料）；collect 失败绝不会改写运行本身的 exit code，会在 `details.collect` 中单独呈现。传 `collect: []` 可对某次调用禁用 collect。glob 匹配会拒绝 `..`、绝对路径，且从不穿过符号链接。
 - `sync: "flush"`（Phase 3 的常驻同步屏障，本轮未实现）：只支持 `"none"`/省略；`"flush"` 返回 `SYNC_NOT_AVAILABLE`。
 - `environment.type: conda | module | slurm`、`gpu.required`、`secretEnv`：配置可以解析成功，但启动时会分别返回 `ENVIRONMENT_ADAPTER_NOT_AVAILABLE` / `GPU_VALIDATION_NOT_AVAILABLE` / `SECRET_ENV_NOT_AVAILABLE`。仅 `environment.type: venv`（直接调用 `<path>/bin/python`，不依赖 `source activate`）与 `executable` 可用。
 

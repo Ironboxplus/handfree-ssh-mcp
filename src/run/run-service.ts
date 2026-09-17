@@ -38,6 +38,7 @@ import {
 import { sliceUtf8Window } from "./log-offset.js";
 import { checkSyncParamSupported, type PhaseOutcome } from "../contracts/run-contract.js";
 import { RunServiceError } from "./run-errors.js";
+import { buildAdHocProfile, AD_HOC_CONFIG_REVISION, AD_HOC_PROFILE_LABEL, type AdHocProfileParams } from "./ad-hoc-profile.js";
 import { computePushedFilesDigest } from "./push-revision.js";
 import { findRemoteCollectFiles, selectWithinCollectCaps, type CollectMatch } from "./collect-glob.js";
 
@@ -99,8 +100,11 @@ export interface RunStatusSummary {
   orphaned?: { detectedAt: string; reason: string };
 }
 
-export interface LaunchParams {
-  profile: string;
+export interface LaunchParams extends AdHocProfileParams {
+  /** A saved `runProfiles.<name>` preset. Optional: omit it and describe the
+   * run inline instead (remoteRoot + venv/executable, see
+   * src/run/ad-hoc-profile.ts) so `workspace-run` works with no YAML. */
+  profile?: string;
   server?: string;
   entrypoint: string;
   args?: string[];
@@ -267,7 +271,7 @@ export class RunService {
     if (effectivePush && !profile.push) {
       throw new RunServiceError(
         "INVALID_CONFIGURATION",
-        "push is enabled (default true unless overridden by push:false or the profile's defaultPush) but this profile has no push.paths configured under runProfiles.<name>.push; add push.paths, or pass push:false and ensure the code already exists under remoteRoot.",
+        "push is enabled but no push sources are declared: add push.paths under runProfiles.<name>.push, or (for an inline run) pass pushPaths, or pass push:false and ensure the code already exists under remoteRoot.",
       );
     }
 
@@ -287,7 +291,7 @@ export class RunService {
     if (effectiveCollectPaths.length > 0 && !profile.collect?.localDir) {
       throw new RunServiceError(
         "INVALID_CONFIGURATION",
-        "collect.paths is declared but this profile has no collect.localDir configured under runProfiles.<name>.collect; add collect.localDir, or pass collect:[] to disable collect for this call.",
+        "collect was requested but there is nowhere local to put the artifacts: add collect.localDir under runProfiles.<name>.collect, or (for an inline run) pass collectLocalDir, or pass collect:[] to disable collect for this call.",
       );
     }
 
@@ -413,9 +417,18 @@ export class RunService {
   }
 
   public async launch(params: LaunchParams): Promise<LaunchResult> {
-    const profile = this.resolveProfile(params.profile);
-    const configRevision = RunProfileRegistry.getInstance().getRevision();
-    return this.launchWithProfile(profile, configRevision, params, undefined);
+    if (params.profile !== undefined) {
+      const profile = this.resolveProfile(params.profile);
+      const configRevision = RunProfileRegistry.getInstance().getRevision();
+      return this.launchWithProfile(profile, configRevision, params, undefined);
+    }
+    // No saved profile -> build an equivalent one from the call itself, then
+    // take the SAME launch path. Resolving the server here (rather than
+    // leaving it to resolveProfileServer) is what gives an inline run the
+    // usual single-enabled-server auto-selection every other tool has.
+    const profile = buildAdHocProfile(params);
+    const server = this.sshManager.resolveServer(params.server);
+    return this.launchWithProfile(profile, AD_HOC_CONFIG_REVISION, { ...params, server }, undefined);
   }
 
   /**
@@ -513,7 +526,7 @@ export class RunService {
     const createdAt = new Date().toISOString();
     const script = buildWrapperScript({
       runId,
-      profile: params.profile,
+      profile: params.profile ?? AD_HOC_PROFILE_LABEL,
       server,
       remoteRoot,
       workdir,
