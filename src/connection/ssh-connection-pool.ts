@@ -49,6 +49,28 @@ export function describePrivateKeyReadFailure(configuredPath: string, error: Err
 
 export type SshDebugSink = (line: string) => void;
 export type AcquiredSshClient = { client: Client; close: () => void };
+
+/**
+ * One connection leased to a multi-connection transfer (see
+ * SshConnectionPool.reserveTransferLanes/openTransferLanes). Exclusively
+ * leased: no other transfer uses it until it is released. `release(true)`
+ * hands a healthy connection back for reuse; `release(false)` closes it.
+ * Idempotent.
+ */
+export type TransferLane = {
+  readonly client: Client;
+  /** True when this connection came out of the idle pool rather than a fresh handshake. */
+  readonly reused: boolean;
+  release(healthy: boolean): void;
+};
+export type TransferLaneReservation = { readonly key: string; readonly count: number };
+type IdleTransferLane = {
+  acquired: AcquiredSshClient;
+  generation: number;
+  epoch: number;
+  timer: NodeJS.Timeout | null;
+  onGone: () => void;
+};
 export type SshClientPurpose = "command" | "sftp";
 export type SshAcquireOptions = {
   reuseConnection?: boolean;
@@ -89,6 +111,31 @@ export class SshConnectionPool {
   // same bastion still gets its own jump client. This keeps tunnel lifetimes
   // tied 1:1 to the target connection and avoids cross-target interference.
   public jumpClients: Map<string, Client[]> = new Map();
+
+  // ---- Transfer lanes (multi-connection download/upload/relay) ----
+  //
+  // `clients` above caches exactly ONE connection per server. A
+  // multi-connection transfer needs N independent connections at once, and
+  // used to open N one-shot connections per call and close them afterwards:
+  // every call paid a full handshake round (~0.7s on a 50ms link, measured)
+  // and nothing bounded how many connections all concurrent transfers opened
+  // against one server. Transfer lanes are that pool: at most
+  // MAX_TRANSFER_LANES_PER_SERVER leased per server (on top of the one cached
+  // `clients` connection), handed out FIFO as whole reservations, and kept
+  // warm for transferLaneIdleMs after release.
+  public static readonly MAX_TRANSFER_LANES_PER_SERVER = 8;
+  public static readonly DEFAULT_TRANSFER_LANE_IDLE_MS = 60_000;
+  private transferLaneIdleMs = SshConnectionPool.DEFAULT_TRANSFER_LANE_IDLE_MS;
+  private readonly idleTransferLanes: Map<string, IdleTransferLane[]> = new Map();
+  private readonly reservedTransferLanes: Map<string, number> = new Map();
+  private readonly transferLaneWaiters: Map<string, Array<{ count: number; grant: () => void }>> = new Map();
+  // Bumped by disconnect(): lanes leased before it are closed on release
+  // instead of being parked, the same way a generation bump retires them for
+  // one server.
+  private transferLaneEpoch = 0;
+  // Close a lane's connection WITHOUT giving its reservation slot back -- see
+  // reopenTransferLane. Kept off the public TransferLane type on purpose.
+  private readonly discardLaneKeepingSlot: WeakMap<TransferLane, () => void> = new WeakMap();
 
   public defaultName: string = "default";
   public enabledServers: string[] | null = null; // null = all servers enabled
@@ -221,6 +268,10 @@ export class SshConnectionPool {
     this.teardownJumpChain(name);
     this.connected.set(name, false);
     this.connecting.delete(name);
+    // Pooled transfer connections go too. Lanes currently LEASED finish
+    // their transfer; on release they are closed rather than pooled if the
+    // generation was bumped (config reload, close-connection).
+    this.closeIdleTransferLanes(name);
   }
 
   public closeClientIfCurrent(name: string, client: Client, bumpGeneration = false): void {
@@ -676,6 +727,235 @@ export class SshConnectionPool {
       return this.connectCommandClient(key, options.timeout ?? 30000, options.debug);
     }
     return this.connectOneShotClient(key, options.timeout ?? 30000, options.debug, purpose);
+  }
+
+  /**
+   * Reserve `count` transfer lanes on server `key`, waiting FIFO while other
+   * transfers hold the server's MAX_TRANSFER_LANES_PER_SERVER budget.
+   *
+   * A transfer reserves ALL the lanes it needs in one step, never some now
+   * and more later: two transfers each holding part of the budget while
+   * waiting for the rest would deadlock. FIFO (a large request at the head is
+   * not overtaken by smaller ones behind it) keeps large requests from
+   * starving. A caller needing lanes on two servers (relay) must reserve them
+   * in a stable server-name order, or A->B and B->A could each hold one side.
+   */
+  public reserveTransferLanes(key: string, count: number): Promise<TransferLaneReservation> {
+    const max = SshConnectionPool.MAX_TRANSFER_LANES_PER_SERVER;
+    if (!Number.isInteger(count) || count < 1 || count > max) {
+      throw new ToolError("INVALID_CONFIGURATION", `transfer lanes must be an integer between 1 and ${max}`, false);
+    }
+    const reservation: TransferLaneReservation = { key, count };
+    const queue = this.transferLaneWaiters.get(key) ?? [];
+    const inUse = this.reservedTransferLanes.get(key) ?? 0;
+    if (queue.length === 0 && inUse + count <= max) {
+      this.reservedTransferLanes.set(key, inUse + count);
+      return Promise.resolve(reservation);
+    }
+    return new Promise((resolve) => {
+      queue.push({ count, grant: () => resolve(reservation) });
+      this.transferLaneWaiters.set(key, queue);
+    });
+  }
+
+  /**
+   * Turn a reservation into connected lanes: idle pooled connections first
+   * (most recently used first), fresh one-shot handshakes -- all concurrent --
+   * for the rest. `fresh` skips the idle pool and closes every lane on
+   * release: the reuseConnection=false escape hatch. On any handshake
+   * failure every lane from this call is closed, the whole reservation is
+   * freed, and the first error is thrown.
+   */
+  public async openTransferLanes(
+    reservation: TransferLaneReservation,
+    options: { timeout?: number; debug?: SshDebugSink; fresh?: boolean } = {},
+  ): Promise<TransferLane[]> {
+    const { key, count } = reservation;
+    const generation = this.connectionGenerations.get(key) ?? 0;
+    const epoch = this.transferLaneEpoch;
+    const fresh = options.fresh === true;
+    const lanes: TransferLane[] = [];
+    if (!fresh) {
+      while (lanes.length < count) {
+        const idle = this.takeIdleTransferLane(key, generation, epoch);
+        if (!idle) break;
+        lanes.push(this.makeTransferLane(key, idle, generation, epoch, true, false));
+      }
+    }
+    const reusedCount = lanes.length;
+    const opened = await Promise.allSettled(
+      Array.from({ length: count - reusedCount }, () =>
+        this.connectOneShotClient(key, options.timeout ?? 30000, options.debug, "sftp")),
+    );
+    const failures: unknown[] = [];
+    for (const outcome of opened) {
+      if (outcome.status === "fulfilled") {
+        lanes.push(this.makeTransferLane(key, outcome.value, generation, epoch, false, fresh));
+      } else {
+        failures.push(outcome.reason);
+      }
+    }
+    options.debug?.(
+      `[mcp] transfer lanes for [${key}]: ${reusedCount} reused, ${opened.length - failures.length} opened` +
+        (failures.length > 0 ? `, ${failures.length} failed` : ""),
+    );
+    if (failures.length > 0) {
+      this.freeTransferLaneSlots(key, failures.length);
+      for (const lane of lanes) lane.release(false);
+      throw failures[0];
+    }
+    return lanes;
+  }
+
+  /**
+   * Replace a leased lane whose connection turned out to be dead (e.g. a
+   * pooled connection that went stale while idle) with a fresh handshake,
+   * KEEPING its reservation slot. Releasing the slot and reserving again
+   * would queue behind other transfers while this one still holds its other
+   * lanes -- a deadlock the moment the budget is contended. On failure the
+   * slot is freed and the error thrown.
+   */
+  public async reopenTransferLane(
+    key: string,
+    lane: TransferLane,
+    options: { timeout?: number; debug?: SshDebugSink } = {},
+  ): Promise<TransferLane> {
+    const discard = this.discardLaneKeepingSlot.get(lane);
+    if (!discard) {
+      throw new ToolError("INVALID_CONFIGURATION", "reopenTransferLane called with a lane that is not leased", false);
+    }
+    discard();
+    const generation = this.connectionGenerations.get(key) ?? 0;
+    const epoch = this.transferLaneEpoch;
+    try {
+      const acquired = await this.connectOneShotClient(key, options.timeout ?? 30000, options.debug, "sftp");
+      options.debug?.(`[mcp] transfer lane for [${key}] was dead; replaced with a fresh connection`);
+      return this.makeTransferLane(key, acquired, generation, epoch, false, false);
+    } catch (error) {
+      this.freeTransferLaneSlots(key, 1);
+      throw error;
+    }
+  }
+
+  /** Test/diagnostic view: idle pooled transfer connections for `key`. */
+  public idleTransferLaneCount(key: string): number {
+    return this.idleTransferLanes.get(key)?.length ?? 0;
+  }
+
+  /** How long a released transfer lane stays pooled before it is closed. */
+  public setTransferLaneIdleMs(idleMs: number): void {
+    this.transferLaneIdleMs = idleMs;
+  }
+
+  private makeTransferLane(
+    key: string,
+    acquired: AcquiredSshClient,
+    generation: number,
+    epoch: number,
+    reused: boolean,
+    fresh: boolean,
+  ): TransferLane {
+    let released = false;
+    let gone = false;
+    const markGone = () => { gone = true; };
+    acquired.client.once("close", markGone);
+    const finish = () => {
+      released = true;
+      acquired.client.removeListener("close", markGone);
+    };
+    const lane: TransferLane = {
+      client: acquired.client,
+      reused,
+      release: (healthy: boolean) => {
+        if (released) return;
+        finish();
+        this.freeTransferLaneSlots(key, 1);
+        const current = (this.connectionGenerations.get(key) ?? 0) === generation && this.transferLaneEpoch === epoch;
+        if (healthy && !fresh && !gone && current) {
+          this.parkIdleTransferLane(key, acquired, generation, epoch);
+        } else {
+          acquired.close();
+        }
+      },
+    };
+    this.discardLaneKeepingSlot.set(lane, () => {
+      if (released) return;
+      finish();
+      acquired.close();
+    });
+    return lane;
+  }
+
+  private parkIdleTransferLane(key: string, acquired: AcquiredSshClient, generation: number, epoch: number): void {
+    const idle: IdleTransferLane = { acquired, generation, epoch, timer: null, onGone: () => {} };
+    // Dropped by the remote or the network while idle (keepalive detects a
+    // dead link): leave the pool at once, so it is never handed out.
+    idle.onGone = () => {
+      this.removeIdleTransferLane(key, idle);
+      acquired.close();
+    };
+    acquired.client.once("close", idle.onGone);
+    idle.timer = setTimeout(idle.onGone, this.transferLaneIdleMs);
+    // A pooled connection must never keep the process alive on its own.
+    idle.timer.unref?.();
+    const list = this.idleTransferLanes.get(key) ?? [];
+    list.push(idle);
+    this.idleTransferLanes.set(key, list);
+  }
+
+  private takeIdleTransferLane(key: string, generation: number, epoch: number): AcquiredSshClient | null {
+    const list = this.idleTransferLanes.get(key);
+    while (list && list.length > 0) {
+      const idle = list.pop()!;
+      this.detachIdleTransferLane(idle);
+      if (idle.generation === generation && idle.epoch === epoch) {
+        if (list.length === 0) this.idleTransferLanes.delete(key);
+        return idle.acquired;
+      }
+      idle.acquired.close();
+    }
+    this.idleTransferLanes.delete(key);
+    return null;
+  }
+
+  private detachIdleTransferLane(idle: IdleTransferLane): void {
+    if (idle.timer) clearTimeout(idle.timer);
+    idle.timer = null;
+    idle.acquired.client.removeListener("close", idle.onGone);
+  }
+
+  private removeIdleTransferLane(key: string, idle: IdleTransferLane): void {
+    this.detachIdleTransferLane(idle);
+    const list = this.idleTransferLanes.get(key);
+    if (!list) return;
+    const index = list.indexOf(idle);
+    if (index >= 0) list.splice(index, 1);
+    if (list.length === 0) this.idleTransferLanes.delete(key);
+  }
+
+  /** Close every idle pooled transfer connection for `key`, or for all servers. */
+  private closeIdleTransferLanes(key?: string): void {
+    const keys = key === undefined ? Array.from(this.idleTransferLanes.keys()) : [key];
+    for (const name of keys) {
+      for (const idle of [...(this.idleTransferLanes.get(name) ?? [])]) {
+        this.removeIdleTransferLane(name, idle);
+        idle.acquired.close();
+      }
+    }
+  }
+
+  private freeTransferLaneSlots(key: string, count: number): void {
+    const max = SshConnectionPool.MAX_TRANSFER_LANES_PER_SERVER;
+    let inUse = Math.max(0, (this.reservedTransferLanes.get(key) ?? 0) - count);
+    const queue = this.transferLaneWaiters.get(key);
+    while (queue && queue.length > 0 && inUse + queue[0].count <= max) {
+      const next = queue.shift()!;
+      inUse += next.count;
+      next.grant();
+    }
+    if (queue && queue.length === 0) this.transferLaneWaiters.delete(key);
+    if (inUse === 0) this.reservedTransferLanes.delete(key);
+    else this.reservedTransferLanes.set(key, inUse);
   }
 
   /**
@@ -1407,6 +1687,10 @@ export class SshConnectionPool {
    * Disconnect SSH connection
    */
   public disconnect(): void {
+    // Retire every lane leased right now too: they close on release instead
+    // of being pooled.
+    this.transferLaneEpoch += 1;
+    this.closeIdleTransferLanes();
     if (this.clients.size > 0) {
       for (const client of this.clients.values()) {
         client.end();

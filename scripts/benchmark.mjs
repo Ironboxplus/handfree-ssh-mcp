@@ -168,6 +168,11 @@ export function buildSweepGrid() {
     { label: "PRODUCT connections=2 (single file)", product: 2 },
     { label: "PRODUCT connections=4 (single file)", product: 4 },
     { label: "PRODUCT connections=8 (single file)", product: 8 },
+    // The PRODUCT rows above run after a warm-up, so they reuse the pooled
+    // transfer lanes (SshConnectionPool) the warm-up left behind -- every
+    // repeated call after the first. This row empties the pool before each
+    // run: the first call's cost, with all 4 handshakes inside the timing.
+    { label: "PRODUCT connections=4 COLD (no pooled lanes)", product: 4, cold: true },
     // The cost of ONE fresh handshake + SFTP open on this link. The PRODUCT
     // rows time setup + data together, while the "x N CONNECTIONS" proxy rows
     // reuse connections warmed by their warm-up run and so time data only;
@@ -798,6 +803,7 @@ async function main() {
           const runOnceProduct = async () => {
             const local = path.join(scratchDir, "sweep-product.bin");
             if (fs.existsSync(local)) fs.rmSync(local);
+            if (point.cold) manager.disconnect();
             const started = process.hrtime.bigint();
             await svc.download(remotePath, local, names[0], { connections: point.product, timeout: 1_800_000 });
             const ms = Number(process.hrtime.bigint() - started) / 1e6;

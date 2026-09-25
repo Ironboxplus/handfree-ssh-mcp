@@ -160,6 +160,8 @@ describe("multi-connection upload real execution", { concurrency: false }, () =>
     const localPath = writeLocal("four-connections.bin", data);
     server.setAuthDelayMs(300);
     try {
+      // Cold pool: otherwise warm transfer lanes from earlier tests are reused.
+      manager.disconnect();
       server.resetConnectionCount();
       const result = await upload({ localPath, remotePath: "/four-connections.bin", connections: 4 });
       assert.equal(result.isError, undefined, responseText(result));

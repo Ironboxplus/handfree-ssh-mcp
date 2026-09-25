@@ -209,6 +209,8 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     fs.writeFileSync(sourcePath, payload);
     const localPath = path.join(localRoot, "tiny-three-bytes.bin");
 
+    // Cold pool: otherwise warm transfer lanes from earlier tests are reused.
+    manager.disconnect();
     server.resetConnectionCount();
     server.resetReadLog();
     const result = await mcpClient.callTool({
@@ -239,6 +241,8 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     fs.writeFileSync(sourcePath, Buffer.alloc(0));
     const localPath = path.join(localRoot, "empty.bin");
 
+    // Cold pool: otherwise warm transfer lanes from earlier tests are reused.
+    manager.disconnect();
     server.resetConnectionCount();
     server.resetReadLog();
     const result = await mcpClient.callTool({
@@ -268,6 +272,8 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     // channels, 1 connection". That distinction is the entire reason the
     // previous "striped" (channel-based) design was deleted -- see PLAN.MD
     // P1-04b/P1-04c.
+    // Cold pool: otherwise warm transfer lanes from earlier tests are reused.
+    manager.disconnect();
     server.resetConnectionCount();
     const result = await mcpClient.callTool({
       name: "download",
@@ -294,6 +300,8 @@ describe("multi-connection download real execution", { concurrency: false }, () 
 
     server.setAuthDelayMs(authDelayMs);
     try {
+      // Cold pool: otherwise warm transfer lanes from earlier tests are reused.
+      manager.disconnect();
       server.resetConnectionCount();
       const startedAt = Date.now();
       const result = await mcpClient.callTool({

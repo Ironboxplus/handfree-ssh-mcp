@@ -135,6 +135,8 @@ describe("multi-connection relay real execution", { concurrency: false }, () => 
     source.setAuthDelayMs(300);
     dest.setAuthDelayMs(300);
     try {
+      // Cold pool: otherwise warm transfer lanes from earlier tests are reused.
+      manager.disconnect();
       resetBoth();
       const result = await relay({ sourceRemotePath: "/pairs.bin", destRemotePath: "/pairs.bin", connections: 4, skipIfIdentical: false });
       assert.equal(result.isError, undefined, responseText(result));
@@ -241,6 +243,8 @@ describe("multi-connection relay real execution", { concurrency: false }, () => 
   test("black-box: self-relay (source and destination are the same server) uses N connections, not 2N", async () => {
     const data = randomBytes(400_009);
     seedSource("/self-in.bin", data);
+    // Cold pool: otherwise warm transfer lanes from earlier tests are reused.
+    manager.disconnect();
     source.resetConnectionCount();
     const result = await mcpClient.callTool({
       name: "transfer",

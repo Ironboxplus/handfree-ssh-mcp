@@ -149,7 +149,7 @@ Parameters:
                   pointless on a fast LAN. Measured uploading 128 MiB at
                   50 ms RTT (one connection 29.8 MiB/s): 2 -> 35.2,
                   4 -> 43.5, 8 -> 44.9 MiB/s -- smaller than download's
-                  gains; the figures include ~0.7 s of connection setup.
+                  gains. Connections are pooled per server, as for download.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -202,7 +202,10 @@ Parameters:
                   not MaxSessions. Measured on a 50 ms / 1 Gbps link against
                   17.5 MiB/s for one connection: 2 -> 28.5, 4 -> 45.7,
                   8 -> 53.9 MiB/s. Diminishing returns past 4; the gain depends
-                  on your link's RTT and bandwidth.
+                  on your link's RTT and bandwidth. The connections are pooled
+                  per server (at most 8 per server, idle ones closed after
+                  60 s), so a repeated transfer skips the handshakes;
+                  reuseConnection=false uses fresh ones, closed afterwards.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -270,6 +273,8 @@ Parameters for upload / download:
                   Maximum 8. Helps on high-latency links; pointless on a
                   fast LAN. Separate, concurrent handshakes, so sshd's
                   MaxStartups is the limit that matters, not MaxSessions.
+                  Connections are pooled per server (at most 8, idle ones
+                  closed after 60 s), so a repeat skips the handshakes.
                   Download measured on 50 ms / 1 Gbps (one connection
                   17.5 MiB/s): 2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s.
                   Rejected for relay strategy="direct"/"auto", a batch

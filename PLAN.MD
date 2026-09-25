@@ -1166,7 +1166,7 @@ PLAN 正文 §2 要的是「多连接单文件分片」，`PLAN.MD:81` 甚至专
 
 原条目作废，改为：
 
-- [x] `transfer mode=relay` 新增 `connections`（默认 1 = 现有 relay 逐字节不变，上限 8）。只与 `strategy: "relay"`（默认）组合；与 `"direct"`/`"auto"`、`archive` 组合时拒绝，不静默忽略。>1 时忽略 `sftpConcurrency`/`chunkSize`/`reuseConnection`，与下载/上传一致。
+- [x] `transfer mode=relay` 新增 `connections`（默认 1 = 现有 relay 逐字节不变，上限 8）。只与 `strategy: "relay"`（默认）组合；与 `"direct"`/`"auto"`、`archive` 组合时拒绝，不静默忽略。>1 时忽略 `sftpConcurrency`/`chunkSize`，与下载/上传一致（`reuseConnection` 自 2.4.0 起表示绕过连接池，见 P1-06b）。
 - [x] N **对**独立的 TCP+SSH 连接：源端 N 条、目标端 N 条，每对负责一个不重叠字节区间。源端读与目标端写各自拥有每连接的 2 MiB channel 窗口。两端所有连接**并发**建立（复用 `openIndependentSftpSessions`），任一握手失败时两端已建立的连接全部关闭。
 - [x] 每对内部是 64 × 32 KiB 的读→写流水线；总 buffer 上限 N × 2 MiB（N=8 时 16 MiB）。
 - [x] 目标端写入同目录 temp 文件：第 0 条连接 `w` 创建，其余 `r+`；全部成功且 temp 大小校验通过后，用 `replaceRemoteFile` 替换目标（posix-rename 原子覆盖，否则先删后改名）。任一连接失败：删除 temp，目标保持原样。**这与单连接 relay 的「原地写」不同**，文档写明。
@@ -1215,6 +1215,56 @@ PLAN 正文 §2 要的是「多连接单文件分片」，`PLAN.MD:81` 甚至专
 1. 单连接 baseline 复用 warm-up 建好的连接（不含握手）；多连接每次两端并发新建，约 0.71 s。
 2. netem 只装在源容器出口，受限的是「源 → 本机」这一段；「本机 → 目标」没有整形。因此这组数字对应「源端链路慢、目标端链路快」的中转场景，未覆盖目标端链路也慢的情况。
 3. `8` 比 `4` 略慢，原因未定位。文档直接建议用 `4`。
+
+### P1-06b 传输连接池（transfer lanes，2026-09-25 交付，2.4.0）
+
+**起因**：P1-04e/f 与 P1-06 交付后，每次 `connections=N` 调用都新建 N 条一次性连接、用完即关。在 50 ms 链路上这是每次约 0.7 s 的固定开销，重复传输每次都付。用户指出后立项。这也兑现了 P1-03b 中「per-server budget」的一部分——**仅限多连接传输所用的连接**；三队列拆分、channel budget 等其余 P1-03b 条目仍未做。
+
+- [x] `SshConnectionPool` 新增按服务器的 transfer lane 池，与缓存的命令连接完全分开：`reserveTransferLanes`（整笔预约、FIFO，每服务器上限 8）→ `openTransferLanes`（先取空闲 lane，LIFO；其余并发新建）→ `TransferLane.release(healthy)`。
+- [x] 成功的传输把 lane 放回池中；失败的传输一律关闭其 lane，不回池。
+- [x] 空闲 60 s 关闭（timer `unref`，不拖住进程）；空闲期间被对端断开的 lane 通过 `close` 事件立即出池。
+- [x] 池中 lane 已失效（连接还在但开不了 SFTP）：`reopenTransferLane` 在**保留预约名额**的前提下换一条新连接，重试一次。先释放再重新预约会在预算紧张时死锁，所以不这样做。
+- [x] `close-connection`、配置重载（generation 变化）、`disconnect()`（epoch 变化）关闭空闲 lane；正在租用中的 lane 在归还时被关闭，不回池。
+- [x] relay 按服务器名排序后依次预约两端，A→B 与 B→A 并发时不会各占一端互等。
+- [x] `reuseConnection=false`：绕过连接池，全新连接，用完即关。此前文档写「>1 时忽略 reuseConnection」，已更正（download/upload/transfer 描述、help、SERVER_INSTRUCTIONS、README 中英文）。
+
+测试（`transfer-lane-pool-real.test.ts`，10 项，两个真实 ssh2 服务器，连接数全部以服务端 accept 计数为准）：
+- 重复下载新建连接数为 0；下载留下的 lane 被上传复用。
+- 空闲超时后 lane 关闭。
+- 服务端断开空闲 lane 后它们出池，下一次重新建连。
+- 池中 lane 拒绝 SFTP 时被替换，每条失效 lane 恰好一条替换连接，传输成功。
+- 失败的传输不回池。
+- `reuseConnection=false` 不动池中 lane，自己的连接用完即关。
+- `close-connection` 清空空闲 lane。
+- 两个并发 `connections=8` 下载：服务端存活连接峰值 ≤ 8，总共只建 8 条（第二个等待后复用）。
+- 反向 relay 并发不死锁。
+- 原有三个多连接套件中 7 个「每次调用连接数」断言改为先清空池（冷启动）。
+
+**变异验证**（10 个，全部被抓到；每个都确认编译进了被测产物）：
+- release 无视 healthy 总是回池。
+- 永不复用空闲 lane。
+- 去掉上限。
+- relay 按源端优先预约：反向 relay 真实死锁，直到测试的 8 s 超时。
+- `closeClient` 不关闭空闲 lane。
+- 忽略 fresh。
+- 失效 lane 不替换。
+- 去掉空闲 timer。
+- 空闲 lane 不监听 `close`。
+- fresh lane 也回池。
+
+真机（`.88` netem lab，50 ms / 1 Gbps，128 MiB，median of 3，每次校验 SHA-256）。benchmark 新增 `PRODUCT connections=4 COLD` 行，每次运行前清空池；其余 PRODUCT / UPLOAD / RELAY 行在 warm-up 之后运行，因此是复用池中连接的重复调用：
+
+| 场景 | 首次调用（本轮 COLD 行 / 此前各轮） | 重复调用（本轮） |
+|---|---|---|
+| 下载 `connections=2` | 28.5 MiB/s | 35.23 MiB/s |
+| 下载 `connections=4` | 45.59 MiB/s | 63.17 MiB/s |
+| 下载 `connections=8` | 53.8 MiB/s | 82.83 MiB/s |
+| 上传 `connections=4` / `8` | 43.5 / 44.9 MiB/s | 53.90 / 52.65 MiB/s |
+| relay `connections=4` / `8` | 33.64 / 31.71 MiB/s | 37.30 / 36.99 MiB/s |
+
+同轮基线：单连接下载 17.48，上传 fastPut 29.14，单连接 relay 16.89；SETUP ONLY（一条新连接）711 ms。下载 `connections=4` 冷热差 782 ms，约等于一轮并发握手，与 SETUP ONLY 一致。「首次调用」列中除 4 连接下载外均为此前各轮数字，不是同轮对照。
+
+口径说明：P1-04e/f 与 P1-06 表格里的多连接数字都含每次约 0.7 s 建连，对应现在的「首次调用」。上传与 relay 在 `8` 仍不比 `4` 快，原因仍未定位。
 
 
 ### P1-07 外部 engine 与远端执行 adapter

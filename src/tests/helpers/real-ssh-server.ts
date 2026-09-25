@@ -70,6 +70,10 @@ export interface RealSshServerStats {
   // setAuthDelayMs(), which gives each handshake a real duration to overlap in.
   activeHandshakes: number;
   maxActiveHandshakes: number;
+  // Peak of liveConnectionCount (open connections, in any state) since the
+  // last resetConnectionCount() -- a per-server connection budget is a bound
+  // on exactly this.
+  maxLiveConnections: number;
 }
 
 const { Server } = ssh2;
@@ -146,6 +150,7 @@ export class RealSshTestServer {
     connectionCount: 0,
     activeHandshakes: 0,
     maxActiveHandshakes: 0,
+    maxLiveConnections: 0,
   };
 
   public port = 0;
@@ -193,6 +198,9 @@ export class RealSshTestServer {
   // these connection indices gets a genuine SFTP FAILURE, the others stay
   // healthy -- the WRITE-side twin of failReadsForConnectionIndex.
   private failWritesForConnectionIndex: Set<number> | null = null;
+  // Connection indices whose SFTP subsystem requests are genuinely refused:
+  // a connection that is still up but can no longer carry an SFTP channel.
+  private rejectSftpForConnectionIndex: Set<number> | null = null;
   // PLAN.MD P1-08a: parsed once in the constructor from
   // directExecOptions.authorizedPublicKeyPem (see below), or undefined when
   // that option is omitted -- `any` because ssh2's ParsedKey type isn't
@@ -274,6 +282,7 @@ export class RealSshTestServer {
         this.stats.activeHandshakes--;
       };
       this.clients.add(client);
+      this.stats.maxLiveConnections = Math.max(this.stats.maxLiveConnections, this.clients.size);
       client.once("close", () => {
         endHandshake();
         this.clients.delete(client);
@@ -335,7 +344,11 @@ export class RealSshTestServer {
         endHandshake();
         client.on("session", (accept) => {
           const session = accept();
-          session.on("sftp", (acceptSftp) => {
+          session.on("sftp", (acceptSftp, rejectSftp) => {
+            if (this.rejectSftpForConnectionIndex?.has(connectionIndex)) {
+              rejectSftp();
+              return;
+            }
             // Each `session` here is one SSH channel; OpenSSH's `MaxSessions`
             // bounds exactly this — concurrently open channels on one
             // connection, not concurrent files or bytes. Count real channel
@@ -449,6 +462,17 @@ export class RealSshTestServer {
   public resetConnectionCount(): void {
     this.stats.connectionCount = 0;
     this.stats.maxActiveHandshakes = this.stats.activeHandshakes;
+    this.stats.maxLiveConnections = this.clients.size;
+  }
+
+  /** See rejectSftpForConnectionIndex above; null clears it. */
+  public setRejectSftpForConnectionIndices(indices: number[] | null): void {
+    this.rejectSftpForConnectionIndex = indices ? new Set(indices) : null;
+  }
+
+  /** Server-side close of every open connection, as a remote restart would. */
+  public dropAllConnections(): void {
+    for (const client of this.clients) client.end();
   }
 
   /** See authDelayMs above. */

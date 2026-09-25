@@ -20,6 +20,8 @@ import {
   SshConnectionPool,
   type SshDebugSink,
   type AcquiredSshClient,
+  type TransferLane,
+  type TransferLaneReservation,
 } from "../connection/ssh-connection-pool.js";
 import { SSHConfig } from "../models/types.js";
 import { Logger } from "../utils/logger.js";
@@ -1242,6 +1244,7 @@ export class TransferService {
           connections,
           options?.timeout,
           debug,
+          options?.reuseConnection === false,
         );
         return appendDebugOutput(message, debugCollector);
       } catch (error) {
@@ -1889,12 +1892,13 @@ export class TransferService {
           connections,
           options?.timeout,
           debug,
+          options?.reuseConnection === false,
         );
         return appendDebugOutput(message, debugCollector);
       } catch (error) {
-        // Every connection this path opens is a fresh one-shot connection
-        // (see downloadMultiConnection) -- there is no cached client for
-        // this server that a failure here could have poisoned, so unlike
+        // This path runs on transfer lanes, never on the cached command
+        // client, and a failed transfer closes its lanes instead of pooling
+        // them -- nothing a failure here touched can be poisoned, so unlike
         // the branches below this never calls this.pool.closeClient().
         throw appendDebugToError(error as Error, debugCollector);
       }
@@ -1955,104 +1959,94 @@ export class TransferService {
   }
 
   /**
-   * Multi-connection single-file download. Splits the remote file into
-   * `connections` non-overlapping byte ranges (computeDownloadByteRanges)
-   * and pulls each range over its OWN independent, freshly-handshaked
-   * SSH/TCP connection (this.pool.acquireSshClient(..., { reuseConnection:
-   * false })) rather than opening `connections` SFTP channels on one shared
-   * connection.
+   * Lease the reservation's connections from the pool (SshConnectionPool
+   * transfer lanes) and open one SFTP session on each, for multi-connection
+   * download, upload and relay. Successes are pushed into the caller's
+   * `lanes`/`sftpSessions` so the caller's own cleanup owns them in every
+   * outcome; the first failure is thrown after ALL attempts have settled.
    *
-   * This distinction is the entire point: every channel opened on one SSH
-   * connection shares that connection's single SSH channel flow-control
-   * window (ssh2 hardcodes MAX_WINDOW at 2 MiB with no Client option to
-   * raise it -- see node_modules/ssh2/lib/Channel.js), so N channels on one
-   * connection cannot move more in-flight data than one channel already
-   * could. N independent connections each get their own window, which is
-   * what actually raises the achievable in-flight byte count on a
-   * high-latency link. See PLAN.MD's P1-04b/P1-04c real netem measurements.
-   *
-   * Correctness properties, all provable in-process:
-   *   - Ranges are non-overlapping and cover the file exactly (pure function,
-   *     white-box tested; also provable as wire truth from the real READ
-   *     requests a test server received).
-   *   - Ranges may complete in any order: each worker writes its own range at
-   *     its own absolute offset via a positional fs.write, so completion
-   *     order never affects the result.
-   *   - Any worker failing ends every open SFTP session, which aborts the
-   *     others' in-flight reads instead of letting them run to completion on
-   *     a temp file about to be deleted; the temp file is then removed and
-   *     the destination path is never touched.
-   *   - The destination is only ever reached via one atomic fs.renameSync,
-   *     performed after the whole temp file's size has been verified -- it
-   *     never exists in a partially-written state.
-   */
-  /**
-   * Open `count` independent one-shot SSH connections, each with its own SFTP
-   * session, for multi-connection download and upload. Successes are pushed
-   * into the caller's `acquired`/`sftpSessions` so the caller's own cleanup
-   * owns them in every outcome; the first failure is thrown after ALL
-   * attempts have settled.
-   *
-   * All N are established CONCURRENTLY, before the file size is known.
-   * Measured on the real 50ms netem lab (PLAN.MD P1-04e), one handshake +
-   * SFTP open costs ~685ms there, and doing them one after another was the
-   * entire gap between multi-connection download and N parallel fastGets:
-   * connections=4 spent 2.7s of 4.9s connecting, connections=8 spent 5.5s of
-   * 7.1s (why 8 measured slower than 4). The data path was already at parity.
-   * Opening the rest only after a first connection had stat'ed the file would
-   * still cost two handshake rounds instead of one. The trade-off: a file
-   * smaller than N BYTES opens connections it then closes unused -- a
-   * transfer that small is negligible either way.
+   * Lanes come from the idle pool when available and are otherwise opened
+   * CONCURRENTLY, before the file size is known. Measured on the real 50ms
+   * netem lab (PLAN.MD P1-04e), one handshake + SFTP open costs ~685ms there,
+   * and doing them one after another was the entire gap between
+   * multi-connection download and N parallel fastGets. A pooled lane skips
+   * that cost entirely. The trade-off of opening before the size is known: a
+   * file smaller than N BYTES leases lanes it then returns unused.
    *
    * Concurrent handshakes are what sshd's MaxStartups limits (default
-   * 10:30:100 -- random drops start at 10 unauthenticated connections), which
-   * the hard cap of 8 stays under.
+   * 10:30:100 -- random drops start at 10 unauthenticated connections); the
+   * pool caps lanes at 8 per server.
    *
-   * Every connection is a fresh one-shot handshake regardless of the caller's
-   * reuseConnection option: independent connections are this feature's
-   * entire mechanism, not something reuseConnection could meaningfully toggle
-   * off. allSettled, not all: if one handshake fails, the ones that succeeded
-   * must still be recorded so the caller releases them -- Promise.all would
-   * drop them on the floor, still connected.
+   * A pooled lane can be dead without the pool having noticed yet (dropped
+   * while idle, no keepalive round since). If its SFTP open fails it is
+   * replaced by a fresh connection that keeps its reservation slot; a FRESH
+   * lane failing is a real failure. `fresh` (reuseConnection=false) bypasses
+   * the idle pool and closes every lane on release. allSettled, not all: the
+   * lanes that did open must still reach the caller so its cleanup releases
+   * them.
    */
-  private async openIndependentSftpSessions(
-    resolvedName: string,
-    count: number,
+  private async openLaneSessions(
+    reservation: TransferLaneReservation,
     label: string,
-    acquired: AcquiredSshClient[],
+    lanes: TransferLane[],
     sftpSessions: SFTPWrapper[],
     timeout: number | undefined,
     debug: SshDebugSink | undefined,
+    fresh: boolean,
   ): Promise<void> {
-    const established = await Promise.allSettled(
-      Array.from({ length: count }, async (_, index) => {
-        const acquiredConnection = await this.pool.acquireSshClient(resolvedName, {
-          reuseConnection: false,
-          timeout,
-          debug,
-          purpose: "sftp",
-        });
+    const leased = await this.pool.openTransferLanes(reservation, { timeout, debug, fresh });
+    const opened = await Promise.allSettled(
+      leased.map(async (lane, index) => {
         try {
-          return {
-            acquiredConnection,
-            sftp: await this.openSftp(acquiredConnection.client, `${label}-${index}`, timeout, debug),
-          };
+          return { lane, sftp: await this.openSftp(lane.client, `${label}-${index}`, timeout, debug) };
         } catch (error) {
-          acquiredConnection.close();
-          throw error;
+          if (!lane.reused) {
+            lane.release(false);
+            throw error;
+          }
+          const replacement = await this.pool.reopenTransferLane(reservation.key, lane, { timeout, debug });
+          try {
+            return { lane: replacement, sftp: await this.openSftp(replacement.client, `${label}-${index}`, timeout, debug) };
+          } catch (retryError) {
+            replacement.release(false);
+            throw retryError;
+          }
         }
       }),
     );
-    for (const outcome of established) {
+    for (const outcome of opened) {
       if (outcome.status === "fulfilled") {
-        acquired.push(outcome.value.acquiredConnection);
+        lanes.push(outcome.value.lane);
         sftpSessions.push(outcome.value.sftp);
       }
     }
-    const firstFailure = established.find((outcome) => outcome.status === "rejected");
+    const firstFailure = opened.find((outcome) => outcome.status === "rejected");
     if (firstFailure) {
       throw (firstFailure as PromiseRejectedResult).reason;
     }
+  }
+
+  /**
+   * End every SFTP session and release every lane of a multi-connection
+   * transfer, exactly once: back to the pool when the transfer succeeded,
+   * closed when it did not (a failed transfer's connections are suspect).
+   */
+  private makeLaneReleaser(
+    lanes: () => TransferLane[],
+    sessions: () => SFTPWrapper[],
+  ): { release: (healthy: boolean) => void; readonly released: boolean } {
+    let released = false;
+    return {
+      release: (healthy: boolean) => {
+        if (released) return;
+        released = true;
+        for (const sftp of sessions()) {
+          try { sftp.end(); } catch { /* already gone */ }
+        }
+        for (const lane of lanes()) lane.release(healthy);
+      },
+      get released() { return released; },
+    };
   }
 
   /**
@@ -2154,31 +2148,26 @@ export class TransferService {
     connections: number,
     timeout: number | undefined,
     debug: SshDebugSink | undefined,
+    fresh: boolean,
   ): Promise<string> {
-    const acquired: AcquiredSshClient[] = [];
+    const lanes: TransferLane[] = [];
     const sftpSessions: SFTPWrapper[] = [];
     let remoteTempPath: string | null = null;
     let localFd: number | null = null;
-    let sessionsClosed = false;
+    let succeeded = false;
+    const releaser = this.makeLaneReleaser(() => lanes, () => sftpSessions);
+    const closeAll = (): void => releaser.release(false);
 
-    const closeAll = (): void => {
-      sessionsClosed = true;
-      for (const sftp of sftpSessions) {
-        try { sftp.end(); } catch { /* already gone */ }
-      }
-      for (const acquiredConnection of acquired) {
-        try { acquiredConnection.close(); } catch { /* already gone */ }
-      }
-    };
-
+    const reservation = await this.pool.reserveTransferLanes(resolvedName, connections);
     try {
-      await this.openIndependentSftpSessions(resolvedName, connections, "multi-upload", acquired, sftpSessions, timeout, debug);
+      await this.openLaneSessions(reservation, "multi-upload", lanes, sftpSessions, timeout, debug, fresh);
 
       if (skipIfIdentical) {
         const decision = await this.decideUploadSkip(
-          acquired[0].client, payload, localPath, size, remotePath, isShellScript, timeout, debug,
+          lanes[0].client, payload, localPath, size, remotePath, isShellScript, timeout, debug,
         );
         if (decision.skip) {
+          succeeded = true;
           return TransferService.uploadSkippedMessage(remotePath, localPath, decision.reason, crlfNote);
         }
       }
@@ -2221,7 +2210,7 @@ export class TransferService {
       } finally {
         // After a failure closeAll() has already ended every session, and a
         // CLOSE sent on an ended session would never be answered.
-        if (!sessionsClosed) {
+        if (!releaser.released) {
           for (const [index, handle] of handles.entries()) {
             try { await this.sftpCloseFile(sftpSessions[index], handle); } catch { /* best-effort */ }
           }
@@ -2238,9 +2227,10 @@ export class TransferService {
       }
       await this.replaceRemoteFile(sftpSessions[0], tempPath, remotePath, debug);
       remoteTempPath = null; // Renamed into place -- nothing left to clean up.
+      succeeded = true;
       return `File uploaded successfully (${size} bytes via ${ranges.length} independent connection(s))${crlfNote}`;
     } finally {
-      closeAll();
+      releaser.release(succeeded);
       if (localFd !== null) {
         try { fs.closeSync(localFd); } catch { /* best-effort */ }
       }
@@ -2369,6 +2359,37 @@ export class TransferService {
     }
   }
 
+  /**
+   * Multi-connection single-file download. Splits the remote file into
+   * `connections` non-overlapping byte ranges (computeDownloadByteRanges)
+   * and pulls each range over its OWN independent SSH/TCP connection -- a
+   * transfer lane leased from the pool (openLaneSessions) -- rather than
+   * opening `connections` SFTP channels on one shared connection.
+   *
+   * This distinction is the entire point: every channel opened on one SSH
+   * connection shares that connection's single SSH channel flow-control
+   * window (ssh2 hardcodes MAX_WINDOW at 2 MiB with no Client option to
+   * raise it -- see node_modules/ssh2/lib/Channel.js), so N channels on one
+   * connection cannot move more in-flight data than one channel already
+   * could. N independent connections each get their own window, which is
+   * what actually raises the achievable in-flight byte count on a
+   * high-latency link. See PLAN.MD's P1-04b/P1-04c real netem measurements.
+   *
+   * Correctness properties, all provable in-process:
+   *   - Ranges are non-overlapping and cover the file exactly (pure function,
+   *     white-box tested; also provable as wire truth from the real READ
+   *     requests a test server received).
+   *   - Ranges may complete in any order: each worker writes its own range at
+   *     its own absolute offset via a positional fs.write, so completion
+   *     order never affects the result.
+   *   - Any worker failing ends every open SFTP session, which aborts the
+   *     others' in-flight reads instead of letting them run to completion on
+   *     a temp file about to be deleted; the temp file is then removed and
+   *     the destination path is never touched.
+   *   - The destination is only ever reached via one atomic fs.renameSync,
+   *     performed after the whole temp file's size has been verified -- it
+   *     never exists in a partially-written state.
+   */
   private async downloadMultiConnection(
     resolvedName: string,
     remotePath: string,
@@ -2376,26 +2397,23 @@ export class TransferService {
     connections: number,
     timeout: number | undefined,
     debug: SshDebugSink | undefined,
+    fresh: boolean,
   ): Promise<string> {
-    const acquired: AcquiredSshClient[] = [];
+    const lanes: TransferLane[] = [];
     const sftpSessions: SFTPWrapper[] = [];
     let tempPath: string | null = null;
+    let succeeded = false;
 
     // Ending every open SFTP session both lets a healthy worker's in-flight
     // READ fail fast (so it stops promptly instead of finishing its whole
-    // range into a temp file that is about to be deleted) and releases the
-    // underlying one-shot connections below.
-    const closeAll = (): void => {
-      for (const sftp of sftpSessions) {
-        try { sftp.end(); } catch { /* already gone */ }
-      }
-      for (const acquiredConnection of acquired) {
-        try { acquiredConnection.close(); } catch { /* already gone */ }
-      }
-    };
+    // range into a temp file that is about to be deleted) and closes the
+    // underlying lanes instead of pooling them.
+    const releaser = this.makeLaneReleaser(() => lanes, () => sftpSessions);
+    const closeAll = (): void => releaser.release(false);
 
+    const reservation = await this.pool.reserveTransferLanes(resolvedName, connections);
     try {
-      await this.openIndependentSftpSessions(resolvedName, connections, "multi-download", acquired, sftpSessions, timeout, debug);
+      await this.openLaneSessions(reservation, "multi-download", lanes, sftpSessions, timeout, debug, fresh);
 
       const fileSize = (await this.sftpStat(sftpSessions[0], remotePath, "source")).size;
       const ranges = computeDownloadByteRanges(fileSize, connections);
@@ -2434,9 +2452,10 @@ export class TransferService {
 
       fs.renameSync(tempPath, localPath);
       tempPath = null; // Renamed -- the finally block below must not delete it.
+      succeeded = true;
       return `File downloaded successfully via ${ranges.length} independent connection(s)`;
     } finally {
-      closeAll();
+      releaser.release(succeeded);
       if (tempPath) {
         try { fs.unlinkSync(tempPath); } catch { /* best-effort cleanup */ }
       }
@@ -2916,8 +2935,13 @@ export class TransferService {
    * replaceRemoteFile. Any failure deletes the temp and leaves the target's
    * previous contents untouched.
    *
-   * Self-relay (source === destination server) opens N connections, each
+   * Self-relay (source === destination server) leases N lanes, each
    * carrying one read and one write SFTP channel, rather than 2N.
+   *
+   * The two sides' lanes are reserved in server-name order, never
+   * source-first: an A->B relay and a concurrent B->A relay reserving
+   * source-first could each hold one server's budget while waiting for the
+   * other's.
    */
   private async transferBetweenServersMultiConnection(
     sourceName: string,
@@ -2935,30 +2959,27 @@ export class TransferService {
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
     debug?.(`[mcp] multi-connection relay ${sourceName} -> ${destName}, connections=${connections}, selfRelay=${selfRelay}`);
 
-    const srcAcquired: AcquiredSshClient[] = [];
+    const fresh = options?.reuseConnection === false;
+    const srcLanes: TransferLane[] = [];
     const srcSessions: SFTPWrapper[] = [];
-    const dstAcquired: AcquiredSshClient[] = [];
+    const dstLanes: TransferLane[] = [];
     const dstSessions: SFTPWrapper[] = [];
     let remoteTempPath: string | null = null;
-    let sessionsClosed = false;
+    let succeeded = false;
+    const releaser = this.makeLaneReleaser(() => [...srcLanes, ...dstLanes], () => [...srcSessions, ...dstSessions]);
+    const closeAll = (): void => releaser.release(false);
 
-    const closeAll = (): void => {
-      sessionsClosed = true;
-      for (const sftp of [...srcSessions, ...dstSessions]) {
-        try { sftp.end(); } catch { /* already gone */ }
-      }
-      for (const acquiredConnection of [...srcAcquired, ...dstAcquired]) {
-        try { acquiredConnection.close(); } catch { /* already gone */ }
-      }
-    };
-
+    const reservations = new Map<string, TransferLaneReservation>();
+    for (const name of [...new Set([sourceName, destName])].sort()) {
+      reservations.set(name, await this.pool.reserveTransferLanes(name, connections));
+    }
     try {
       if (selfRelay) {
-        await this.openIndependentSftpSessions(sourceName, connections, "multi-relay-src", srcAcquired, srcSessions, timeout, debug);
+        await this.openLaneSessions(reservations.get(sourceName)!, "multi-relay-src", srcLanes, srcSessions, timeout, debug, fresh);
         // A second channel on each of the same connections for the writes.
         const writeChannels = await Promise.allSettled(
-          srcAcquired.map((acquiredConnection, index) =>
-            this.openSftp(acquiredConnection.client, `multi-relay-dst-${index}`, timeout, debug)),
+          srcLanes.map((lane, index) =>
+            this.openSftp(lane.client, `multi-relay-dst-${index}`, timeout, debug)),
         );
         for (const outcome of writeChannels) {
           if (outcome.status === "fulfilled") dstSessions.push(outcome.value);
@@ -2968,16 +2989,16 @@ export class TransferService {
       } else {
         // Both sides concurrently, and allSettled so that whichever side
         // fails, the other side's connections are still recorded -- and
-        // closed by closeAll() -- instead of leaking.
+        // released by the finally below -- instead of leaking.
         const sides = await Promise.allSettled([
-          this.openIndependentSftpSessions(sourceName, connections, "multi-relay-src", srcAcquired, srcSessions, timeout, debug),
-          this.openIndependentSftpSessions(destName, connections, "multi-relay-dst", dstAcquired, dstSessions, timeout, debug),
+          this.openLaneSessions(reservations.get(sourceName)!, "multi-relay-src", srcLanes, srcSessions, timeout, debug, fresh),
+          this.openLaneSessions(reservations.get(destName)!, "multi-relay-dst", dstLanes, dstSessions, timeout, debug, fresh),
         ]);
         const failedSide = sides.find((outcome) => outcome.status === "rejected");
         if (failedSide) throw (failedSide as PromiseRejectedResult).reason;
       }
-      const srcClient = srcAcquired[0].client;
-      const dstClient = selfRelay ? srcClient : dstAcquired[0].client;
+      const srcClient = srcLanes[0].client;
+      const dstClient = selfRelay ? srcClient : dstLanes[0].client;
 
       const sourceSize = (await this.sftpStat(srcSessions[0], validatedSourcePath, "source")).size;
       if (skipIfIdentical) {
@@ -2985,6 +3006,7 @@ export class TransferService {
           sourceName, destName, srcClient, dstClient, dstSessions[0], validatedSourcePath, validatedDestPath, sourceSize,
         );
         if (skipped) {
+          succeeded = true;
           return appendDebugOutput(skipped, debugCollector);
         }
       }
@@ -3017,7 +3039,7 @@ export class TransferService {
       } finally {
         // After a failure closeAll() has already ended every session; a CLOSE
         // sent on an ended session would never be answered.
-        if (!sessionsClosed) {
+        if (!releaser.released) {
           for (const [index, handle] of srcHandles.entries()) {
             try { await this.sftpCloseFile(srcSessions[index], handle); } catch { /* best-effort */ }
           }
@@ -3052,6 +3074,7 @@ export class TransferService {
 
       await this.replaceRemoteFile(dstSessions[0], tempPath, validatedDestPath, debug);
       remoteTempPath = null;
+      succeeded = true;
       const srcConfig = this.pool.getConfig(sourceName);
       const dstConfig = this.pool.getConfig(destName);
       return appendDebugOutput(
@@ -3063,7 +3086,7 @@ export class TransferService {
     } catch (error) {
       throw appendDebugToError(error as Error, debugCollector);
     } finally {
-      closeAll();
+      releaser.release(succeeded);
       if (remoteTempPath) {
         await this.removeRemoteFileBestEffort(destName, remoteTempPath, timeout, debug);
       }

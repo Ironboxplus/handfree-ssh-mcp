@@ -400,6 +400,8 @@ Independent *connections* is the point, and it is not the same as opening more S
 
 This helps on **high-latency** links, where one connection's window bounds throughput to roughly window/RTT. It does nothing useful on a fast LAN. Each connection is a separate SSH handshake, and all of them are made concurrently (so the cost is about one handshake, not N), which makes sshd's `MaxStartups` the remote limit that matters, not `MaxSessions` — OpenSSH's default `10:30:100` starts dropping unauthenticated connections at 10.
 
+The connections are **pooled per server**: a successful transfer parks them, and the next multi-connection download, upload or relay on that server reuses them without any handshake. At most 8 exist per server — a transfer that needs more than are free waits for them, and a relay reserves both servers in a fixed order so two opposite relays cannot deadlock. Idle connections close after 60 s, and `close-connection` closes them at once. A failed transfer closes its connections rather than pooling them, and a pooled connection found dead is replaced transparently. `reuseConnection=false` bypasses the pool: fresh connections, closed afterwards.
+
 Measured on a real `tc netem` lab link at 50 ms / 1 Gbps (128 MiB file, median of 3 runs, SHA-256 verified every run):
 
 | setting | throughput |
@@ -408,6 +410,8 @@ Measured on a real `tc netem` lab link at 50 ms / 1 Gbps (128 MiB file, median o
 | `connections: 2` | 28.54 MiB/s |
 | `connections: 4` | 45.71 MiB/s |
 | `connections: 8` | 53.86 MiB/s |
+
+That table is a **first call**, with every handshake inside the timing. A repeated call on the same server reuses the pooled connections and skips them: in the same lab, repeated calls measured 35.2 MiB/s at `2`, 63.2 at `4` and 82.8 at `8` (the 4-connection first call measured 45.6 in that run; the ~0.8 s difference is one concurrent handshake round).
 
 Those numbers describe that one shaped link only; your own gain depends on RTT and bandwidth. Returns diminish past `4`. (Releases before 2.1.4 opened the connections one after another, which cost ~0.7 s per connection on that link and made `8` no faster than a single connection; the data path itself was never the bottleneck.) `connections` applies to single files only and is rejected for relay `strategy: "direct"`/`"auto"`, a batch (array) `localPath`, `recursive: true`, and `archive: true`.
 
@@ -424,7 +428,7 @@ Measured uploading a 128 MiB file at 50 ms RTT (SHA-256 verified inside the cont
 | `connections: 4` | 43.48 MiB/s |
 | `connections: 8` | 44.92 MiB/s |
 
-The gains are smaller than for download. Those figures include about 0.7 s of connection setup per call, which a larger file amortizes. In that lab only the server-to-client direction is bandwidth-shaped, so the upload numbers reflect the 50 ms RTT but no 1 Gbps ceiling.
+The gains are smaller than for download. Those figures include about 0.7 s of connection setup per call. With the pool, repeated uploads skip it: 38.9 MiB/s at `2`, 53.9 at `4`, 52.7 at `8` against 29.1 for one connection. In that lab only the server-to-client direction is bandwidth-shaped, so the upload numbers reflect the 50 ms RTT but no 1 Gbps ceiling.
 
 ### Multi-connection relay
 
@@ -439,7 +443,7 @@ Measured relaying a 128 MiB file between two lab containers, with the source →
 | `connections: 4` | 33.64 MiB/s |
 | `connections: 8` | 31.71 MiB/s |
 
-`8` was no faster than `4` there; use `4`.
+`8` was no faster than `4` there; use `4`. Repeated relays on pooled connections measured 26.6 MiB/s at `2`, 37.3 at `4` and 37.0 at `8`.
 
 ### `execute-command` output capping & full logs
 
