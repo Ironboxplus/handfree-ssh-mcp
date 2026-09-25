@@ -604,16 +604,22 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     assert.equal(server.stats.connectionCount, 0, "an invalid connections value must not open any connection");
   });
 
-  test("black-box: the transfer tool rejects connections for mode=upload, recursive=true, and archive=true", async () => {
-    const localFile = path.join(localRoot, "upload-source.txt");
-    fs.writeFileSync(localFile, "irrelevant");
-
-    const uploadResult = await mcpClient.callTool({
+  test("black-box: the transfer tool rejects connections for mode=relay, recursive=true, and archive=true", async () => {
+    // mode=upload accepts connections since P1-04f (see
+    // multi-connection-upload-real.test.ts); relay still does not.
+    const relayResult = await mcpClient.callTool({
       name: "transfer",
-      arguments: { mode: "upload", connectionName: "multiconn", localPath: localFile, remotePath: "/rejected-upload.txt", connections: 4 },
+      arguments: {
+        mode: "relay",
+        sourceServer: "multiconn",
+        sourceRemotePath: "/relay-source.bin",
+        destServer: "multiconn",
+        destRemotePath: "/relay-dest.bin",
+        connections: 4,
+      },
     });
-    assert.equal(uploadResult.isError, true);
-    assert.match(responseText(uploadResult), /connections is only supported for mode/);
+    assert.equal(relayResult.isError, true);
+    assert.match(responseText(relayResult), /connections is only supported for mode/);
 
     const remoteDir = "/reject-recursive-dir";
     const recursiveResult = await mcpClient.callTool({

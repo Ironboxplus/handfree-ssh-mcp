@@ -409,7 +409,22 @@ Measured on a real `tc netem` lab link at 50 ms / 1 Gbps (128 MiB file, median o
 | `connections: 4` | 45.71 MiB/s |
 | `connections: 8` | 53.86 MiB/s |
 
-Those numbers describe that one shaped link only; your own gain depends on RTT and bandwidth. Returns diminish past `4`. (Releases before 2.1.4 opened the connections one after another, which cost ~0.7 s per connection on that link and made `8` no faster than a single connection; the data path itself was never the bottleneck.) `connections` applies to single-file download only and is rejected for upload, `recursive: true`, and `archive: true`.
+Those numbers describe that one shaped link only; your own gain depends on RTT and bandwidth. Returns diminish past `4`. (Releases before 2.1.4 opened the connections one after another, which cost ~0.7 s per connection on that link and made `8` no faster than a single connection; the data path itself was never the bottleneck.) `connections` applies to single files only and is rejected for relay, a batch (array) `localPath`, `recursive: true`, and `archive: true`.
+
+### Multi-connection upload
+
+`upload` and `transfer mode=upload` accept the same `connections` (default `1`, maximum `8`). Above `1`, each byte range is written over its own independent SSH/TCP connection into **one remote temp file** next to the target. Only connection 0 creates/truncates it; the others open it without truncating. After every range succeeds and the temp file's size is verified, it replaces `remotePath` — as one atomic rename where the server advertises `posix-rename@openssh.com` (every OpenSSH does; verified against a real OpenSSH), otherwise by removing the old file and then renaming, which leaves a brief window where `remotePath` does not exist. If any connection fails, the temp file is deleted and `remotePath` keeps its previous contents. Skip-if-identical and the shell-script CRLF→LF fix still apply.
+
+Measured uploading a 128 MiB file at 50 ms RTT (SHA-256 verified inside the container every run, the same remote path overwritten each time):
+
+| setting | throughput |
+|---|---|
+| default single connection (`fastPut`) | 29.84 MiB/s |
+| `connections: 2` | 35.18 MiB/s |
+| `connections: 4` | 43.48 MiB/s |
+| `connections: 8` | 44.92 MiB/s |
+
+The gains are smaller than for download. Those figures include about 0.7 s of connection setup per call, which a larger file amortizes. In that lab only the server-to-client direction is bandwidth-shaped, so the upload numbers reflect the 50 ms RTT but no 1 Gbps ceiling.
 
 ### `execute-command` output capping & full logs
 

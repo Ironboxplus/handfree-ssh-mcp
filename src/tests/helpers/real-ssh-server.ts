@@ -40,6 +40,11 @@ export interface RealSshServerStats {
   // bookkeeping -- to prove striped download's ranges are non-overlapping
   // and exactly cover the file.
   readRequests: Array<{ offset: number; length: number }>;
+  // Multi-connection upload: the WRITE-side twin of readRequests -- every
+  // real WRITE's (offset, length) and the index of the connection it arrived
+  // on, since the last resetWriteLog(). Proves the ranges written are
+  // non-overlapping and cover the file exactly, from the server's side.
+  writeRequests: Array<{ offset: number; length: number; connectionIndex: number }>;
   // PLAN.MD P1-08a: cumulative count of real "exec" channel requests this
   // instance has received (covers md5sum/tar/the generic real-shell
   // fallback alike). Lets a test prove a rejected direct-transfer call made
@@ -136,6 +141,7 @@ export class RealSshTestServer {
     maxActiveReaddirs: 0,
     openDirRequests: 0,
     readRequests: [],
+    writeRequests: [],
     execCommandCount: 0,
     connectionCount: 0,
     activeHandshakes: 0,
@@ -183,6 +189,10 @@ export class RealSshTestServer {
   // genuinely rejected -- a real failed handshake for exactly one of several
   // concurrent connections, the others staying healthy.
   private rejectAuthForConnectionIndex: Set<number> | null = null;
+  // Multi-connection upload ("cancel the rest" proof): every WRITE on one of
+  // these connection indices gets a genuine SFTP FAILURE, the others stay
+  // healthy -- the WRITE-side twin of failReadsForConnectionIndex.
+  private failWritesForConnectionIndex: Set<number> | null = null;
   // PLAN.MD P1-08a: parsed once in the constructor from
   // directExecOptions.authorizedPublicKeyPem (see below), or undefined when
   // that option is omitted -- `any` because ssh2's ParsedKey type isn't
@@ -402,6 +412,16 @@ export class RealSshTestServer {
     this.stats.readRequests.length = 0;
   }
 
+  /** Same reasoning as resetReadLog(), for the WRITE log. */
+  public resetWriteLog(): void {
+    this.stats.writeRequests.length = 0;
+  }
+
+  /** See failWritesForConnectionIndex above; null clears it. */
+  public setFailWritesForConnectionIndices(indices: number[] | null): void {
+    this.failWritesForConnectionIndex = indices ? new Set(indices) : null;
+  }
+
   /**
    * From the (count+1)-th real READ request onward (counting from the
    * current resetReadLog() baseline), respond with a genuine SFTP
@@ -567,6 +587,10 @@ export class RealSshTestServer {
     });
     sftp.on("WRITE", (requestId: number, handle: Buffer, offset: number, data: Buffer) => {
       trace("WRITE", `offset=${offset} length=${data.length}`);
+      this.stats.writeRequests.push({ offset, length: data.length, connectionIndex });
+      if (this.failWritesForConnectionIndex?.has(connectionIndex)) {
+        return sftp.status(requestId, STATUS_CODE.FAILURE, "injected per-connection write failure (test)");
+      }
       const state = lookupHandle(handle);
       if (!state || state.kind !== "file") return sftp.status(requestId, STATUS_CODE.FAILURE);
       this.stats.activeWrites++;
@@ -607,6 +631,23 @@ export class RealSshTestServer {
     sftp.on("MKDIR", (requestId: number, remotePath: string, attrs: { mode?: number }) => {
       trace("MKDIR", remotePath);
       fs.mkdir(this.toLocalPath(remotePath), { mode: attrs.mode ?? 0o755 }, (error) =>
+        error ? fail(requestId, error) : sftp.status(requestId, STATUS_CODE.OK));
+    });
+    // SFTP v3 RENAME with OpenSSH's semantics: it FAILS when the target
+    // already exists (OpenSSH's sftp-server uses link()+unlink() for exactly
+    // this reason), unlike Node's fs.rename, which silently overwrites. A
+    // client that only works because the fixture overwrote for it would
+    // break against every real server; overwriting atomically needs the
+    // posix-rename@openssh.com extension, which ssh2's server-side VERSION
+    // reply cannot advertise -- so this fixture always exercises the plain
+    // RENAME fallback.
+    sftp.on("RENAME", (requestId: number, oldPath: string, newPath: string) => {
+      trace("RENAME", `${oldPath} -> ${newPath}`);
+      const target = this.toLocalPath(newPath);
+      if (fs.existsSync(target)) {
+        return sftp.status(requestId, STATUS_CODE.FAILURE, "target exists");
+      }
+      fs.rename(this.toLocalPath(oldPath), target, (error) =>
         error ? fail(requestId, error) : sftp.status(requestId, STATUS_CODE.OK));
     });
     sftp.on("REMOVE", (requestId: number, remotePath: string) => {

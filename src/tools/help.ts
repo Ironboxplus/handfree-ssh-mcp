@@ -136,6 +136,20 @@ Parameters:
                   Both report a per-file uploaded/skipped/failed status.
   fileConcurrency (number, optional)   Batch mode only. Independent files
                   uploaded in parallel. Default 4, maximum 8.
+  connections     (number, optional)   Single file only (not batch). Default 1
+                  (unchanged behavior). Above 1, write the file over that many
+                  INDEPENDENT SSH/TCP connections, each carrying its own
+                  non-overlapping byte range into one remote temp file that
+                  then replaces remotePath -- atomically where the server
+                  supports posix-rename@openssh.com (OpenSSH does), otherwise
+                  by removing the old file first. A failure on any connection
+                  leaves remotePath untouched. Maximum 8. The handshakes run
+                  concurrently, so sshd's MaxStartups is the limit that
+                  matters, not MaxSessions. Helps on high-latency links;
+                  pointless on a fast LAN. Measured uploading 128 MiB at
+                  50 ms RTT (one connection 29.8 MiB/s): 2 -> 35.2,
+                  4 -> 43.5, 8 -> 44.9 MiB/s -- smaller than download's
+                  gains; the figures include ~0.7 s of connection setup.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -242,16 +256,18 @@ Parameters for upload / download:
                   recursion stays sequential; no multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
-  connections     (number, optional)   mode="download", single file only.
-                  Default 1 (unchanged). Above 1, split the file into that many
-                  non-overlapping byte ranges pulled over that many INDEPENDENT
-                  SSH/TCP connections, reassembled, verified, atomically
-                  renamed. Maximum 8. Helps on high-latency links; pointless on
-                  a fast LAN. Separate, concurrent handshakes, so sshd's
+  connections     (number, optional)   mode="download" or "upload", single file
+                  only. Default 1 (unchanged). Above 1, split the file into
+                  that many non-overlapping byte ranges moved over that many
+                  INDEPENDENT SSH/TCP connections, reassembled, verified,
+                  renamed into place (see the download/upload help).
+                  Maximum 8. Helps on high-latency links; pointless on a
+                  fast LAN. Separate, concurrent handshakes, so sshd's
                   MaxStartups is the limit that matters, not MaxSessions.
-                  Measured on 50 ms / 1 Gbps (one connection 17.5 MiB/s):
-                  2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s. Rejected for
-                  upload, recursive=true and archive=true.
+                  Download measured on 50 ms / 1 Gbps (one connection
+                  17.5 MiB/s): 2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s.
+                  Rejected for relay, a batch (array) localPath,
+                  recursive=true and archive=true.
   fileConcurrency (number, optional)   Recursive or batch upload only: independent
                   files transferred in parallel. Default 4, maximum 8. Each
                   parallel file opens its own SFTP channel on the same SSH

@@ -186,7 +186,22 @@ servers:
 | `connections: 4` | 45.71 MiB/s |
 | `connections: 8` | 53.86 MiB/s |
 
-以上数字只对那一条被整形的链路成立，实际收益取决于你自己链路的 RTT 与带宽。超过 `4` 之后收益递减。（2.1.4 之前的版本是一条接一条地建连，在那条链路上每条约 0.7 秒，导致 `8` 与单连接一样慢；数据通路本身从来不是瓶颈。）`connections` 仅适用于单文件下载，对 upload、`recursive: true`、`archive: true` 均会被拒绝。
+以上数字只对那一条被整形的链路成立，实际收益取决于你自己链路的 RTT 与带宽。超过 `4` 之后收益递减。（2.1.4 之前的版本是一条接一条地建连，在那条链路上每条约 0.7 秒，导致 `8` 与单连接一样慢；数据通路本身从来不是瓶颈。）`connections` 仅适用于单个文件，对 relay、批量（数组）`localPath`、`recursive: true`、`archive: true` 均会被拒绝。
+
+### 多连接上传
+
+`upload` 与 `transfer mode=upload` 也接受同样的 `connections`（默认 `1`，上限 `8`）。大于 `1` 时，每个字节区间经各自独立的 SSH/TCP 连接写入目标旁边的**同一个远端临时文件**：只有第 0 条连接负责创建/截断，其余连接打开时不截断。所有区间成功、临时文件大小校验通过后，才替换 `remotePath`——对端声明 `posix-rename@openssh.com` 时（OpenSSH 均支持，已在真实 OpenSSH 上验证）是一次原子改名；否则先删除旧文件再改名，期间 `remotePath` 会短暂不存在。任一连接失败时，临时文件被删除，`remotePath` 保持原内容不变。跳过相同文件与 shell 脚本 CRLF→LF 修正照常生效。
+
+在 50 ms RTT 下上传 128 MiB 文件的实测结果（每次都在容器内校验 SHA-256，且每次覆盖同一个远端路径）：
+
+| 设置 | 吞吐 |
+|---|---|
+| 默认单连接（`fastPut`） | 29.84 MiB/s |
+| `connections: 2` | 35.18 MiB/s |
+| `connections: 4` | 43.48 MiB/s |
+| `connections: 8` | 44.92 MiB/s |
+
+收益小于下载。以上数字包含每次调用约 0.7 秒的建连时间，文件越大这部分占比越小。该实验环境只对服务端到客户端方向做了带宽整形，所以上传数字体现的是 50 ms RTT 的影响，没有 1 Gbps 上限。
 
 ### 🏃 workspace-run（远程运行）
 

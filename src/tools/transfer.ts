@@ -113,7 +113,7 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
         "Recursive upload/download only: maximum independent files transferred in parallel. Default 4, maximum 8. Each file transferred in parallel opens its own SFTP channel on the same SSH connection, and the cap is kept under OpenSSH's common default MaxSessions=10 so it does not reliably fail against a default-configured remote sshd. This improves directory trees with many small files without creating an archive.",
       ),
       connections: z.number().int().positive().optional().describe(
-        "mode=\"download\" only, single file (not recursive, not archive, not batch). Default 1 (today's single-connection behavior, unchanged). A value above 1 pulls the file over that many independent SSH/TCP connections, each fetching its own non-overlapping byte range; maximum 8. Each connection is a separate TCP+SSH handshake, not an extra channel on one connection, and all N handshakes happen concurrently -- so the relevant remote limit is sshd's MaxStartups (concurrent unauthenticated connections; OpenSSH's default 10:30:100 starts dropping at 10), not MaxSessions. Measured on a 50ms/1Gbps link against 17.5 MiB/s for one connection: 2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s, i.e. diminishing returns past 4. Gains depend on your link's RTT and bandwidth; none on a fast LAN. Ignores fast/sftpConcurrency/chunkSize and reuseConnection when above 1.",
+        "mode=\"download\" or mode=\"upload\", single file only (not recursive, not archive, not batch; rejected for relay). Default 1 (today's single-connection behavior, unchanged). A value above 1 moves the file over that many independent SSH/TCP connections, each carrying its own non-overlapping byte range; maximum 8. Upload writes one remote temp file that then replaces remotePath (atomically where the server supports posix-rename@openssh.com, as OpenSSH does; otherwise the old file is removed first), and a failure leaves remotePath untouched. Each connection is a separate TCP+SSH handshake, not an extra channel on one connection, and all N handshakes happen concurrently -- so the relevant remote limit is sshd's MaxStartups (concurrent unauthenticated connections; OpenSSH's default 10:30:100 starts dropping at 10), not MaxSessions. Download measured on a 50ms/1Gbps link against 17.5 MiB/s for one connection: 2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s, i.e. diminishing returns past 4. Upload of 128 MiB at 50ms RTT against 29.8 MiB/s for one connection: 2 -> 35.2, 4 -> 43.5, 8 -> 44.9 MiB/s. Gains depend on your link's RTT and bandwidth; none on a fast LAN. Ignores fast/sftpConcurrency/chunkSize and reuseConnection when above 1.",
       ),
       archive: z.boolean().optional().describe(
         "When true, package the source file/directory into one temporary tar, transfer it, extract it into the destination directory, then clean both temporary archives. Default false.",
@@ -142,15 +142,18 @@ For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePa
             false,
           );
         }
-        // connections is single-file download only -- reject it up front for
-        // every other mode/shape rather than silently ignoring it.
+        // connections is single-file download/upload only -- reject it up
+        // front for every other mode/shape rather than silently ignoring it.
         if (connections !== undefined) {
-          if (mode !== "download") {
+          if (mode === "relay") {
             throw new ToolError(
               "INVALID_CONFIGURATION",
-              `connections is only supported for mode="download", not mode="${mode}"`,
+              `connections is only supported for mode="download" or mode="upload", not mode="${mode}"`,
               false,
             );
+          }
+          if (Array.isArray(localPath)) {
+            throw new ToolError("INVALID_CONFIGURATION", "connections is not supported with a batch (array) localPath", false);
           }
           if (archive) {
             throw new ToolError("INVALID_CONFIGURATION", "connections is not supported with archive=true", false);

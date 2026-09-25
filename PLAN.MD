@@ -1087,6 +1087,59 @@ PLAN 正文 §2 要的是「多连接单文件分片」，`PLAN.MD:81` 甚至专
 
 **仍存在的差距（记账）**：修复后的 `connections=4` 总耗时 2800 ms 中，约 700 ms 仍是一次握手——对 128 MiB 的文件占 25%，文件越大占比越小。这是一次性连接的固有成本，本轮不处理。另外 benchmark 首轮的单连接 baseline 出现过一次 14.34 MiB/s（其余各轮均为 ~17.5），倍数一律以修复后同一轮的 17.54 计。
 
+### P1-04f 多连接单文件上传（2026-09-25 立项并交付，2.2.0）
+
+**为什么现在做**：P1-04e 证明多**连接**在 50 ms/1 Gbps 上对下载有 2.6–3.1× 收益，瓶颈是每连接一个 2 MiB 的 SSH channel 窗口。上传同样受这个窗口约束（对端 OpenSSH `CHAN_SES_WINDOW_DEFAULT` = 64 × 32 KiB = 2 MiB），目前没有任何加速手段。P1-05 已作废，它是多 **channel** 方案，前提不成立；本任务与其**机制不同**。
+
+**措辞锁定（吸取 P1-04 的教训）**：每个区间走一条**独立的 TCP+SSH 连接**（`acquireSshClient({reuseConnection:false})`）。不接受「channel 或 connection」这样的二选一写法；灰盒测试必须用服务端的真实连接计数证明连接数，而不是 channel 数。
+
+范围与契约：
+- [x] `upload` 与 `transfer mode=upload` 新增 `connections`（默认 1 = 现有行为逐字节不变，上限 8，校验失败不开任何连接）；数组 `localPath`（批量）、`recursive`、`archive` 下拒绝。>1 时忽略 `fast`/`sftpConcurrency`/`chunkSize`/`reuseConnection`，与下载一致。
+- [x] N 条连接**并发**建立（沿用 P1-04e 的结论），一条握手失败时其余已连上的全部关闭，不泄漏。
+- [x] skip-if-identical 照旧生效（复用既有判定，不重写），命中则零 WRITE。
+- [x] 写入同目录下的远端 temp 文件，**只创建/截断一次**（第一条连接 `w`），其余连接以 `r+` 打开，**绝不带 truncate**（P1-05 前两条的不变量，本任务继承）。各连接写不重叠区间，每连接流水线 64 × 32 KiB。
+- [x] 完成后校验远端 temp 大小，再替换正式目标：对端声明 `posix-rename@openssh.com` 时原子覆盖；否则退化为「目标存在则先 REMOVE，再 RENAME」，存在一个目标短暂缺失的窗口，文档写明。
+- [x] 任一连接失败：取消其余，删除远端 temp，**正式目标保持原样**（原有内容不被破坏）。
+- [x] shell 脚本的 CRLF→LF 修正在多连接下仍然生效（源为修正后的内存 buffer）。
+
+验收：
+- [x] **P1-04f-A1**（黑盒）：真实 SFTP 服务器，非整除大小文件经 `upload`/`transfer` 以 `connections=4` 上传，远端 SHA-256 一致，无 temp 残留；覆盖已有目标。
+- [x] **P1-04f-A2**（灰盒）：服务端真实计数——连接数 = N 且握手并发峰值 = N；服务端 WRITE 日志不重叠且精确覆盖；指定连接写失败时目标原内容不变、temp 被删、连接全部关闭。
+- [x] **P1-04f-A3**（白盒）：区间划分复用已穷举的 `computeDownloadByteRanges`（与方向无关），不另写一份。
+- [x] **P1-04f-A4**（真机）：`.88` netem lab 同一 harness 测上传吞吐（单连接 vs 2/4/8），每次在容器内校验 SHA-256；反复覆盖同一目标，走真实 OpenSSH 的 `posix-rename`。未测出收益则不发布该参数。
+
+#### P1-04f 执行结果（2026-09-25）
+
+实现：`transfer-service.ts` `uploadMultiConnection` / `uploadByteRangeWorker` / `replaceRemoteFile` / `removeRemoteFileBestEffort`。与下载共用两段抽出的逻辑，不复制：`openIndependentSftpSessions`（P1-04e 的并发建连 + `allSettled` 防泄漏）与 `runRangeWorkersFailFast`（原先内联在下载里的 fail-fast 调度 + 不活动看门狗）。skip-if-identical 判定抽成 `decideUploadSkip`，单连接与多连接两条路径共用。区间划分复用 `computeDownloadByteRanges`（与方向无关，P1-04f-A3 不另写一份）。
+
+测试（`multi-connection-upload-real.test.ts`，14 项，真实 ssh2 服务器）。fixture 新增服务端 WRITE 日志 `writeRequests`（带连接编号）、按连接编号注入写失败 `setFailWritesForConnectionIndices`，以及 **OpenSSH 语义的 `RENAME`（目标已存在则失败）**。Node 的 `fs.rename` 会静默覆盖，若 fixture 照搬它，客户端「靠 fixture 帮忙覆盖」才能通过的 bug 在真实服务器上会直接失败。ssh2 服务端的 SFTP `VERSION` 回复写死、无法声明扩展，所以 fixture 覆盖的是回退路径；`posix-rename` 路径由真机覆盖（见下）。
+- RED：实现前 9/14 失败，均失败在目标断言上。
+- **变异验证**：
+  - 去掉回退路径中「先删除已存在目标」→「覆盖已有目标」用例变红。
+  - 失败时不删远端 temp → 「写失败保留原目标」用例变红（temp 残留）。
+  - **其他连接改用会截断的 `w` 打开 temp → 仍然全绿，这是等价变异**：当前实现里所有 open 都在任何写入开始前完成，截断的只是空文件。`r+` 作为防御性写法保留，并在代码注释里如实写明「此项未被测试锁住、为什么锁不住」，不把它当成已被验证的性质。
+  - 我设计的第 4 个「对照变异」本身写错了（rename 成功后又删了目标），结果无效，作废。
+
+真机验证：
+- **posix-rename**：用本地构建直接对 `.88` 的真实 OpenSSH 上传 3 MiB 文件、`connections=4`，连续两轮，第二轮覆盖已存在的文件。两轮的调试输出都是 `via posix-rename@openssh.com (atomic)`，回读 SHA-256 一致；远端零残留。
+- **吞吐（P1-04f-A4）**：`.88` netem lab，128 MiB，median of 3，每次在容器内校验 SHA-256，每次覆盖同一远端路径：
+
+| 上传 | 吞吐 | 相对单连接 |
+|---|---|---|
+| `connections=1`（fastPut，现有路径） | 29.84 MiB/s | 1.00× |
+| `connections=2` | 35.18 MiB/s | 1.18× |
+| `connections=4` | 43.48 MiB/s | 1.46× |
+| `connections=8` | 44.92 MiB/s | 1.51× |
+
+同轮下载复测：`connections=4` 46.08、`8` 54.70 MiB/s，与 P1-04e 一致。
+
+**必须如实记下的口径问题**：
+1. 单连接 baseline 复用 warm-up 已建好的连接，计时不含握手；多连接每次都新建连接，计时含约 0.69 s 握手，对 128 MiB 占比很大。扣除后 `connections=4` 的数据阶段约 57 MiB/s，即约 1.9×。**这是推算，未实测**，产品文档只写上表的实测值。
+2. netem 只装在容器 `eth0` **出口**：下载的数据方向被整形，上传的数据方向**没有被限速**，只有回程的 ACK/窗口调整带 50 ms 延迟。因此上传数字测到的是「50 ms RTT 下每连接受窗口限制」，不含 1 Gbps 上限。这也解释了上传 baseline（29.8）为什么高于下载（17.5）。
+
+结论：收益真实但小于下载，达到 A4「测出收益才发布」的门槛。`connections=8` 相对 4 几乎无增益（+3%），数据阶段约 60 MiB/s 的平台期原因**未定位**，记账。
+
+
 ### P1-05 Capability-gated striped upload 〔2026-09-16 作废〕
 
 **状态：作废，未开工。** 本任务是 striped download 的上传镜像。P1-04b 在真实 netem lab 上证明 striped 的多 channel 架构不产生加速（比 baseline 慢 2.3 倍，原因见 P1-04b 执行结果），striped download 已整体删除，上传镜像的前提随之消失。下方条目保留供存档，不再是欠债。
@@ -1239,7 +1292,7 @@ Rev.4 修正：本任务原先被排在 `P1-01 → P1-02 → P1-09`，即等 Tra
 | 用户目标 | 状态 | 对应任务 |
 |---|---|---|
 | 批量上传 | ✅ 已交付 `d0dc039` | P1-09 |
-| 传输加速 | 🔄 部分 | P1-04d/P1-04e ✅ 多连接单文件下载（2.1.4，50 ms/1 Gbps 实测 `connections=4` 2.61×、`8` 3.07×；**仅 download 方向**）；P1-03a ✅ `8244a90`；P1-04a `06b1552` **已删除**（P1-04b 真机证伪，striped 比 baseline 慢 2.3×）；P1-04b 已跑出真实数字（`fast` 19.5 MiB/s = 线速 16.4%），下一步杠杆「提高在途字节数」已记账未做 |
+| 传输加速 | 🔄 部分 | P1-04d/P1-04e ✅ 多连接单文件下载（2.1.4，50 ms/1 Gbps 实测 `connections=4` 2.61×、`8` 3.07×）；P1-04f ✅ 多连接单文件上传（2.2.0，50 ms RTT 实测 `connections=4` 1.46×）；P1-03a ✅ `8244a90`；P1-04a `06b1552` **已删除**（P1-04b 真机证伪，striped 比 baseline 慢 2.3×）；P1-04b 已跑出真实数字（`fast` 19.5 MiB/s = 线速 16.4%），下一步杠杆「提高在途字节数」已记账未做 |
 | 远程运行 | ⬜ 本节 | P2-01/02/03/04/05/06 |
 | 两服务器直传 | ✅ 已交付 | P1-08a（P1-08b 的 rclone/agent-forward/daemon 崩溃重入按 Rev.4 不适用） |
 

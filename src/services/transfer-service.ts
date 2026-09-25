@@ -63,11 +63,12 @@ export type SftpOptions = {
   chunkSize?: number;
   fileConcurrency?: number;
   /**
-   * Multi-connection single-file download only (see TransferService.download).
-   * 1 (default) is exactly today's single-connection behavior, unchanged.
-   * >1 pulls the file over that many independent SSH/TCP connections, each
-   * fetching its own non-overlapping byte range. Ignored/rejected outside
-   * download (see registerTransferTool's validation).
+   * Multi-connection single-file download and upload (see
+   * TransferService.download/upload). 1 (default) is exactly today's
+   * single-connection behavior, unchanged. >1 moves the file over that many
+   * independent SSH/TCP connections, each carrying its own non-overlapping
+   * byte range. Rejected for batch, recursive and archive transfers (see the
+   * upload/transfer tools' validation).
    */
   connections?: number;
 };
@@ -419,8 +420,8 @@ export class TransferService {
   private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = 8;
   private static readonly ARCHIVE_ERROR_OUTPUT_BYTES = 16 * 1024;
 
-  // Multi-connection single-file download (see download()/downloadMultiConnection
-  // below). Each connection is a full independent TCP+SSH handshake, not an
+  // Multi-connection single-file download and upload (see
+  // downloadMultiConnection/uploadMultiConnection below). Each connection is a full independent TCP+SSH handshake, not an
   // extra channel on a shared connection -- the relevant remote limit is
   // sshd's MaxStartups (concurrent unauthenticated connection attempts), not
   // MaxSessions (channels per connection, which is what
@@ -428,8 +429,8 @@ export class TransferService {
   // conservative ceiling given MaxStartups' common default (10); operators
   // running many concurrent multi-connection downloads against the same host
   // may need to raise it.
-  private static readonly MAX_DOWNLOAD_CONNECTIONS = 8;
-  // Per-connection read chunk size for multi-connection download. Deliberately
+  private static readonly MAX_TRANSFER_CONNECTIONS = 8;
+  // Per-connection chunk size for multi-connection download/upload. Deliberately
   // its own constant rather than reusing the `chunkSize` fast-download option:
   // this path never calls ssh2 fastGet, so overloading that option's meaning
   // here would make one field mean two unrelated things depending on an
@@ -447,7 +448,7 @@ export class TransferService {
   // measured 23.37 MiB/s at 4 connections where the same 4 connections
   // running ssh2 fastGet reached 60.62. Keeping the chunk to one round trip
   // makes DEPTH x CHUNK the true in-flight figure.
-  private static readonly MULTI_CONNECTION_READ_CHUNK_BYTES = 32 * 1024;
+  private static readonly MULTI_CONNECTION_CHUNK_BYTES = 32 * 1024;
   // Concurrent SFTP READs kept outstanding per connection. DEPTH x CHUNK =
   // 64 x 32 KiB = 2 MiB, which is exactly ssh2's hardcoded per-connection SSH
   // channel window (MAX_WINDOW, lib/Channel.js:15) and exactly the shape
@@ -566,7 +567,7 @@ export class TransferService {
   private sftpOpenFile(
     sftp: SFTPWrapper,
     remotePath: string,
-    mode: "r" | "w",
+    mode: "r" | "w" | "r+",
     mapError: (error: Error) => Error,
   ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
@@ -896,11 +897,12 @@ export class TransferService {
   }
 
   /**
-   * Resolve the requested connection count for a multi-connection download.
+   * Resolve the requested connection count for a multi-connection download
+   * or upload.
    * Validated (and, on failure, rejected) BEFORE any connection is opened, so
    * an invalid request never opens even one extra TCP/SSH handshake.
    */
-  private resolveDownloadConnections(options?: SftpOptions): number {
+  private resolveTransferConnections(options?: SftpOptions): number {
     const requested = options?.connections;
     if (requested === undefined) {
       return 1;
@@ -908,10 +910,10 @@ export class TransferService {
     if (!Number.isInteger(requested) || requested < 1) {
       throw new ToolError("INVALID_CONFIGURATION", "connections must be a positive integer", false);
     }
-    if (requested > TransferService.MAX_DOWNLOAD_CONNECTIONS) {
+    if (requested > TransferService.MAX_TRANSFER_CONNECTIONS) {
       throw new ToolError(
         "INVALID_CONFIGURATION",
-        `connections must not exceed ${TransferService.MAX_DOWNLOAD_CONNECTIONS}`,
+        `connections must not exceed ${TransferService.MAX_TRANSFER_CONNECTIONS}`,
         false,
       );
     }
@@ -1162,6 +1164,9 @@ export class TransferService {
     const validatedLocalPath = this.validateLocalPath(localPath, resolvedName);
     const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
     const skipIfIdentical = options?.skipIfIdentical !== false; // default true
+    // Validated BEFORE anything else opens a connection, so a request for an
+    // invalid connection count never opens even one extra handshake.
+    const connections = this.resolveTransferConnections(options);
 
     // ---- Read local file (stat + content as Buffer) ----
     let stat: fs.Stats;
@@ -1222,6 +1227,28 @@ export class TransferService {
       ? ` (${TransferService.CRLF_FIX_MARKER}: converted ${crlfFixed.replacedCount} line endings to LF before upload because target is a shell script).`
       : "";
 
+    if (connections > 1) {
+      debug?.(`[mcp] sftp multi-connection upload on [${resolvedName}], connections=${connections}`);
+      try {
+        const message = await this.uploadMultiConnection(
+          resolvedName,
+          validatedLocalPath,
+          validatedRemotePath,
+          payload,
+          payload?.length ?? stat.size,
+          isShellScript,
+          skipIfIdentical,
+          crlfNote,
+          connections,
+          options?.timeout,
+          debug,
+        );
+        return appendDebugOutput(message, debugCollector);
+      } catch (error) {
+        throw appendDebugToError(error as Error, debugCollector);
+      }
+    }
+
     debug?.(`[mcp] sftp upload on [${resolvedName}], reuseConnection=${reuseConnection}`);
     let connection: AcquiredSshClient | null = null;
     try {
@@ -1235,27 +1262,19 @@ export class TransferService {
 
       // ---- Skip-if-identical check ----
       if (skipIfIdentical) {
-        const decision = payload
-          ? await this.shouldSkipUpload(
-              client,
-              payload,
-              validatedRemotePath,
-              isShellScript,
-              options?.timeout,
-              debug,
-            )
-          : await this.shouldSkipFastUpload(
-              client,
-              validatedLocalPath,
-              stat.size,
-              validatedRemotePath,
-              options?.timeout,
-              debug,
-            );
+        const decision = await this.decideUploadSkip(
+          client,
+          payload,
+          validatedLocalPath,
+          stat.size,
+          validatedRemotePath,
+          isShellScript,
+          options?.timeout,
+          debug,
+        );
         if (decision.skip) {
           return appendDebugOutput(
-            `${TransferService.UPLOAD_SKIPPED_PREFIX} remote file '${validatedRemotePath}' is already identical to local ` +
-              `'${validatedLocalPath}' (${decision.reason}).${crlfNote}`,
+            TransferService.uploadSkippedMessage(validatedRemotePath, validatedLocalPath, decision.reason, crlfNote),
             debugCollector,
           );
         }
@@ -1289,6 +1308,30 @@ export class TransferService {
     } finally {
       connection?.close();
     }
+  }
+
+  /** The single-file skip-if-identical decision, shared by the single- and
+   * multi-connection upload paths: an in-memory payload (buffered path, or a
+   * CRLF-fixed shell script) is compared as bytes; otherwise the local file
+   * is compared without being read into memory. */
+  private decideUploadSkip(
+    client: Client,
+    payload: Buffer | null,
+    localPath: string,
+    localSize: number,
+    remotePath: string,
+    isShellScript: boolean,
+    timeout?: number,
+    debug?: SshDebugSink,
+  ): Promise<{ skip: boolean; reason: string }> {
+    return payload
+      ? this.shouldSkipUpload(client, payload, remotePath, isShellScript, timeout, debug)
+      : this.shouldSkipFastUpload(client, localPath, localSize, remotePath, timeout, debug);
+  }
+
+  private static uploadSkippedMessage(remotePath: string, localPath: string, reason: string, crlfNote: string): string {
+    return `${TransferService.UPLOAD_SKIPPED_PREFIX} remote file '${remotePath}' is already identical to local ` +
+      `'${localPath}' (${reason}).${crlfNote}`;
   }
 
   /**
@@ -1834,7 +1877,7 @@ export class TransferService {
     const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
     // Validated BEFORE anything else opens a connection, so a request for an
     // invalid connection count never opens even one extra handshake.
-    const connections = this.resolveDownloadConnections(options);
+    const connections = this.resolveTransferConnections(options);
 
     if (connections > 1) {
       debug?.(`[mcp] sftp multi-connection download on [${resolvedName}], connections=${connections}`);
@@ -1943,6 +1986,389 @@ export class TransferService {
    *     performed after the whole temp file's size has been verified -- it
    *     never exists in a partially-written state.
    */
+  /**
+   * Open `count` independent one-shot SSH connections, each with its own SFTP
+   * session, for multi-connection download and upload. Successes are pushed
+   * into the caller's `acquired`/`sftpSessions` so the caller's own cleanup
+   * owns them in every outcome; the first failure is thrown after ALL
+   * attempts have settled.
+   *
+   * All N are established CONCURRENTLY, before the file size is known.
+   * Measured on the real 50ms netem lab (PLAN.MD P1-04e), one handshake +
+   * SFTP open costs ~685ms there, and doing them one after another was the
+   * entire gap between multi-connection download and N parallel fastGets:
+   * connections=4 spent 2.7s of 4.9s connecting, connections=8 spent 5.5s of
+   * 7.1s (why 8 measured slower than 4). The data path was already at parity.
+   * Opening the rest only after a first connection had stat'ed the file would
+   * still cost two handshake rounds instead of one. The trade-off: a file
+   * smaller than N BYTES opens connections it then closes unused -- a
+   * transfer that small is negligible either way.
+   *
+   * Concurrent handshakes are what sshd's MaxStartups limits (default
+   * 10:30:100 -- random drops start at 10 unauthenticated connections), which
+   * the hard cap of 8 stays under.
+   *
+   * Every connection is a fresh one-shot handshake regardless of the caller's
+   * reuseConnection option: independent connections are this feature's
+   * entire mechanism, not something reuseConnection could meaningfully toggle
+   * off. allSettled, not all: if one handshake fails, the ones that succeeded
+   * must still be recorded so the caller releases them -- Promise.all would
+   * drop them on the floor, still connected.
+   */
+  private async openIndependentSftpSessions(
+    resolvedName: string,
+    count: number,
+    label: string,
+    acquired: AcquiredSshClient[],
+    sftpSessions: SFTPWrapper[],
+    timeout: number | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<void> {
+    const established = await Promise.allSettled(
+      Array.from({ length: count }, async (_, index) => {
+        const acquiredConnection = await this.pool.acquireSshClient(resolvedName, {
+          reuseConnection: false,
+          timeout,
+          debug,
+          purpose: "sftp",
+        });
+        try {
+          return {
+            acquiredConnection,
+            sftp: await this.openSftp(acquiredConnection.client, `${label}-${index}`, timeout, debug),
+          };
+        } catch (error) {
+          acquiredConnection.close();
+          throw error;
+        }
+      }),
+    );
+    for (const outcome of established) {
+      if (outcome.status === "fulfilled") {
+        acquired.push(outcome.value.acquiredConnection);
+        sftpSessions.push(outcome.value.sftp);
+      }
+    }
+    const firstFailure = established.find((outcome) => outcome.status === "rejected");
+    if (firstFailure) {
+      throw (firstFailure as PromiseRejectedResult).reason;
+    }
+  }
+
+  /**
+   * Run `count` range workers of a multi-connection transfer, one per
+   * connection, and settle as soon as the OUTCOME is known: resolve when all
+   * succeed, reject on the first failure (after setting the abort flag and
+   * calling `closeAll`).
+   *
+   * The abort flag is COOPERATIVE: a worker checks it before starting its
+   * NEXT chunk, so failing fast stops OTHER workers from scheduling further
+   * work. It cannot reach back into a request already in flight at the
+   * moment of failure -- ssh2 does not reliably reject an outstanding SFTP
+   * request just because this side ended the channel/connection mid-request
+   * (no Client/SFTP option changes that), so an in-flight request on another
+   * worker can be left permanently unsettled by closeAll(). That is exactly
+   * why this does NOT use Promise.all/allSettled to wait for every worker --
+   * the same fail-fast style relayWithPrefetchWindow uses for its own worker
+   * pool: an abandoned worker's dangling promise is simply never awaited,
+   * instead of hanging the whole transfer on it. The inactivity watchdog is
+   * the backstop for the remaining gap: the ONE worker whose outcome we are
+   * still waiting on getting stuck with no response at all.
+   */
+  private async runRangeWorkersFailFast(
+    count: number,
+    startWorker: (index: number, isAborted: () => boolean, onProgress: () => void) => Promise<void>,
+    closeAll: () => void,
+    timeout: number | undefined,
+    description: string,
+    debug: SshDebugSink | undefined,
+  ): Promise<void> {
+    if (count === 0) return;
+    let aborted = false;
+    await this.runWithInactivityTimeout<void>(
+      (onProgress) =>
+        new Promise<void>((resolve, reject) => {
+          let settled = false;
+          let remaining = count;
+          const fail = (error: unknown) => {
+            if (settled) return;
+            settled = true;
+            aborted = true;
+            closeAll();
+            reject(error);
+          };
+          const succeed = () => {
+            if (settled) return;
+            remaining -= 1;
+            if (remaining === 0) {
+              settled = true;
+              resolve();
+            }
+          };
+          for (let index = 0; index < count; index += 1) {
+            startWorker(index, () => aborted, onProgress).then(succeed, fail);
+          }
+        }),
+      this.transferStallTimeout(timeout),
+      description,
+      debug,
+      () => {
+        aborted = true;
+        closeAll();
+      },
+    );
+  }
+
+  /**
+   * Multi-connection single-file upload (PLAN.MD P1-04f): the upload twin of
+   * downloadMultiConnection. `size` bytes are split into non-overlapping
+   * ranges (the same exhaustively-tested computeDownloadByteRanges -- range
+   * arithmetic has no direction), each written over its OWN independent
+   * TCP+SSH connection. Each connection gets its own SSH channel window
+   * (OpenSSH's sftp-server advertises 2 MiB), which is the whole point.
+   *
+   * Safety properties:
+   *   - All bytes go to ONE remote temp file next to the target (same
+   *     directory, so the final rename never crosses a filesystem). It is
+   *     created and truncated exactly ONCE, by connection 0 opening it "w";
+   *     every other connection opens it "r+" -- write access, NEVER
+   *     truncate. Today every open completes before any range starts
+   *     writing, so a truncating open would only truncate an empty file and
+   *     no test can observe the difference (mutating "r+" to "w" stays green
+   *     -- verified). "r+" is kept because it is the correct mode the moment
+   *     that ordering changes: if a worker ever started as soon as its OWN
+   *     handle opened, a later "w" open would wipe ranges already written.
+   *   - The target is touched only after every range has succeeded and the
+   *     temp file's size has been verified; on any failure the temp file is
+   *     removed and the target keeps its previous contents.
+   */
+  private async uploadMultiConnection(
+    resolvedName: string,
+    localPath: string,
+    remotePath: string,
+    payload: Buffer | null,
+    size: number,
+    isShellScript: boolean,
+    skipIfIdentical: boolean,
+    crlfNote: string,
+    connections: number,
+    timeout: number | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<string> {
+    const acquired: AcquiredSshClient[] = [];
+    const sftpSessions: SFTPWrapper[] = [];
+    let remoteTempPath: string | null = null;
+    let localFd: number | null = null;
+    let sessionsClosed = false;
+
+    const closeAll = (): void => {
+      sessionsClosed = true;
+      for (const sftp of sftpSessions) {
+        try { sftp.end(); } catch { /* already gone */ }
+      }
+      for (const acquiredConnection of acquired) {
+        try { acquiredConnection.close(); } catch { /* already gone */ }
+      }
+    };
+
+    try {
+      await this.openIndependentSftpSessions(resolvedName, connections, "multi-upload", acquired, sftpSessions, timeout, debug);
+
+      if (skipIfIdentical) {
+        const decision = await this.decideUploadSkip(
+          acquired[0].client, payload, localPath, size, remotePath, isShellScript, timeout, debug,
+        );
+        if (decision.skip) {
+          return TransferService.uploadSkippedMessage(remotePath, localPath, decision.reason, crlfNote);
+        }
+      }
+
+      const ranges = computeDownloadByteRanges(size, connections);
+      debug?.(
+        `[mcp] multi-connection upload: size=${size}, ${connections} connection(s) opened, ${ranges.length} range(s)`,
+      );
+      // The source: the in-memory payload when there is one (a CRLF-fixed
+      // shell script, or the buffered path), otherwise positional reads from
+      // the local file -- never the whole file in memory.
+      if (!payload) {
+        localFd = fs.openSync(localPath, "r");
+      }
+      const fd = localFd;
+      const readSource = (offset: number, length: number): Promise<Buffer> =>
+        payload
+          ? Promise.resolve(payload.subarray(offset, offset + length))
+          : this.readLocalPositional(fd!, offset, length);
+
+      const tempPath = `${remotePath}.handfree-upload-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tmp`;
+      const openError = (error: Error) => this.makeSftpError("Dest open error", error);
+      const handles: Buffer[] = [await this.sftpOpenFile(sftpSessions[0], tempPath, "w", openError)];
+      remoteTempPath = tempPath;
+      try {
+        handles.push(
+          ...(await Promise.all(
+            ranges.slice(1).map((_, offsetIndex) => this.sftpOpenFile(sftpSessions[offsetIndex + 1], tempPath, "r+", openError)),
+          )),
+        );
+        await this.runRangeWorkersFailFast(
+          ranges.length,
+          (index, isAborted, onProgress) =>
+            this.uploadByteRangeWorker(sftpSessions[index], handles[index], ranges[index], readSource, isAborted, onProgress),
+          closeAll,
+          timeout,
+          `multi-connection upload ${remotePath}`,
+          debug,
+        );
+      } finally {
+        // After a failure closeAll() has already ended every session, and a
+        // CLOSE sent on an ended session would never be answered.
+        if (!sessionsClosed) {
+          for (const [index, handle] of handles.entries()) {
+            try { await this.sftpCloseFile(sftpSessions[index], handle); } catch { /* best-effort */ }
+          }
+        }
+      }
+
+      const finalSize = (await this.sftpStat(sftpSessions[0], tempPath, "dest")).size;
+      if (finalSize !== size) {
+        throw new ToolError(
+          "SFTP_ERROR",
+          `Multi-connection upload size mismatch: expected ${size} bytes, got ${finalSize}`,
+          false,
+        );
+      }
+      await this.replaceRemoteFile(sftpSessions[0], tempPath, remotePath, debug);
+      remoteTempPath = null; // Renamed into place -- nothing left to clean up.
+      return `File uploaded successfully (${size} bytes via ${ranges.length} independent connection(s))${crlfNote}`;
+    } finally {
+      closeAll();
+      if (localFd !== null) {
+        try { fs.closeSync(localFd); } catch { /* best-effort */ }
+      }
+      if (remoteTempPath) {
+        await this.removeRemoteFileBestEffort(resolvedName, remoteTempPath, timeout, debug);
+      }
+    }
+  }
+
+  /**
+   * One range of a multi-connection upload: DEPTH concurrent writers per
+   * connection, each taking the next chunk, reading it from the source and
+   * writing it at its absolute offset. Same pipeline shape (and the same
+   * reason it must not be a serial loop) as downloadByteRangeWorker.
+   */
+  private async uploadByteRangeWorker(
+    sftp: SFTPWrapper,
+    handle: Buffer,
+    range: { offset: number; length: number },
+    readSource: (offset: number, length: number) => Promise<Buffer>,
+    isAborted: () => boolean,
+    onProgress: () => void,
+  ): Promise<void> {
+    const chunkSize = TransferService.MULTI_CONNECTION_CHUNK_BYTES;
+    const depth = Math.min(TransferService.MULTI_CONNECTION_PIPELINE_DEPTH, Math.max(1, Math.ceil(range.length / chunkSize)));
+    let nextRelativeOffset = 0;
+    const runPipelinedWriter = async (): Promise<void> => {
+      for (;;) {
+        if (isAborted()) {
+          throw new ToolError("SFTP_ERROR", "Multi-connection upload cancelled: another connection failed", false);
+        }
+        const relativeOffset = nextRelativeOffset;
+        if (relativeOffset >= range.length) return;
+        nextRelativeOffset += chunkSize;
+        const length = Math.min(chunkSize, range.length - relativeOffset);
+        const offset = range.offset + relativeOffset;
+        const chunk = await readSource(offset, length);
+        await this.sftpWriteRelayChunk(sftp, handle, chunk, offset);
+        onProgress();
+      }
+    };
+    await Promise.all(Array.from({ length: depth }, () => runPipelinedWriter()));
+  }
+
+  /** Positional read of exactly `length` bytes from a local fd (fs.read may
+   * return fewer than asked; keep reading until the range is complete). */
+  private async readLocalPositional(fd: number, offset: number, length: number): Promise<Buffer> {
+    const buffer = Buffer.allocUnsafe(length);
+    let received = 0;
+    while (received < length) {
+      const bytesRead = await new Promise<number>((resolve, reject) => {
+        fs.read(fd, buffer, received, length - received, offset + received, (error, count) =>
+          error ? reject(new ToolError("LOCAL_FILE_READ_FAILED", `Failed to read local file at offset ${offset + received}: ${error.message}`, false)) : resolve(count));
+      });
+      if (bytesRead <= 0) {
+        throw new ToolError("LOCAL_FILE_READ_FAILED", `Local file changed or ended early at offset ${offset + received}`, false);
+      }
+      received += bytesRead;
+    }
+    return buffer;
+  }
+
+  /**
+   * Move a finished remote temp file over the target. With the
+   * posix-rename@openssh.com extension (every OpenSSH server) this is one
+   * atomic rename that overwrites. Without it, plain SFTP v3 RENAME refuses
+   * to overwrite an existing target on OpenSSH-like servers, so the target is
+   * removed first -- leaving a brief window in which it does not exist.
+   */
+  private async replaceRemoteFile(
+    sftp: SFTPWrapper,
+    tempPath: string,
+    targetPath: string,
+    debug?: SshDebugSink,
+  ): Promise<void> {
+    const renamed = await new Promise<boolean>((resolve, reject) => {
+      try {
+        sftp.ext_openssh_rename(tempPath, targetPath, (error) =>
+          error ? reject(this.makeSftpError("Rename error", error)) : resolve(true));
+      } catch {
+        // Thrown synchronously when the server did not advertise the extension.
+        resolve(false);
+      }
+    });
+    if (renamed) {
+      debug?.(`[mcp] replaced ${targetPath} via posix-rename@openssh.com (atomic)`);
+      return;
+    }
+
+    const targetExists = await new Promise<boolean>((resolve) => {
+      sftp.stat(targetPath, (error) => resolve(!error));
+    });
+    if (targetExists) {
+      await new Promise<void>((resolve, reject) => {
+        sftp.unlink(targetPath, (error) => (error ? reject(this.makeSftpError("Dest remove error", error)) : resolve()));
+      });
+    }
+    await new Promise<void>((resolve, reject) => {
+      sftp.rename(tempPath, targetPath, (error) => (error ? reject(this.makeSftpError("Rename error", error)) : resolve()));
+    });
+    debug?.(`[mcp] replaced ${targetPath} via plain RENAME (posix-rename not advertised; target removed first: ${targetExists})`);
+  }
+
+  /** Delete a remote file over a fresh one-shot connection, swallowing every
+   * error: used to remove a failed transfer's temp file after the transfer's
+   * own connections have been torn down. */
+  private async removeRemoteFileBestEffort(
+    resolvedName: string,
+    remotePath: string,
+    timeout: number | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<void> {
+    let connection: AcquiredSshClient | null = null;
+    try {
+      connection = await this.pool.acquireSshClient(resolvedName, { reuseConnection: false, timeout, debug, purpose: "sftp" });
+      const sftp = await this.openSftp(connection.client, "temp-cleanup", timeout, debug);
+      try {
+        await new Promise<void>((resolve) => sftp.unlink(remotePath, () => resolve()));
+      } finally {
+        try { sftp.end(); } catch { /* best-effort */ }
+      }
+    } catch (error) {
+      debug?.(`[mcp] could not remove remote temp file ${remotePath}: ${(error as Error).message}`);
+    } finally {
+      connection?.close();
+    }
+  }
+
   private async downloadMultiConnection(
     resolvedName: string,
     remotePath: string,
@@ -1969,56 +2395,7 @@ export class TransferService {
     };
 
     try {
-      // All N connections are established CONCURRENTLY, before the file size
-      // is known. Measured on the real 50ms netem lab (PLAN.MD P1-04e), one
-      // handshake + SFTP open costs ~685ms there, and doing them one after
-      // another was the entire gap between this feature and N parallel
-      // fastGets: connections=4 spent 2.7s of 4.9s connecting, connections=8
-      // spent 5.5s of 7.1s (why 8 measured slower than 4). The data path was
-      // already at parity. Opening the rest only after a first connection had
-      // stat'ed the file would still cost two handshake rounds instead of one.
-      // The trade-off: a file smaller than N BYTES opens connections it then
-      // closes unused -- a transfer that small is negligible either way.
-      //
-      // Concurrent handshakes are what sshd's MaxStartups limits (default
-      // 10:30:100 -- random drops start at 10 unauthenticated connections),
-      // which the hard cap of 8 stays under.
-      //
-      // Every connection is a fresh one-shot handshake regardless of the
-      // caller's reuseConnection option: independent connections are this
-      // feature's entire mechanism, not something reuseConnection could
-      // meaningfully toggle off. allSettled, not all: if one handshake fails,
-      // the ones that succeeded must still be recorded so closeAll() releases
-      // them -- Promise.all would drop them on the floor, still connected.
-      const established = await Promise.allSettled(
-        Array.from({ length: connections }, async (_, index) => {
-          const acquiredConnection = await this.pool.acquireSshClient(resolvedName, {
-            reuseConnection: false,
-            timeout,
-            debug,
-            purpose: "sftp",
-          });
-          try {
-            return {
-              acquiredConnection,
-              sftp: await this.openSftp(acquiredConnection.client, `multi-download-${index}`, timeout, debug),
-            };
-          } catch (error) {
-            acquiredConnection.close();
-            throw error;
-          }
-        }),
-      );
-      for (const outcome of established) {
-        if (outcome.status === "fulfilled") {
-          acquired.push(outcome.value.acquiredConnection);
-          sftpSessions.push(outcome.value.sftp);
-        }
-      }
-      const firstFailure = established.find((outcome) => outcome.status === "rejected");
-      if (firstFailure) {
-        throw (firstFailure as PromiseRejectedResult).reason;
-      }
+      await this.openIndependentSftpSessions(resolvedName, connections, "multi-download", acquired, sftpSessions, timeout, debug);
 
       const fileSize = (await this.sftpStat(sftpSessions[0], remotePath, "source")).size;
       const ranges = computeDownloadByteRanges(fileSize, connections);
@@ -2033,66 +2410,15 @@ export class TransferService {
           fs.ftruncateSync(localFd, fileSize);
         }
 
-        if (ranges.length > 0) {
-          // aborted is a COOPERATIVE flag: a worker checks it before starting
-          // its NEXT chunk read, so failing fast here stops OTHER workers
-          // from scheduling any further work. It cannot reach back into a
-          // read that is already in flight at the moment of failure -- ssh2
-          // does not reliably reject an outstanding SFTP request just
-          // because this side ended the channel/connection mid-request (no
-          // Client/SFTP option changes that), so an already-in-flight
-          // request on another worker can be left permanently unsettled by
-          // closeAll() below. That is exactly why this does NOT use
-          // Promise.all/allSettled to wait for every worker: settling this
-          // whole step (resolve on full success, reject on first failure) as
-          // soon as the OUTCOME is known -- the same fail-fast style
-          // relayWithPrefetchWindow above uses for its own worker pool --
-          // means an abandoned worker's dangling promise is simply never
-          // awaited, instead of hanging the entire download on it. The
-          // inactivity watchdog below is the backstop for the remaining
-          // gap: the ONE worker whose failure we are actually waiting on
-          // getting stuck with no response at all.
-          let aborted = false;
-          await this.runWithInactivityTimeout<void>(
-            (onProgress) =>
-              new Promise<void>((resolve, reject) => {
-                let settled = false;
-                let remaining = ranges.length;
-                const fail = (error: unknown) => {
-                  if (settled) return;
-                  settled = true;
-                  aborted = true;
-                  closeAll();
-                  reject(error);
-                };
-                const succeed = () => {
-                  if (settled) return;
-                  remaining -= 1;
-                  if (remaining === 0) {
-                    settled = true;
-                    resolve();
-                  }
-                };
-                for (const [index, range] of ranges.entries()) {
-                  this.downloadByteRangeWorker(
-                    sftpSessions[index],
-                    remotePath,
-                    localFd,
-                    range,
-                    () => aborted,
-                    onProgress,
-                  ).then(succeed, fail);
-                }
-              }),
-            this.transferStallTimeout(timeout),
-            `multi-connection download ${remotePath}`,
-            debug,
-            () => {
-              aborted = true;
-              closeAll();
-            },
-          );
-        }
+        await this.runRangeWorkersFailFast(
+          ranges.length,
+          (index, isAborted, onProgress) =>
+            this.downloadByteRangeWorker(sftpSessions[index], remotePath, localFd, ranges[index], isAborted, onProgress),
+          closeAll,
+          timeout,
+          `multi-connection download ${remotePath}`,
+          debug,
+        );
       } finally {
         fs.closeSync(localFd);
       }
@@ -2181,7 +2507,7 @@ export class TransferService {
       // several concurrent reads on one SFTP handle is precisely what ssh2's
       // own fastGet does, and it is what made the measured 4-connection case
       // reach 59.93 MiB/s rather than ~20 (PLAN.MD P1-04c).
-      const chunkSize = TransferService.MULTI_CONNECTION_READ_CHUNK_BYTES;
+      const chunkSize = TransferService.MULTI_CONNECTION_CHUNK_BYTES;
       const chunkCount = Math.ceil(range.length / chunkSize);
       const depth = Math.min(TransferService.MULTI_CONNECTION_PIPELINE_DEPTH, Math.max(1, chunkCount));
       let nextRelativeOffset = 0;

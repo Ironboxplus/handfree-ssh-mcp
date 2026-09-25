@@ -176,6 +176,15 @@ export function buildSweepGrid() {
     // them) was the whole gap -- the product now opens all N concurrently, so
     // its setup should cost about one of these, not N.
     { label: "SETUP ONLY: 1 fresh connection", setup: 1 },
+    // Multi-connection UPLOAD (PLAN.MD P1-04f-A4). connections=1 is the
+    // shipping single-connection fastPut path, the baseline the others are
+    // judged against. Every run overwrites the SAME remote path, so from the
+    // second run on the final step is a real OpenSSH posix-rename over an
+    // existing file; the SHA-256 is checked inside the container every run.
+    { label: "UPLOAD connections=1 (fastPut)", upload: 1 },
+    { label: "UPLOAD connections=2", upload: 2 },
+    { label: "UPLOAD connections=4", upload: 4 },
+    { label: "UPLOAD connections=8", upload: 8 },
   ];
 }
 
@@ -654,15 +663,57 @@ async function main() {
         // name -- genuinely independent TCP connections and channel windows,
         // not N channels on one connection (which is what was removed).
         const names = [];
-        const config = {};
+        // Not named `config`: that would shadow the lab config dockerCmd()
+        // needs below (the upload rows verify SHA-256 inside the container).
+        const serverConfigs = {};
         for (let i = 0; i < (point.connections ?? 1); i += 1) {
           const n = `${serverName}-conn${i}`;
           names.push(n);
-          config[n] = { ...baseServerConfig };
+          serverConfigs[n] = { ...baseServerConfig };
         }
-        manager.setConfig(config, names);
+        manager.setConfig(serverConfigs, names);
         const svc = manager.getTransferService();
         const opts = { fast: true, reuseConnection: true, timeout: 1_800_000, sftpConcurrency: point.sftpConcurrency, chunkSize: point.chunkSize };
+
+        if (point.upload) {
+          // Generated once per sweep, from the same kind of incompressible
+          // random data as the download payload.
+          const localUpload = path.join(scratchDir, "upload-source.bin");
+          if (!fs.existsSync(localUpload)) {
+            fs.writeFileSync(localUpload, randomBytes(profile.fileBytes));
+          }
+          const uploadSha256 = sha256File(localUpload);
+          const remoteUploadPath = `/home/labuser/data/upload-${token}.bin`;
+          const runOnceUpload = async () => {
+            const started = process.hrtime.bigint();
+            await svc.upload(localUpload, remoteUploadPath, names[0], {
+              connections: point.upload,
+              fast: true,
+              // Every run must really transfer: the same bytes land on the
+              // same path each time, which skip-if-identical would skip.
+              skipIfIdentical: false,
+              timeout: 1_800_000,
+            });
+            const ms = Number(process.hrtime.bigint() - started) / 1e6;
+            const check = await conn.exec(
+              dockerCmd(config, `exec ${shellQuote(containerName)} sha256sum ${shellQuote(remoteUploadPath)}`),
+              { timeoutMs: 120000 },
+            );
+            const remoteSha = (check.stdout ?? "").trim().split(/\s+/)[0];
+            if (remoteSha !== uploadSha256) {
+              throw new Error(`${point.label}: remote SHA-256 ${remoteSha} != local ${uploadSha256}`);
+            }
+            return ms;
+          };
+          for (let i = 0; i < profile.warmups; i += 1) await runOnceUpload();
+          const uploadSamples = [];
+          for (let i = 0; i < profile.runs; i += 1) uploadSamples.push(await runOnceUpload());
+          const uploadThroughput = throughput(profile.fileBytes, median(uploadSamples));
+          rows.push({ ...point, connections: point.upload, samples: uploadSamples, aggregateBytesPerSec: uploadThroughput, perConnectionBytesPerSec: uploadThroughput / point.upload });
+          log(`  ${point.label.padEnd(40)} ${(uploadThroughput / (1024 * 1024)).toFixed(2)} MiB/s (median ${median(uploadSamples).toFixed(0)} ms)`);
+          manager.disconnect();
+          continue;
+        }
 
         if (point.setup) {
           const runOnceSetup = async () => {
