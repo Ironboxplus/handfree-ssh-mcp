@@ -2576,6 +2576,19 @@ export class TransferService {
     options?: SftpOptions & { skipIfIdentical?: boolean },
   ): Promise<string> {
     const strategy: TransferStrategy = options?.strategy ?? "relay";
+    // Validated before any probe or connection, so an invalid request opens
+    // nothing on either server.
+    const connections = this.resolveTransferConnections(options);
+    if (connections > 1) {
+      if (strategy !== "relay") {
+        throw new ToolError(
+          "INVALID_CONFIGURATION",
+          `connections is only supported with strategy="relay", not strategy="${strategy}"`,
+          false,
+        );
+      }
+      return this.transferBetweenServersMultiConnection(sourceName, sourceRemotePath, destName, destRemotePath, connections, options);
+    }
     if (strategy === "relay") {
       return this.transferBetweenServersRelay(sourceName, sourceRemotePath, destName, destRemotePath, options);
     }
@@ -2857,6 +2870,244 @@ export class TransferService {
   private static readonly DEFAULT_DIRECT_PROBE_TIMEOUT_MS = 8000;
   private static readonly DEFAULT_DIRECT_CONNECT_TIMEOUT_SECONDS = 6;
 
+  /**
+   * Relay skip-if-identical, shared by the single- and multi-connection relay
+   * paths: same size on both sides AND matching md5sum (when available on
+   * both). Never pulls bytes through the MCP host for the compare -- if
+   * md5sum is missing on either side the caller just transfers. Returns the
+   * "skipped" message, or null to transfer.
+   */
+  private async relaySkipIfIdentical(
+    sourceName: string,
+    destName: string,
+    srcClient: Client,
+    dstClient: Client,
+    dstSftp: SFTPWrapper,
+    sourcePath: string,
+    destPath: string,
+    sourceSize: number,
+  ): Promise<string | null> {
+    const dstStatProbe = await this.sftpStat(dstSftp, destPath, "dest").catch(() => null);
+    if (!dstStatProbe || dstStatProbe.size !== sourceSize) return null;
+    const [srcMd5, dstMd5] = await Promise.all([
+      this.remoteMd5(srcClient, sourcePath).catch(() => null),
+      this.remoteMd5(dstClient, destPath).catch(() => null),
+    ]);
+    if (!srcMd5 || !dstMd5 || srcMd5 !== dstMd5) return null;
+    const srcConfig = this.pool.getConfig(sourceName);
+    const dstConfig = this.pool.getConfig(destName);
+    return `Transfer skipped: destination already identical ` +
+      `(size=${sourceSize} bytes, md5=${srcMd5}). ` +
+      `${srcConfig.username}@${srcConfig.host}:${sourcePath}` +
+      ` == ${dstConfig.username}@${dstConfig.host}:${destPath}`;
+  }
+
+  /**
+   * Multi-connection relay (PLAN.MD P1-06): N PAIRS of independent TCP+SSH
+   * connections -- N to the source and N to the destination -- each pair
+   * moving one non-overlapping byte range (computeDownloadByteRanges). Both
+   * legs of a single-connection relay are capped by their connection's SSH
+   * channel window; here each leg of each pair has its own.
+   *
+   * Destination handling is the multi-connection upload's, not the
+   * single-connection relay's in-place write: one temp file next to the
+   * target, created/truncated only by connection 0 ("w", the others "r+"),
+   * size- and md5-verified BEFORE it replaces the target via
+   * replaceRemoteFile. Any failure deletes the temp and leaves the target's
+   * previous contents untouched.
+   *
+   * Self-relay (source === destination server) opens N connections, each
+   * carrying one read and one write SFTP channel, rather than 2N.
+   */
+  private async transferBetweenServersMultiConnection(
+    sourceName: string,
+    sourceRemotePath: string,
+    destName: string,
+    destRemotePath: string,
+    connections: number,
+    options?: SftpOptions & { skipIfIdentical?: boolean },
+  ): Promise<string> {
+    const validatedSourcePath = this.validateRemotePath(sourceRemotePath, sourceName);
+    const validatedDestPath = this.validateRemotePath(destRemotePath, destName);
+    const skipIfIdentical = options?.skipIfIdentical !== false;
+    const selfRelay = sourceName === destName;
+    const timeout = options?.timeout;
+    const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
+    debug?.(`[mcp] multi-connection relay ${sourceName} -> ${destName}, connections=${connections}, selfRelay=${selfRelay}`);
+
+    const srcAcquired: AcquiredSshClient[] = [];
+    const srcSessions: SFTPWrapper[] = [];
+    const dstAcquired: AcquiredSshClient[] = [];
+    const dstSessions: SFTPWrapper[] = [];
+    let remoteTempPath: string | null = null;
+    let sessionsClosed = false;
+
+    const closeAll = (): void => {
+      sessionsClosed = true;
+      for (const sftp of [...srcSessions, ...dstSessions]) {
+        try { sftp.end(); } catch { /* already gone */ }
+      }
+      for (const acquiredConnection of [...srcAcquired, ...dstAcquired]) {
+        try { acquiredConnection.close(); } catch { /* already gone */ }
+      }
+    };
+
+    try {
+      if (selfRelay) {
+        await this.openIndependentSftpSessions(sourceName, connections, "multi-relay-src", srcAcquired, srcSessions, timeout, debug);
+        // A second channel on each of the same connections for the writes.
+        const writeChannels = await Promise.allSettled(
+          srcAcquired.map((acquiredConnection, index) =>
+            this.openSftp(acquiredConnection.client, `multi-relay-dst-${index}`, timeout, debug)),
+        );
+        for (const outcome of writeChannels) {
+          if (outcome.status === "fulfilled") dstSessions.push(outcome.value);
+        }
+        const failedChannel = writeChannels.find((outcome) => outcome.status === "rejected");
+        if (failedChannel) throw (failedChannel as PromiseRejectedResult).reason;
+      } else {
+        // Both sides concurrently, and allSettled so that whichever side
+        // fails, the other side's connections are still recorded -- and
+        // closed by closeAll() -- instead of leaking.
+        const sides = await Promise.allSettled([
+          this.openIndependentSftpSessions(sourceName, connections, "multi-relay-src", srcAcquired, srcSessions, timeout, debug),
+          this.openIndependentSftpSessions(destName, connections, "multi-relay-dst", dstAcquired, dstSessions, timeout, debug),
+        ]);
+        const failedSide = sides.find((outcome) => outcome.status === "rejected");
+        if (failedSide) throw (failedSide as PromiseRejectedResult).reason;
+      }
+      const srcClient = srcAcquired[0].client;
+      const dstClient = selfRelay ? srcClient : dstAcquired[0].client;
+
+      const sourceSize = (await this.sftpStat(srcSessions[0], validatedSourcePath, "source")).size;
+      if (skipIfIdentical) {
+        const skipped = await this.relaySkipIfIdentical(
+          sourceName, destName, srcClient, dstClient, dstSessions[0], validatedSourcePath, validatedDestPath, sourceSize,
+        );
+        if (skipped) {
+          return appendDebugOutput(skipped, debugCollector);
+        }
+      }
+
+      const ranges = computeDownloadByteRanges(sourceSize, connections);
+      const tempPath = `${validatedDestPath}.handfree-relay-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tmp`;
+      const sourceOpenError = (error: Error) => this.makeSftpError("Source open error", error);
+      const destOpenError = (error: Error) => this.makeSftpError("Dest open error", error);
+      const dstHandles: Buffer[] = [await this.sftpOpenFile(dstSessions[0], tempPath, "w", destOpenError)];
+      remoteTempPath = tempPath;
+      const srcHandles: Buffer[] = [];
+      try {
+        const [openedSource, openedDest] = await Promise.all([
+          Promise.all(ranges.map((_, index) => this.sftpOpenFile(srcSessions[index], validatedSourcePath, "r", sourceOpenError))),
+          Promise.all(ranges.slice(1).map((_, offsetIndex) => this.sftpOpenFile(dstSessions[offsetIndex + 1], tempPath, "r+", destOpenError))),
+        ]);
+        srcHandles.push(...openedSource);
+        dstHandles.push(...openedDest);
+        await this.runRangeWorkersFailFast(
+          ranges.length,
+          (index, isAborted, onProgress) =>
+            this.relayByteRangeWorker(
+              srcSessions[index], srcHandles[index], dstSessions[index], dstHandles[index], ranges[index], isAborted, onProgress,
+            ),
+          closeAll,
+          timeout,
+          `multi-connection relay ${sourceName}:${validatedSourcePath} -> ${destName}:${validatedDestPath}`,
+          debug,
+        );
+      } finally {
+        // After a failure closeAll() has already ended every session; a CLOSE
+        // sent on an ended session would never be answered.
+        if (!sessionsClosed) {
+          for (const [index, handle] of srcHandles.entries()) {
+            try { await this.sftpCloseFile(srcSessions[index], handle); } catch { /* best-effort */ }
+          }
+          for (const [index, handle] of dstHandles.entries()) {
+            try { await this.sftpCloseFile(dstSessions[index], handle); } catch { /* best-effort */ }
+          }
+        }
+      }
+
+      // Verify the TEMP file, before it replaces anything: a mismatch must
+      // leave the target's previous contents in place.
+      const verification: string[] = [];
+      const tempSize = (await this.sftpStat(dstSessions[0], tempPath, "dest")).size;
+      if (tempSize !== sourceSize) {
+        throw new ToolError(
+          "SFTP_ERROR",
+          `Transfer verification failed: size mismatch (source=${sourceSize} bytes, dest=${tempSize} bytes)`,
+          true,
+        );
+      }
+      verification.push(`size=${sourceSize} bytes ✓`);
+      const [srcMd5, dstMd5] = await Promise.all([
+        this.remoteMd5(srcClient, validatedSourcePath).catch(() => null),
+        this.remoteMd5(dstClient, tempPath).catch(() => null),
+      ]);
+      if (srcMd5 && dstMd5) {
+        if (srcMd5 !== dstMd5) {
+          throw new ToolError("SFTP_ERROR", `Transfer verification failed: MD5 mismatch (source=${srcMd5}, dest=${dstMd5})`, true);
+        }
+        verification.push(`md5=${srcMd5} ✓`);
+      }
+
+      await this.replaceRemoteFile(dstSessions[0], tempPath, validatedDestPath, debug);
+      remoteTempPath = null;
+      const srcConfig = this.pool.getConfig(sourceName);
+      const dstConfig = this.pool.getConfig(destName);
+      return appendDebugOutput(
+        `Transfer complete (via ${ranges.length} independent connection pair(s), verified: ${verification.join(", ")}): ` +
+          `${srcConfig.username}@${srcConfig.host}:${validatedSourcePath}` +
+          ` → ${dstConfig.username}@${dstConfig.host}:${validatedDestPath}`,
+        debugCollector,
+      );
+    } catch (error) {
+      throw appendDebugToError(error as Error, debugCollector);
+    } finally {
+      closeAll();
+      if (remoteTempPath) {
+        await this.removeRemoteFileBestEffort(destName, remoteTempPath, timeout, debug);
+      }
+    }
+  }
+
+  /**
+   * One range of a multi-connection relay: DEPTH concurrent slots, each
+   * reading the next chunk from the source and writing it at the same offset
+   * on the destination. Errors keep the existing "Source read error" /
+   * "Dest write error" prefixes, which is what tells the caller which leg
+   * failed.
+   */
+  private async relayByteRangeWorker(
+    srcSftp: SFTPWrapper,
+    srcHandle: Buffer,
+    dstSftp: SFTPWrapper,
+    dstHandle: Buffer,
+    range: { offset: number; length: number },
+    isAborted: () => boolean,
+    onProgress: () => void,
+  ): Promise<void> {
+    const chunkSize = TransferService.MULTI_CONNECTION_CHUNK_BYTES;
+    const depth = Math.min(TransferService.MULTI_CONNECTION_PIPELINE_DEPTH, Math.max(1, Math.ceil(range.length / chunkSize)));
+    let nextRelativeOffset = 0;
+    const runSlot = async (): Promise<void> => {
+      for (;;) {
+        if (isAborted()) {
+          throw new ToolError("SFTP_ERROR", "Multi-connection relay cancelled: another connection failed", false);
+        }
+        const relativeOffset = nextRelativeOffset;
+        if (relativeOffset >= range.length) return;
+        nextRelativeOffset += chunkSize;
+        const length = Math.min(chunkSize, range.length - relativeOffset);
+        const offset = range.offset + relativeOffset;
+        const chunk = await this.sftpReadRelayChunk(srcSftp, srcHandle, offset, length);
+        onProgress();
+        await this.sftpWriteRelayChunk(dstSftp, dstHandle, chunk, offset);
+        onProgress();
+      }
+    };
+    await Promise.all(Array.from({ length: depth }, () => runSlot()));
+  }
+
   private async transferBetweenServersRelay(
     sourceName: string,
     sourceRemotePath: string,
@@ -2904,28 +3155,12 @@ export class TransferService {
       // Get source file size before transfer
       const srcStat = await this.sftpStat(srcSftp, validatedSourcePath, "source");
 
-      // Skip-if-identical: same size on both sides AND matching md5sum (when
-      // available on both). We never pull bytes through the MCP host for the
-      // compare — if md5sum is missing on either side we just transfer.
       if (skipIfIdentical) {
-        const dstStatProbe = await this.sftpStat(dstSftp, validatedDestPath, "dest")
-          .catch(() => null);
-        if (dstStatProbe && dstStatProbe.size === srcStat.size) {
-          const [srcMd5, dstMd5] = await Promise.all([
-            this.remoteMd5(srcClient, validatedSourcePath).catch(() => null),
-            this.remoteMd5(dstClient, validatedDestPath).catch(() => null),
-          ]);
-          if (srcMd5 && dstMd5 && srcMd5 === dstMd5) {
-            const srcConfig = this.pool.getConfig(sourceName);
-            const dstConfig = this.pool.getConfig(destName);
-            return appendDebugOutput(
-              `Transfer skipped: destination already identical ` +
-                `(size=${srcStat.size} bytes, md5=${srcMd5}). ` +
-                `${srcConfig.username}@${srcConfig.host}:${validatedSourcePath}` +
-                ` == ${dstConfig.username}@${dstConfig.host}:${validatedDestPath}`,
-              debugCollector,
-            );
-          }
+        const skipped = await this.relaySkipIfIdentical(
+          sourceName, destName, srcClient, dstClient, dstSftp, validatedSourcePath, validatedDestPath, srcStat.size,
+        );
+        if (skipped) {
+          return appendDebugOutput(skipped, debugCollector);
         }
       }
 

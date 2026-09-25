@@ -1158,15 +1158,64 @@ PLAN 正文 §2 要的是「多连接单文件分片」，`PLAN.MD:81` 甚至专
 
 - [ ] **P1-05-A1**：OpenSSH fixture 走 striped；限制随机写的真实兼容性 fixture 自动回退；正式目标文件从未用于 probe；结果 SHA-256 相同。
 
-### P1-06 多通道 relay
+### P1-06 多连接 relay（2026-09-25 改写并交付，2.3.0）
 
-- [ ] relay planner 根据 RTT、文件大小、channel budget 和 memory budget 选择 stream 数。
-- [ ] 每个 stream 负责不重叠 range；源 read 和目标 write 解耦但总 buffer 有界。
-- [ ] 明确区分 `requestsPerStream` 与 `streams`。
-- [ ] self-relay 保持单 server 连接复用和安全 offset 行为。
-- [ ] 任一腿失败取消整个 job，保留可诊断的 source/destination phase。
+**改写原因**：原文写的是「stream」，并要求「planner 根据 RTT、文件大小、budget 自动选择 stream 数」。
+- 「stream」没说清是 channel 还是连接，正是 P1-04 striped 失败的根源（验收写成「channel 或 connection」，实现选了 channel，一条 TCP 连接、一个窗口，零加速）。
+- 自动 planner 在已交付的下载/上传里都没有需求：用户显式传 `connections`，文档给出实测数字，行为可预期。无需求方的 planner 属于过度设计。
 
-- [ ] **P1-06-A1**：执行 8.2 的 canonical relay performance gate；任务正文不复制另一套阈值。Controller RSS 与目标 SHA-256 同时满足 8.2。
+原条目作废，改为：
+
+- [x] `transfer mode=relay` 新增 `connections`（默认 1 = 现有 relay 逐字节不变，上限 8）。只与 `strategy: "relay"`（默认）组合；与 `"direct"`/`"auto"`、`archive` 组合时拒绝，不静默忽略。>1 时忽略 `sftpConcurrency`/`chunkSize`/`reuseConnection`，与下载/上传一致。
+- [x] N **对**独立的 TCP+SSH 连接：源端 N 条、目标端 N 条，每对负责一个不重叠字节区间。源端读与目标端写各自拥有每连接的 2 MiB channel 窗口。两端所有连接**并发**建立（复用 `openIndependentSftpSessions`），任一握手失败时两端已建立的连接全部关闭。
+- [x] 每对内部是 64 × 32 KiB 的读→写流水线；总 buffer 上限 N × 2 MiB（N=8 时 16 MiB）。
+- [x] 目标端写入同目录 temp 文件：第 0 条连接 `w` 创建，其余 `r+`；全部成功且 temp 大小校验通过后，用 `replaceRemoteFile` 替换目标（posix-rename 原子覆盖，否则先删后改名）。任一连接失败：删除 temp，目标保持原样。**这与单连接 relay 的「原地写」不同**，文档写明。
+- [x] skip-if-identical（大小 + md5）与完成后的大小 + md5 校验照旧生效。
+- [x] self-relay（源与目标是同一台服务器）：每条连接开两个 SFTP channel（一读一写），共 N 条连接而非 2N。
+- [x] 任一腿失败取消全部，错误消息指明是源端还是目标端。
+
+验收：
+- [x] **P1-06-A1**（黑盒）：两个真实 SFTP 服务器之间以 `connections=4` relay 非整除大小文件，目标 SHA-256 一致，无 temp 残留；覆盖已有目标；self-relay 同样正确。
+- [x] **P1-06-A2**（灰盒）：两端服务器各自真实计数——连接数各为 N、握手并发峰值各为 N；源端 READ 日志与目标端 WRITE 日志都不重叠且精确覆盖；目标端某条连接写失败、源端某条连接读失败时，目标原内容不变、temp 被删、两端连接全部关闭。
+- [x] **P1-06-A3**（真机）：`.88` netem lab 源容器 → 目标容器，单连接 vs 2/4/8，每次在目标容器内校验 SHA-256。未测出收益则不发布该参数。
+
+#### P1-06 执行结果（2026-09-25）
+
+实现：`transfer-service.ts` `transferBetweenServersMultiConnection` / `relayByteRangeWorker`，入口在 `transferBetweenServers` 分派处，先于任何 probe 或连接校验 `connections`。复用而非复制：`openIndependentSftpSessions`（两端各调用一次，外层 `allSettled`，保证一端失败时另一端已建立的连接也被关闭）、`runRangeWorkersFailFast`、`replaceRemoteFile`、`removeRemoteFileBestEffort`。skip 判定从单连接 relay 抽成 `relaySkipIfIdentical`，两条路径共用。与单连接 relay 的一处刻意差异：**md5 校验针对 temp 文件、在替换目标之前完成**，校验失败时目标保持原样；单连接 relay 是原地写，只能事后校验。
+
+测试（`multi-connection-relay-real.test.ts`，12 项，两个真实 ssh2 服务器）：
+- RED：实现前 10/12 失败，均在目标断言上。
+- 两端各 4 条连接、握手并发峰值各为 4。
+- 源端 READ 与目标端 WRITE 日志各自不重叠、精确覆盖。
+- 目标端写失败 / 源端读失败：目标原内容保留、temp 删除、两端连接全部关闭，错误消息分别带 `Dest write error` / `Source read error`。
+- 目标端一次握手失败：两端零残留连接。
+- skip-if-identical 零 WRITE；self-relay 只开 N 条连接；3 字节文件恰好 3 个 WRITE；空文件；与 direct/auto/archive 组合及超上限时在任何连接之前被拒。
+
+**变异验证**：
+- 两端改用 `Promise.all` 且各自使用局部数组（一端失败会丢掉另一端已建立的连接）→「目标端握手失败」用例变红，报 source 连接未关闭。
+- 失败时不删 temp → 两个失败用例变红。
+- self-relay 改开 2N 条连接 → self-relay 用例变红。
+
+**记下一次无效的变异运行**：第一次做「两端 Promise.all」变异时，第一版括号不匹配、根本没编译过；第二版因为 Windows 上 Python 的 `/tmp` 与 bash 的 `/tmp` 不是同一个目录，变异体从未写进源码，跑的是原代码。两次结果都不作数，第三次直接改源文件才得到上面的有效结论。**变异测试必须先确认变异体确实编译进了被测产物**，否则「全绿」「全红」都没有意义。
+
+**已知缺口**：流水线深度（每对 64 个在途请求）没有正确性测试守住——改成串行照样正确，只是变慢。它由下面的真机吞吐数字间接守住。
+
+真机（P1-06-A3）：`.88` netem lab，源容器 → 本机 → 目标容器，128 MiB，median of 3，每次在目标容器内校验 SHA-256：
+
+| relay | 吞吐 | 相对单连接 |
+|---|---|---|
+| `connections=1`（现有窗口化 relay） | 16.36 MiB/s | 1.00× |
+| `connections=2` | 23.74 MiB/s | 1.45× |
+| `connections=4` | 33.64 MiB/s | 2.06× |
+| `connections=8` | 31.71 MiB/s | 1.94× |
+
+同轮复测：下载 `connections=4` 45.69 / `8` 53.80，上传 `4` 42.36 / `8` 45.61，与前几轮一致。
+
+口径说明：
+1. 单连接 baseline 复用 warm-up 建好的连接（不含握手）；多连接每次两端并发新建，约 0.71 s。
+2. netem 只装在源容器出口，受限的是「源 → 本机」这一段；「本机 → 目标」没有整形。因此这组数字对应「源端链路慢、目标端链路快」的中转场景，未覆盖目标端链路也慢的情况。
+3. `8` 比 `4` 略慢，原因未定位。文档直接建议用 `4`。
+
 
 ### P1-07 外部 engine 与远端执行 adapter
 
@@ -1292,7 +1341,7 @@ Rev.4 修正：本任务原先被排在 `P1-01 → P1-02 → P1-09`，即等 Tra
 | 用户目标 | 状态 | 对应任务 |
 |---|---|---|
 | 批量上传 | ✅ 已交付 `d0dc039` | P1-09 |
-| 传输加速 | 🔄 部分 | P1-04d/P1-04e ✅ 多连接单文件下载（2.1.4，50 ms/1 Gbps 实测 `connections=4` 2.61×、`8` 3.07×）；P1-04f ✅ 多连接单文件上传（2.2.0，50 ms RTT 实测 `connections=4` 1.46×）；P1-03a ✅ `8244a90`；P1-04a `06b1552` **已删除**（P1-04b 真机证伪，striped 比 baseline 慢 2.3×）；P1-04b 已跑出真实数字（`fast` 19.5 MiB/s = 线速 16.4%），下一步杠杆「提高在途字节数」已记账未做 |
+| 传输加速 | 🔄 部分 | P1-04d/P1-04e ✅ 多连接单文件下载（2.1.4，50 ms/1 Gbps 实测 `connections=4` 2.61×、`8` 3.07×）；P1-04f ✅ 多连接单文件上传（2.2.0，50 ms RTT 实测 `connections=4` 1.46×）；P1-06 ✅ 多连接 relay（2.3.0，50 ms/1 Gbps 源端链路实测 `connections=4` 2.06×）；P1-03a ✅ `8244a90`；P1-04a `06b1552` **已删除**（P1-04b 真机证伪，striped 比 baseline 慢 2.3×）；P1-04b 已跑出真实数字（`fast` 19.5 MiB/s = 线速 16.4%），下一步杠杆「提高在途字节数」已记账未做 |
 | 远程运行 | ⬜ 本节 | P2-01/02/03/04/05/06 |
 | 两服务器直传 | ✅ 已交付 | P1-08a（P1-08b 的 rclone/agent-forward/daemon 崩溃重入按 Rev.4 不适用） |
 

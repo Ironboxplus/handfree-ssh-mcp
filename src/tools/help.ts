@@ -256,18 +256,24 @@ Parameters for upload / download:
                   recursion stays sequential; no multi-file concurrency.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
-  connections     (number, optional)   mode="download" or "upload", single file
-                  only. Default 1 (unchanged). Above 1, split the file into
-                  that many non-overlapping byte ranges moved over that many
-                  INDEPENDENT SSH/TCP connections, reassembled, verified,
-                  renamed into place (see the download/upload help).
+  connections     (number, optional)   Single file only; relay only with
+                  strategy="relay" (the default). Default 1 (unchanged).
+                  Above 1, split the file into that many non-overlapping byte
+                  ranges moved over that many INDEPENDENT SSH/TCP connections,
+                  reassembled, verified, renamed into place (see the
+                  download/upload help). Relay opens N connections on EACH
+                  server (N in total for a self-relay), writes a temp file on
+                  the destination, verifies size + md5, then replaces the
+                  target -- unlike the single-connection relay, which writes
+                  in place. Relay measured on a 50 ms/1 Gbps source leg (one
+                  connection 16.4 MiB/s): 2 -> 23.7, 4 -> 33.6, 8 -> 31.7.
                   Maximum 8. Helps on high-latency links; pointless on a
                   fast LAN. Separate, concurrent handshakes, so sshd's
                   MaxStartups is the limit that matters, not MaxSessions.
                   Download measured on 50 ms / 1 Gbps (one connection
                   17.5 MiB/s): 2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s.
-                  Rejected for relay, a batch (array) localPath,
-                  recursive=true and archive=true.
+                  Rejected for relay strategy="direct"/"auto", a batch
+                  (array) localPath, recursive=true and archive=true.
   fileConcurrency (number, optional)   Recursive or batch upload only: independent
                   files transferred in parallel. Default 4, maximum 8. Each
                   parallel file opens its own SFTP channel on the same SSH

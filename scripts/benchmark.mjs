@@ -185,6 +185,14 @@ export function buildSweepGrid() {
     { label: "UPLOAD connections=2", upload: 2 },
     { label: "UPLOAD connections=4", upload: 4 },
     { label: "UPLOAD connections=8", upload: 8 },
+    // Multi-connection RELAY (PLAN.MD P1-06-A3): source container ->
+    // destination container through this host. connections=1 is the shipping
+    // single-connection windowed relay. Only the source's egress is shaped,
+    // so the constrained leg is source -> this host, as in download.
+    { label: "RELAY connections=1 (windowed relay)", relay: 1 },
+    { label: "RELAY connections=2", relay: 2 },
+    { label: "RELAY connections=4", relay: 4 },
+    { label: "RELAY connections=8", relay: 8 },
   ];
 }
 
@@ -556,15 +564,19 @@ async function main() {
     lab = await upLab(conn, config, lab, log);
 
     const containerName = `${lab.projectName}-source-1`;
+    // The relay rows (PLAN.MD P1-06-A3) copy source -> destination through
+    // this host, so the destination container needs the key too.
+    const destinationContainerName = `${lab.projectName}-destination-1`;
     const keypair = generateKeypair(keyDir, "bench");
     // generateKeypair returns PATHS, not key material; the public half has to
     // be read off disk. Only the public half ever leaves this machine.
     const publicKey = fs.readFileSync(keypair.publicKeyPath, "utf8").trim();
-    log("installing the benchmark public key into the source container");
+    for (const target of [containerName, destinationContainerName]) {
+    log(`installing the benchmark public key into ${target}`);
     const install = await conn.exec(
       dockerCmd(
         config,
-        `exec ${shellQuote(containerName)} sh -lc ${shellQuote(
+        `exec ${shellQuote(target)} sh -lc ${shellQuote(
           `printf '%s\\n' ${shellQuote(publicKey)} >> /home/labuser/.ssh/authorized_keys`,
         )}`,
       ),
@@ -572,9 +584,10 @@ async function main() {
     );
     if (install.code !== 0) {
       throw Object.assign(
-        new Error(`could not install the benchmark public key (exit ${install.code}): ${install.stderr?.trim()}`),
+        new Error(`could not install the benchmark public key into ${target} (exit ${install.code}): ${install.stderr?.trim()}`),
         { infrastructure: true },
       );
+    }
     }
 
     // Real shaping. This is the whole reason the benchmark cannot run
@@ -674,6 +687,43 @@ async function main() {
         manager.setConfig(serverConfigs, names);
         const svc = manager.getTransferService();
         const opts = { fast: true, reuseConnection: true, timeout: 1_800_000, sftpConcurrency: point.sftpConcurrency, chunkSize: point.chunkSize };
+
+        if (point.relay) {
+          const destinationName = "bench-destination";
+          manager.setConfig(
+            { ...serverConfigs, [destinationName]: { ...baseServerConfig, port: lab.ports.destination } },
+            [...names, destinationName],
+          );
+          const relaySvc = manager.getTransferService();
+          const relayDestPath = `/home/labuser/data/relay-${token}.bin`;
+          const runOnceRelay = async () => {
+            const started = process.hrtime.bigint();
+            await relaySvc.transferBetweenServers(names[0], remotePath, destinationName, relayDestPath, {
+              ...(point.relay > 1 ? { connections: point.relay } : {}),
+              // Every run must really transfer the same bytes to the same path.
+              skipIfIdentical: false,
+              timeout: 1_800_000,
+            });
+            const ms = Number(process.hrtime.bigint() - started) / 1e6;
+            const check = await conn.exec(
+              dockerCmd(config, `exec ${shellQuote(destinationContainerName)} sha256sum ${shellQuote(relayDestPath)}`),
+              { timeoutMs: 120000 },
+            );
+            const destSha = (check.stdout ?? "").trim().split(/\s+/)[0];
+            if (destSha !== expectedSha256) {
+              throw new Error(`${point.label}: destination SHA-256 ${destSha} != source ${expectedSha256}`);
+            }
+            return ms;
+          };
+          for (let i = 0; i < profile.warmups; i += 1) await runOnceRelay();
+          const relaySamples = [];
+          for (let i = 0; i < profile.runs; i += 1) relaySamples.push(await runOnceRelay());
+          const relayThroughput = throughput(profile.fileBytes, median(relaySamples));
+          rows.push({ ...point, connections: point.relay, samples: relaySamples, aggregateBytesPerSec: relayThroughput, perConnectionBytesPerSec: relayThroughput / point.relay });
+          log(`  ${point.label.padEnd(40)} ${(relayThroughput / (1024 * 1024)).toFixed(2)} MiB/s (median ${median(relaySamples).toFixed(0)} ms)`);
+          manager.disconnect();
+          continue;
+        }
 
         if (point.upload) {
           // Generated once per sweep, from the same kind of incompressible

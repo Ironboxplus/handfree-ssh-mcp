@@ -409,7 +409,7 @@ Measured on a real `tc netem` lab link at 50 ms / 1 Gbps (128 MiB file, median o
 | `connections: 4` | 45.71 MiB/s |
 | `connections: 8` | 53.86 MiB/s |
 
-Those numbers describe that one shaped link only; your own gain depends on RTT and bandwidth. Returns diminish past `4`. (Releases before 2.1.4 opened the connections one after another, which cost ~0.7 s per connection on that link and made `8` no faster than a single connection; the data path itself was never the bottleneck.) `connections` applies to single files only and is rejected for relay, a batch (array) `localPath`, `recursive: true`, and `archive: true`.
+Those numbers describe that one shaped link only; your own gain depends on RTT and bandwidth. Returns diminish past `4`. (Releases before 2.1.4 opened the connections one after another, which cost ~0.7 s per connection on that link and made `8` no faster than a single connection; the data path itself was never the bottleneck.) `connections` applies to single files only and is rejected for relay `strategy: "direct"`/`"auto"`, a batch (array) `localPath`, `recursive: true`, and `archive: true`.
 
 ### Multi-connection upload
 
@@ -425,6 +425,21 @@ Measured uploading a 128 MiB file at 50 ms RTT (SHA-256 verified inside the cont
 | `connections: 8` | 44.92 MiB/s |
 
 The gains are smaller than for download. Those figures include about 0.7 s of connection setup per call, which a larger file amortizes. In that lab only the server-to-client direction is bandwidth-shaped, so the upload numbers reflect the 50 ms RTT but no 1 Gbps ceiling.
+
+### Multi-connection relay
+
+`transfer mode=relay` accepts the same `connections` with the default `strategy: "relay"` (it is rejected with `"direct"`/`"auto"`, which copy on the source server and have no byte ranges to split). Above `1`, the file is split into that many byte ranges, and each range moves over its own **pair** of independent connections — one to the source, one to the destination — so both legs get a window per range. That is `N` connections on each server; a self-relay (same server on both ends) opens `N` connections in total, each carrying one read and one write channel. Unlike the single-connection relay, which writes the destination in place, the destination is written to a temp file, checked for size and md5, and only then renamed over the target (the same replace step as multi-connection upload). If anything fails, the temp file is deleted and the target keeps its previous contents.
+
+Measured relaying a 128 MiB file between two lab containers, with the source → MCP-host leg shaped to 50 ms / 1 Gbps (SHA-256 verified inside the destination container every run):
+
+| setting | throughput |
+|---|---|
+| default single connection (windowed relay) | 16.36 MiB/s |
+| `connections: 2` | 23.74 MiB/s |
+| `connections: 4` | 33.64 MiB/s |
+| `connections: 8` | 31.71 MiB/s |
+
+`8` was no faster than `4` there; use `4`.
 
 ### `execute-command` output capping & full logs
 
