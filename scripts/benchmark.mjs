@@ -168,6 +168,14 @@ export function buildSweepGrid() {
     { label: "PRODUCT connections=2 (single file)", product: 2 },
     { label: "PRODUCT connections=4 (single file)", product: 4 },
     { label: "PRODUCT connections=8 (single file)", product: 8 },
+    // The cost of ONE fresh handshake + SFTP open on this link. The PRODUCT
+    // rows time setup + data together, while the "x N CONNECTIONS" proxy rows
+    // reuse connections warmed by their warm-up run and so time data only;
+    // without this number a gap between them cannot be attributed. It is how
+    // PLAN.MD P1-04e found that serial setup (~685ms per connection, N of
+    // them) was the whole gap -- the product now opens all N concurrently, so
+    // its setup should cost about one of these, not N.
+    { label: "SETUP ONLY: 1 fresh connection", setup: 1 },
   ];
 }
 
@@ -656,6 +664,35 @@ async function main() {
         const svc = manager.getTransferService();
         const opts = { fast: true, reuseConnection: true, timeout: 1_800_000, sftpConcurrency: point.sftpConcurrency, chunkSize: point.chunkSize };
 
+        if (point.setup) {
+          const runOnceSetup = async () => {
+            const started = process.hrtime.bigint();
+            const opened = [];
+            try {
+              for (let i = 0; i < point.setup; i += 1) {
+                const acquired = await manager.acquireSshClient(names[0], { reuseConnection: false, purpose: "sftp" });
+                opened.push(acquired);
+                const sftp = await new Promise((resolve, reject) => {
+                  acquired.client.sftp((err, wrapper) => (err ? reject(err) : resolve(wrapper)));
+                });
+                sftp.end();
+              }
+              return Number(process.hrtime.bigint() - started) / 1e6;
+            } finally {
+              for (const acquired of opened) acquired.close();
+            }
+          };
+          for (let i = 0; i < profile.warmups; i += 1) await runOnceSetup();
+          const setupSamples = [];
+          for (let i = 0; i < profile.runs; i += 1) setupSamples.push(await runOnceSetup());
+          // Not a throughput: reported as elapsed ms. aggregateBytesPerSec is
+          // left 0 so it can never win the "best aggregate" line below.
+          rows.push({ ...point, connections: point.setup, samples: setupSamples, aggregateBytesPerSec: 0, perConnectionBytesPerSec: 0 });
+          log(`  ${point.label.padEnd(40)} median ${median(setupSamples).toFixed(0)} ms`);
+          manager.disconnect();
+          continue;
+        }
+
         if (point.product) {
           const runOnceProduct = async () => {
             const local = path.join(scratchDir, "sweep-product.bin");
@@ -672,7 +709,7 @@ async function main() {
           for (let i = 0; i < profile.runs; i += 1) productSamples.push(await runOnceProduct());
           const productThroughput = throughput(profile.fileBytes, median(productSamples));
           rows.push({ ...point, connections: point.product, samples: productSamples, aggregateBytesPerSec: productThroughput, perConnectionBytesPerSec: productThroughput / point.product });
-          log(`  ${point.label.padEnd(30)} ${(productThroughput / (1024 * 1024)).toFixed(2)} MiB/s`);
+          log(`  ${point.label.padEnd(30)} ${(productThroughput / (1024 * 1024)).toFixed(2)} MiB/s (median ${median(productSamples).toFixed(0)} ms)`);
           manager.disconnect();
           continue;
         }
@@ -700,7 +737,8 @@ async function main() {
         rows.push({ ...point, samples, aggregateBytesPerSec: aggregate, perConnectionBytesPerSec: perConn });
         log(
           `  ${point.label.padEnd(30)} aggregate ${(aggregate / (1024 * 1024)).toFixed(2)} MiB/s` +
-            (point.connections > 1 ? ` (${(perConn / (1024 * 1024)).toFixed(2)} MiB/s per connection)` : ""),
+            (point.connections > 1 ? ` (${(perConn / (1024 * 1024)).toFixed(2)} MiB/s per connection)` : "") +
+            ` (median ${median(samples).toFixed(0)} ms)`,
         );
         manager.disconnect();
       }

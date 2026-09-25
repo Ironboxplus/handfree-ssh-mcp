@@ -1969,39 +1969,61 @@ export class TransferService {
     };
 
     try {
-      // The very first connection is not a separate "control" connection --
-      // it doubles as the connection for range 0 once ranges are known, so a
-      // request for `connections=N` opens exactly N connections total, never
-      // N+1. Every connection here is a fresh one-shot handshake regardless
-      // of the caller's reuseConnection option: independent connections are
-      // this feature's entire mechanism, not something reuseConnection could
-      // meaningfully toggle off.
-      const first = await this.pool.acquireSshClient(resolvedName, {
-        reuseConnection: false,
-        timeout,
-        debug,
-        purpose: "sftp",
-      });
-      acquired.push(first);
-      sftpSessions.push(await this.openSftp(first.client, "multi-download-0", timeout, debug));
+      // All N connections are established CONCURRENTLY, before the file size
+      // is known. Measured on the real 50ms netem lab (PLAN.MD P1-04e), one
+      // handshake + SFTP open costs ~685ms there, and doing them one after
+      // another was the entire gap between this feature and N parallel
+      // fastGets: connections=4 spent 2.7s of 4.9s connecting, connections=8
+      // spent 5.5s of 7.1s (why 8 measured slower than 4). The data path was
+      // already at parity. Opening the rest only after a first connection had
+      // stat'ed the file would still cost two handshake rounds instead of one.
+      // The trade-off: a file smaller than N BYTES opens connections it then
+      // closes unused -- a transfer that small is negligible either way.
+      //
+      // Concurrent handshakes are what sshd's MaxStartups limits (default
+      // 10:30:100 -- random drops start at 10 unauthenticated connections),
+      // which the hard cap of 8 stays under.
+      //
+      // Every connection is a fresh one-shot handshake regardless of the
+      // caller's reuseConnection option: independent connections are this
+      // feature's entire mechanism, not something reuseConnection could
+      // meaningfully toggle off. allSettled, not all: if one handshake fails,
+      // the ones that succeeded must still be recorded so closeAll() releases
+      // them -- Promise.all would drop them on the floor, still connected.
+      const established = await Promise.allSettled(
+        Array.from({ length: connections }, async (_, index) => {
+          const acquiredConnection = await this.pool.acquireSshClient(resolvedName, {
+            reuseConnection: false,
+            timeout,
+            debug,
+            purpose: "sftp",
+          });
+          try {
+            return {
+              acquiredConnection,
+              sftp: await this.openSftp(acquiredConnection.client, `multi-download-${index}`, timeout, debug),
+            };
+          } catch (error) {
+            acquiredConnection.close();
+            throw error;
+          }
+        }),
+      );
+      for (const outcome of established) {
+        if (outcome.status === "fulfilled") {
+          acquired.push(outcome.value.acquiredConnection);
+          sftpSessions.push(outcome.value.sftp);
+        }
+      }
+      const firstFailure = established.find((outcome) => outcome.status === "rejected");
+      if (firstFailure) {
+        throw (firstFailure as PromiseRejectedResult).reason;
+      }
 
       const fileSize = (await this.sftpStat(sftpSessions[0], remotePath, "source")).size;
       const ranges = computeDownloadByteRanges(fileSize, connections);
-
-      for (let index = 1; index < ranges.length; index += 1) {
-        const acquiredConnection = await this.pool.acquireSshClient(resolvedName, {
-          reuseConnection: false,
-          timeout,
-          debug,
-          purpose: "sftp",
-        });
-        acquired.push(acquiredConnection);
-        sftpSessions.push(
-          await this.openSftp(acquiredConnection.client, `multi-download-${index}`, timeout, debug),
-        );
-      }
       debug?.(
-        `[mcp] multi-connection download: fileSize=${fileSize}, ${ranges.length} connection(s)/range(s)`,
+        `[mcp] multi-connection download: fileSize=${fileSize}, ${connections} connection(s) opened, ${ranges.length} range(s)`,
       );
 
       tempPath = `${localPath}.handfree-download-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tmp`;
@@ -2155,7 +2177,7 @@ export class TransferService {
       //
       // ssh2 caps each connection's SSH channel window at MAX_WINDOW = 2 MiB
       // (lib/Channel.js:15), so ~2 MiB per connection is all that window can
-      // hold: DEPTH x CHUNK = 8 x 256 KiB = 2 MiB fills it exactly. Issuing
+      // hold: DEPTH x CHUNK = 64 x 32 KiB = 2 MiB fills it exactly. Issuing
       // several concurrent reads on one SFTP handle is precisely what ssh2's
       // own fastGet does, and it is what made the measured 4-connection case
       // reach 59.93 MiB/s rather than ~20 (PLAN.MD P1-04c).

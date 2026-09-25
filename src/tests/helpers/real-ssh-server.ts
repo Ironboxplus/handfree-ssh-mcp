@@ -58,6 +58,13 @@ export interface RealSshServerStats {
   // deleted striped design, which shared one connection's SSH channel
   // window and could not speed anything up). See resetConnectionCount().
   connectionCount: number;
+  // Connections accepted but not yet authenticated ("ready"), and the peak
+  // of that since the last resetConnectionCount(). Distinguishes N handshakes
+  // done concurrently (peak N) from N done one after another (peak 1) --
+  // connectionCount alone reports N either way. Only meaningful together with
+  // setAuthDelayMs(), which gives each handshake a real duration to overlap in.
+  activeHandshakes: number;
+  maxActiveHandshakes: number;
 }
 
 const { Server } = ssh2;
@@ -131,6 +138,8 @@ export class RealSshTestServer {
     readRequests: [],
     execCommandCount: 0,
     connectionCount: 0,
+    activeHandshakes: 0,
+    maxActiveHandshakes: 0,
   };
 
   public port = 0;
@@ -164,6 +173,16 @@ export class RealSshTestServer {
   // failReadsAfterCount alone cannot make that distinction, since it fails
   // every connection's next read once the shared counter is past threshold.
   private failReadsForConnectionIndex: Set<number> | null = null;
+  // A real delay before accepting authentication, i.e. a handshake that
+  // genuinely takes this long -- the in-process stand-in for a
+  // high-latency link, where each SSH handshake costs several round trips.
+  // Same rationale as readResponseDelayMs: without it a local handshake is
+  // too fast for concurrent ones to observably overlap. 0 = unchanged.
+  private authDelayMs = 0;
+  // Connection indices (see connectionReadDelaysMs) whose authentication is
+  // genuinely rejected -- a real failed handshake for exactly one of several
+  // concurrent connections, the others staying healthy.
+  private rejectAuthForConnectionIndex: Set<number> | null = null;
   // PLAN.MD P1-08a: parsed once in the constructor from
   // directExecOptions.authorizedPublicKeyPem (see below), or undefined when
   // that option is omitted -- `any` because ssh2's ParsedKey type isn't
@@ -236,8 +255,19 @@ export class RealSshTestServer {
       // position among connections since the last resetConnectionCount().
       const connectionIndex = this.stats.connectionCount;
       this.stats.connectionCount++;
+      this.stats.activeHandshakes++;
+      this.stats.maxActiveHandshakes = Math.max(this.stats.maxActiveHandshakes, this.stats.activeHandshakes);
+      let handshakeCounted = true;
+      const endHandshake = () => {
+        if (!handshakeCounted) return;
+        handshakeCounted = false;
+        this.stats.activeHandshakes--;
+      };
       this.clients.add(client);
-      client.once("close", () => this.clients.delete(client));
+      client.once("close", () => {
+        endHandshake();
+        this.clients.delete(client);
+      });
       // PLAN.MD P1-08a: this fixture now routinely runs several real ssh2
       // servers concurrently in one test file (one making real outbound ssh
       // connections to another), so a connection being reset mid-teardown
@@ -247,12 +277,20 @@ export class RealSshTestServer {
       // for real; see this task's investigation notes).
       client.on("error", () => { /* connection reset during teardown; nothing to do */ });
       client.on("authentication", (context) => {
+        if (this.rejectAuthForConnectionIndex?.has(connectionIndex)) {
+          context.reject([]);
+          return;
+        }
         if (
           context.method === "password" &&
           context.username === "test" &&
           context.password === "test"
         ) {
-          context.accept();
+          if (this.authDelayMs > 0) {
+            setTimeout(() => context.accept(), this.authDelayMs);
+          } else {
+            context.accept();
+          }
           return;
         }
         if (context.method === "publickey" && this.authorizedKey) {
@@ -284,6 +322,7 @@ export class RealSshTestServer {
         context.reject();
       });
       client.on("ready", () => {
+        endHandshake();
         client.on("session", (accept) => {
           const session = accept();
           session.on("sftp", (acceptSftp) => {
@@ -389,6 +428,22 @@ export class RealSshTestServer {
    */
   public resetConnectionCount(): void {
     this.stats.connectionCount = 0;
+    this.stats.maxActiveHandshakes = this.stats.activeHandshakes;
+  }
+
+  /** See authDelayMs above. */
+  public setAuthDelayMs(delayMs: number): void {
+    this.authDelayMs = delayMs;
+  }
+
+  /** See rejectAuthForConnectionIndex above; null clears it. */
+  public setRejectAuthForConnectionIndices(indices: number[] | null): void {
+    this.rejectAuthForConnectionIndex = indices ? new Set(indices) : null;
+  }
+
+  /** Connections currently open on the server side, whatever their state. */
+  public get liveConnectionCount(): number {
+    return this.clients.size;
   }
 
   /** See connectionReadDelaysMs above. */

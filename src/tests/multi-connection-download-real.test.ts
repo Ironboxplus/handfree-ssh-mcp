@@ -210,6 +210,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     const localPath = path.join(localRoot, "tiny-three-bytes.bin");
 
     server.resetConnectionCount();
+    server.resetReadLog();
     const result = await mcpClient.callTool({
       name: "download",
       arguments: { remotePath, localPath, connectionName: "multiconn", connections: 8, timeout: 10000 },
@@ -218,19 +219,28 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     assert.match(responseText(result), /via 3 independent connection\(s\)/);
     assert.equal(fs.statSync(localPath).size, 3);
     assert.equal(sha256File(localPath), sha256File(sourcePath));
-    // requested 8, but a 3-byte file can only ever justify 3 real
-    // connections/workers -- proves no empty worker/connection was opened
-    // for the other 5.
-    assert.equal(server.stats.connectionCount, 3);
+    // All 8 requested connections are opened up front, concurrently -- the
+    // file size is not known until one of them stats it, and waiting for
+    // that before opening the rest would cost a second full handshake
+    // round on every download (see the concurrent-handshake test below).
+    // The price is paid only here, for a file smaller than N BYTES: the 5
+    // surplus connections are closed unused. What must still hold is that
+    // no EMPTY range worker runs -- the server saw exactly 3 one-byte READs.
+    assert.equal(server.stats.connectionCount, 8);
+    assert.deepEqual(
+      [...server.stats.readRequests].sort((a, b) => a.offset - b.offset),
+      [{ offset: 0, length: 1 }, { offset: 1, length: 1 }, { offset: 2, length: 1 }],
+    );
   });
 
-  test("black-box: an empty file opens exactly one connection (to discover the size) and zero range workers", async () => {
+  test("black-box: an empty file runs zero range workers and still lands as an empty file", async () => {
     const remotePath = "/empty.bin";
     const sourcePath = server.toLocalPath(remotePath);
     fs.writeFileSync(sourcePath, Buffer.alloc(0));
     const localPath = path.join(localRoot, "empty.bin");
 
     server.resetConnectionCount();
+    server.resetReadLog();
     const result = await mcpClient.callTool({
       name: "download",
       arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
@@ -238,7 +248,10 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     assert.equal(result.isError, undefined, responseText(result));
     assert.match(responseText(result), /via 0 independent connection\(s\)/);
     assert.equal(fs.statSync(localPath).size, 0);
-    assert.equal(server.stats.connectionCount, 1);
+    // Opened concurrently before the size was known (see the tiny-file test
+    // above for why), then closed unused: not one READ was issued.
+    assert.equal(server.stats.connectionCount, 4);
+    assert.deepEqual(server.stats.readRequests, []);
   });
 
   test("grey-box: connections=4 opens 4 real, distinct TCP+SSH connections -- not 4 channels on one connection", async () => {
@@ -263,6 +276,89 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     assert.equal(result.isError, undefined, responseText(result));
     assert.equal(sha256File(localPath), sha256File(sourcePath));
     assert.equal(server.stats.connectionCount, 4, "expected exactly 4 distinct real TCP+SSH connections");
+  });
+
+  test("grey-box: the N connections are established CONCURRENTLY, not one handshake after another", async () => {
+    // Measured on the real 50ms netem lab (PLAN.MD P1-04e): one handshake
+    // costs ~685ms there, and establishing them serially was the WHOLE gap
+    // between this feature and N parallel fastGets -- connections=4 spent
+    // 2.7s of its 4.9s just connecting, and connections=8 spent 5.5s of 7.1s,
+    // which is why 8 measured slower than 4. The data path itself was at
+    // parity. A real server-side auth delay stands in for that latency here.
+    const authDelayMs = 400;
+    const size = 200_000;
+    const remotePath = "/concurrent-handshakes.bin";
+    const sourcePath = server.toLocalPath(remotePath);
+    fs.writeFileSync(sourcePath, randomBytes(size));
+    const localPath = path.join(localRoot, "concurrent-handshakes.bin");
+
+    server.setAuthDelayMs(authDelayMs);
+    try {
+      server.resetConnectionCount();
+      const startedAt = Date.now();
+      const result = await mcpClient.callTool({
+        name: "download",
+        arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
+      });
+      const elapsed = Date.now() - startedAt;
+      assert.equal(result.isError, undefined, responseText(result));
+      assert.equal(sha256File(localPath), sha256File(sourcePath));
+      assert.equal(server.stats.connectionCount, 4);
+      // The load-bearing assertion: the server itself saw all 4 handshakes
+      // in progress at the same moment. Serial establishment peaks at 1.
+      assert.equal(server.stats.maxActiveHandshakes, 4, "expected all 4 handshakes to be in flight at once");
+      // And the consequence the user actually feels: ~one handshake of
+      // latency, not four (serial would be >= 4 x 400 = 1600ms).
+      assert.ok(elapsed < authDelayMs * 3, `expected ~1 handshake of latency, took ${elapsed}ms`);
+    } finally {
+      server.setAuthDelayMs(0);
+    }
+  });
+
+  test("failure/cleanup: one of the concurrent handshakes failing leaves no other connection open", async () => {
+    // Connections are now established concurrently, so when one fails the
+    // others may still be mid-handshake or already up. Every one that did
+    // come up must be closed -- none may be leaked, still connected to the
+    // server, after the call returns its error.
+    const remotePath = "/handshake-failure.bin";
+    fs.writeFileSync(server.toLocalPath(remotePath), randomBytes(100_000));
+    const localPath = path.join(localRoot, "handshake-failure.bin");
+    // Let the other connections still be in their handshake when #2 fails,
+    // which is the case that leaks if the failure is propagated without
+    // waiting for, and then closing, the ones still in progress.
+    // Server-side close events arrive asynchronously after a client ends its
+    // socket; poll briefly rather than guess a sleep.
+    const waitForNoLiveConnections = async () => {
+      const deadline = Date.now() + 3000;
+      while (server.liveConnectionCount > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    };
+    // Start from zero: earlier tests' connections (and the pool's cached
+    // client) may still be closing, which would make any other baseline race.
+    manager.disconnect();
+    await waitForNoLiveConnections();
+    assert.equal(server.liveConnectionCount, 0, "precondition: no connection left over from earlier tests");
+
+    server.setAuthDelayMs(200);
+    server.setRejectAuthForConnectionIndices([2]);
+    try {
+      server.resetConnectionCount();
+      const result = await mcpClient.callTool({
+        name: "download",
+        arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
+      });
+      assert.equal(result.isError, true, "a failed handshake must fail the download");
+      assert.equal(server.stats.connectionCount, 4);
+      assert.equal(fs.existsSync(localPath), false);
+      assert.deepEqual(leftoverTempFiles(localRoot), []);
+
+      await waitForNoLiveConnections();
+      assert.equal(server.liveConnectionCount, 0, "every connection that came up must have been closed");
+    } finally {
+      server.setAuthDelayMs(0);
+      server.setRejectAuthForConnectionIndices(null);
+    }
   });
 
   test("grey-box: connections=1 (the default) opens exactly 1 real connection, same as today", async () => {

@@ -177,14 +177,19 @@ describe("documentation coverage: every tool parameter appears in that tool's he
     }
   });
 
-  test("the connections guidance states the measured caveat, not just that the option exists", () => {
-    // connections=8 measured SLOWER than a single connection on the lab link.
-    // Documenting the knob without that caveat invites users straight into
-    // the regression, so the caveat is asserted, not merely the mention.
+  test("the connections guidance states the real remote limit and the measured returns, not just that the option exists", () => {
+    // The N handshakes are made concurrently, so the remote limit a user can
+    // actually hit is sshd's MaxStartups (unauthenticated connections), not
+    // MaxSessions -- documenting the knob without naming it invites a
+    // connection-drop the user cannot diagnose. The earlier caveat here
+    // ("8 is SLOWER") described serial connection setup, which was fixed in
+    // 2.1.4; the measured, diminishing returns replace it.
     const helpText = TOOL_HELP_FOR_TEST["download"];
     assert.match(helpText, /MaxStartups/, "help must name the remote limit that actually applies to N connections");
-    assert.match(helpText, /SLOWER/, "help must warn that raising connections too far measured slower");
+    assert.match(helpText, /concurrent/i, "help must say the handshakes are concurrent -- that is why MaxStartups applies");
+    assert.match(helpText, /Diminishing returns/i, "help must state the measured returns, not imply more is always better");
     assert.match(SERVER_INSTRUCTIONS, /MaxStartups/);
-    assert.match(SERVER_INSTRUCTIONS, /SLOWER/);
+    assert.match(SERVER_INSTRUCTIONS, /concurrently/);
+    assert.match(SERVER_INSTRUCTIONS, /diminishing returns/i);
   });
 });

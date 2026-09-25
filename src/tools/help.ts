@@ -182,11 +182,13 @@ Parameters:
                   reassemble, verify and atomically rename. Maximum 8.
                   Helps on high-latency links, where one connection is capped by
                   the SSH channel's flow-control window; pointless on a fast LAN.
-                  Each connection is a separate SSH handshake, so the remote
-                  limit that matters is sshd's MaxStartups, not MaxSessions.
-                  Measured on a 50 ms / 1 Gbps link: 4 was best, and 8 was
-                  SLOWER than a single connection. Measure your own link before
-                  raising it.
+                  Each connection is a separate SSH handshake and they all run
+                  concurrently, so the remote limit that matters is sshd's
+                  MaxStartups (OpenSSH default 10:30:100 starts dropping at 10),
+                  not MaxSessions. Measured on a 50 ms / 1 Gbps link against
+                  17.5 MiB/s for one connection: 2 -> 28.5, 4 -> 45.7,
+                  8 -> 53.9 MiB/s. Diminishing returns past 4; the gain depends
+                  on your link's RTT and bandwidth.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -245,9 +247,10 @@ Parameters for upload / download:
                   non-overlapping byte ranges pulled over that many INDEPENDENT
                   SSH/TCP connections, reassembled, verified, atomically
                   renamed. Maximum 8. Helps on high-latency links; pointless on
-                  a fast LAN. Separate handshakes, so sshd's MaxStartups is the
-                  limit that matters, not MaxSessions. Measured on 50 ms /
-                  1 Gbps: 4 best, 8 SLOWER than one connection. Rejected for
+                  a fast LAN. Separate, concurrent handshakes, so sshd's
+                  MaxStartups is the limit that matters, not MaxSessions.
+                  Measured on 50 ms / 1 Gbps (one connection 17.5 MiB/s):
+                  2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s. Rejected for
                   upload, recursive=true and archive=true.
   fileConcurrency (number, optional)   Recursive or batch upload only: independent
                   files transferred in parallel. Default 4, maximum 8. Each

@@ -175,18 +175,18 @@ servers:
 
 关键在于是独立的**连接**，而不是更多的 SFTP channel：同一条 SSH 连接上的所有 channel 共享该连接的流控窗口（ssh2 把它写死为 2 MiB），所以多开 channel 换不来任何东西；多一条连接才多一个窗口。
 
-该选项在**高延迟**链路上有效——单连接的吞吐大致被 窗口/RTT 限制；在低延迟局域网上没有意义。每条连接都是一次独立的 SSH 握手，因此对端的相关限制是 sshd 的 `MaxStartups` 而非 `MaxSessions`。
+该选项在**高延迟**链路上有效——单连接的吞吐大致被 窗口/RTT 限制；在低延迟局域网上没有意义。每条连接都是一次独立的 SSH 握手，且所有握手并发进行（总代价约等于一次握手，而不是 N 次），因此对端的相关限制是 sshd 的 `MaxStartups` 而非 `MaxSessions`——OpenSSH 默认的 `10:30:100` 在未认证连接达到 10 条时开始丢弃。
 
 在真实 `tc netem` 环境下实测（50 ms / 1 Gbps，128 MiB 文件，3 次取 median，每次校验 SHA-256）：
 
 | 设置 | 吞吐 |
 |---|---|
-| 默认单连接 | 17.88 MiB/s |
-| `connections: 2` | 25.18 MiB/s |
-| `connections: 4` | 26.50 MiB/s |
-| `connections: 8` | 17.81 MiB/s —— **比单连接还慢** |
+| 默认单连接 | 17.54 MiB/s |
+| `connections: 2` | 28.54 MiB/s |
+| `connections: 4` | 45.71 MiB/s |
+| `connections: 8` | 53.86 MiB/s |
 
-以上数字只对那一条被整形的链路成立，实际收益取决于你自己链路的 RTT 与带宽。那里 `4` 最优而 `8` 反而更差，所以调高之前请先实测。`connections` 仅适用于单文件下载，对 upload、`recursive: true`、`archive: true` 均会被拒绝。
+以上数字只对那一条被整形的链路成立，实际收益取决于你自己链路的 RTT 与带宽。超过 `4` 之后收益递减。（2.1.4 之前的版本是一条接一条地建连，在那条链路上每条约 0.7 秒，导致 `8` 与单连接一样慢；数据通路本身从来不是瓶颈。）`connections` 仅适用于单文件下载，对 upload、`recursive: true`、`archive: true` 均会被拒绝。
 
 ### 🏃 workspace-run（远程运行）
 

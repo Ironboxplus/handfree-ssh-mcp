@@ -398,18 +398,18 @@ Rules (enforced at config load — bad configs fail fast):
 
 Independent *connections* is the point, and it is not the same as opening more SFTP channels: every channel on one SSH connection shares that connection's flow-control window (ssh2 hardcodes it at 2 MiB), so extra channels buy nothing. A second connection brings a second window.
 
-This helps on **high-latency** links, where one connection's window bounds throughput to roughly window/RTT. It does nothing useful on a fast LAN. Each connection is a separate SSH handshake, so the remote limit that matters is sshd's `MaxStartups`, not `MaxSessions`.
+This helps on **high-latency** links, where one connection's window bounds throughput to roughly window/RTT. It does nothing useful on a fast LAN. Each connection is a separate SSH handshake, and all of them are made concurrently (so the cost is about one handshake, not N), which makes sshd's `MaxStartups` the remote limit that matters, not `MaxSessions` — OpenSSH's default `10:30:100` starts dropping unauthenticated connections at 10.
 
 Measured on a real `tc netem` lab link at 50 ms / 1 Gbps (128 MiB file, median of 3 runs, SHA-256 verified every run):
 
 | setting | throughput |
 |---|---|
-| default single connection | 17.88 MiB/s |
-| `connections: 2` | 25.18 MiB/s |
-| `connections: 4` | 26.50 MiB/s |
-| `connections: 8` | 17.81 MiB/s — **slower than one connection** |
+| default single connection | 17.54 MiB/s |
+| `connections: 2` | 28.54 MiB/s |
+| `connections: 4` | 45.71 MiB/s |
+| `connections: 8` | 53.86 MiB/s |
 
-Those numbers describe that one shaped link only; your own gain depends on RTT and bandwidth. `4` was the best setting there and `8` was actively worse, so measure before raising it. `connections` applies to single-file download only and is rejected for upload, `recursive: true`, and `archive: true`.
+Those numbers describe that one shaped link only; your own gain depends on RTT and bandwidth. Returns diminish past `4`. (Releases before 2.1.4 opened the connections one after another, which cost ~0.7 s per connection on that link and made `8` no faster than a single connection; the data path itself was never the bottleneck.) `connections` applies to single-file download only and is rejected for upload, `recursive: true`, and `archive: true`.
 
 ### `execute-command` output capping & full logs
 

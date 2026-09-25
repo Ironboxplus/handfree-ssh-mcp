@@ -1046,13 +1046,46 @@ PLAN 正文 §2 要的是「多连接单文件分片」，`PLAN.MD:81` 甚至专
 
 **必须诚实记下的缺口**：本实现只拿到 1.48×，而**同样 4 条连接**改用 ssh2 自己的 `fastGet` 能到 3.28×。即每连接 6.6 vs 14.6 MiB/s，**我们的区间 worker 比 ssh2 自己的实现慢约 2 倍**。这不是协议或窗口上限，是实现差距。
 
-已定位到原因（`node_modules/ssh2/lib/protocol/SFTP.js:2379`）：`fastXfer` 用 `while (pdst < fsize && reads < concurrency)` **持续**把读请求补满到 concurrency，写入与读取解耦；而本实现的每个流水线槽位是 `读 → 写 → 读` 耦合的，槽位在写的时候不发读，有效在途深度因此低于标称的 64。修法是把读写解耦（读端只管把 concurrency 填满，写端独立消费），本轮**未做**。
+~~已定位到原因（`node_modules/ssh2/lib/protocol/SFTP.js:2379`）：`fastXfer` 用 `while (pdst < fsize && reads < concurrency)` **持续**把读请求补满到 concurrency，写入与读取解耦；而本实现的每个流水线槽位是 `读 → 写 → 读` 耦合的，槽位在写的时候不发读，有效在途深度因此低于标称的 64。修法是把读写解耦（读端只管把 concurrency 填满，写端独立消费），本轮**未做**。~~ **〔2026-09-25 撤回，见 P1-04e〕** 这段诊断是错的：`SFTP.js:2379` 的 `while` 只在 `startReads()` 里执行一次，之后 `fastXfer` 的每个槽位同样是 `onread → dst.write → writeCb → singleRead`，**与本实现结构相同**。而且在 50 ms RTT 下，本地异步写一个 32 KiB 块耗时远低于 1 ms，耦合损失不到 1%，数量级上就解释不了 2 倍——下面第 2 条假设（同步写）被实测否定时，这一点其实已经露出来了。真正的原因是计时口径：参照组复用预热连接，产品组计时包含 N 次**串行**握手。
 
 排查过程中否定掉的两个假设（都靠实测，不靠推理）：
 1. **chunk 大小**：原为 256 KiB，而 `sftpReadRelayChunk` 会循环直到读满、SFTP 单次 READ 响应通常上限 32 KiB —— 所以一次「256 KiB 读」其实是 ~8 次**串行**往返，标称深度 8 实际只有 8 × 32 KiB = 256 KiB 在途。改为 32 KiB × 深度 64（= 2 MiB，正好是 ssh2 的 MAX_WINDOW）后：23.37 → 26.11 MiB/s。有效但不足以解释缺口。
 2. **同步写阻塞事件循环**：`fs.writeSync` 改为异步 `fs.write`（4 × 64 = 256 个并发写确实会卡住事件循环，且 `connections=8` 反而更慢与此假设吻合）。实测 26.11 → 26.50，**几乎无差别，假设被否定**。`connections=8` 更慢的真正原因仍未定位。
 
-**产品内的说法**：工具描述只写行为（「通过 N 条独立连接拉取各自的字节区间」），并明确写出「8 实测比 4 更慢」。不写任何倍数承诺——倍数依赖链路 RTT 与带宽，上表只对这条 50 ms/1 Gbps 的 lab 链路成立。
+**产品内的说法**：工具描述只写行为（「通过 N 条独立连接拉取各自的字节区间」），并明确写出「8 实测比 4 更慢」。不写任何倍数承诺——倍数依赖链路 RTT 与带宽，上表只对这条 50 ms/1 Gbps 的 lab 链路成立。〔2026-09-25：「8 比 4 更慢」已随 P1-04e 修复失效，产品文案改为实测的递减收益。〕
+
+### P1-04e 多连接下载：并行建连（已交付，2026-09-25，2.1.4）
+
+**结论先行**：P1-04d 记下的「比 fastGet 慢约 2 倍」**不是数据通路的差距，全部是串行握手**。数据通路与 fastGet 持平。修法是 N 条连接并行建立，`connections=4` 从 1.48× 到 **2.61×**，`connections=8` 从 1.00× 到 **3.07×**。
+
+**怎么查出来的**：先核对 P1-04d 的诊断（读写耦合），发现它与 `fastXfer` 源码不符（见 P1-04d 内的撤回注记）。再对比 `scripts/benchmark.mjs` 两组的计时：参照组（`x N CONNECTIONS`）用 `reuseConnection:true`，warm-up 已把连接建好，计时**不含握手**；产品组每次调用 `acquireSshClient({reuseConnection:false})`，且 `downloadMultiConnection` 用 `for` 循环 `await` 逐条建连，计时**含 N 次串行握手 + SFTP open**。于是给 harness 加了 `SETUP ONLY` 行，单独测建连，在真实 `.88` netem lab（50 ms/1 Gbps，128 MiB，median of 3，每次校验 SHA-256）上拆分：
+
+| | 总耗时 | 串行建连 | 纯数据 | 数据阶段吞吐 | 参照组（预热 fastGet） |
+|---|---|---|---|---|---|
+| `connections=2` | 5096 ms | ~1370 ms | 3726 ms | 34.4 MiB/s | 33.3 MiB/s |
+| `connections=4` | 4866 ms | 2749 ms | 2117 ms | 60.5 MiB/s | 57.5 MiB/s |
+| `connections=8` | 7103 ms | 5490 ms | 1613 ms | 79.4 MiB/s | — |
+
+单次握手 ~685 ms。`connections=8` 更慢的原因随之明确：数据只要 1.6 s，建连要 5.5 s。
+
+**修法**（`transfer-service.ts` `downloadMultiConnection`）：N 条连接在**得知文件大小之前**用 `Promise.allSettled` 全部并发建立，第一条用来 stat。用 `allSettled` 而非 `all`：一条握手失败时，其余已连上的必须被记录下来由 `closeAll()` 关闭，`all` 会把它们丢掉、连接泄漏。取舍：先 stat 再并行建其余连接要付两轮握手；代价只落在**小于 N 字节**的文件上（多开的连接不用即关）。并发握手使 sshd `MaxStartups`（默认 `10:30:100`，未认证连接到 10 开始随机丢弃）成为真正相关的上限，硬上限 8 在其之下。
+
+**测试**（`multi-connection-download-real.test.ts`，17 项）：`RealSshTestServer` 新增真实服务端认证延迟 `setAuthDelayMs`、并发握手计数 `activeHandshakes/maxActiveHandshakes`、按连接编号拒绝认证 `setRejectAuthForConnectionIndices`、`liveConnectionCount`。
+- 灰盒：认证延迟 400 ms 下 `connections=4`，服务端观测到的并发握手峰值必须为 4，总耗时 < 3×延迟。修复前实测峰值 **1**（真实 RED）。
+- 失败清理：4 条中第 3 条认证被真实拒绝，调用报错，服务端存活连接最终回到 0。**变异验证**：把 `allSettled` 换成 `Promise.all`，该测试变红，实测 **3 条连接泄漏**。
+- 两条既有断言按新契约修改（非迁就）：3 字节文件 `connections=8` 与空文件 `connections=4` 的连接数由「恰好等于区间数」改为「等于请求数」，同时新增服务端真实 READ 日志断言，守住原本真正要守的性质——**不产生空的区间 worker**（3 字节文件恰好 3 个 1 字节 READ，空文件 0 个 READ）。
+
+**真机实测（修复后，同一 harness）**：
+
+| | 修复前 | 修复后 | 相对单连接 17.54 MiB/s |
+|---|---|---|---|
+| `connections=2` | 25.12 | **28.54** MiB/s | 1.63× |
+| `connections=4` | 26.30 | **45.71** MiB/s | 2.61× |
+| `connections=8` | 18.02 | **53.86** MiB/s | 3.07× |
+
+修复前按「一次握手 ~685 ms + 数据 2117 ms」预测 `connections=4` ≈ 46 MiB/s，实测 45.71。
+
+**仍存在的差距（记账）**：修复后的 `connections=4` 总耗时 2800 ms 中，约 700 ms 仍是一次握手——对 128 MiB 的文件占 25%，文件越大占比越小。这是一次性连接的固有成本，本轮不处理。另外 benchmark 首轮的单连接 baseline 出现过一次 14.34 MiB/s（其余各轮均为 ~17.5），倍数一律以修复后同一轮的 17.54 计。
 
 ### P1-05 Capability-gated striped upload 〔2026-09-16 作废〕
 
@@ -1206,7 +1239,7 @@ Rev.4 修正：本任务原先被排在 `P1-01 → P1-02 → P1-09`，即等 Tra
 | 用户目标 | 状态 | 对应任务 |
 |---|---|---|
 | 批量上传 | ✅ 已交付 `d0dc039` | P1-09 |
-| 传输加速 | 🔄 部分 | P1-03a ✅ `8244a90`；P1-04a `06b1552` **已删除**（P1-04b 真机证伪，striped 比 baseline 慢 2.3×）；P1-04b 已跑出真实数字（`fast` 19.5 MiB/s = 线速 16.4%），下一步杠杆「提高在途字节数」已记账未做 |
+| 传输加速 | 🔄 部分 | P1-04d/P1-04e ✅ 多连接单文件下载（2.1.4，50 ms/1 Gbps 实测 `connections=4` 2.61×、`8` 3.07×；**仅 download 方向**）；P1-03a ✅ `8244a90`；P1-04a `06b1552` **已删除**（P1-04b 真机证伪，striped 比 baseline 慢 2.3×）；P1-04b 已跑出真实数字（`fast` 19.5 MiB/s = 线速 16.4%），下一步杠杆「提高在途字节数」已记账未做 |
 | 远程运行 | ⬜ 本节 | P2-01/02/03/04/05/06 |
 | 两服务器直传 | ✅ 已交付 | P1-08a（P1-08b 的 rclone/agent-forward/daemon 崩溃重入按 Rev.4 不适用） |
 
