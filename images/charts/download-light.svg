@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="326" viewBox="0 0 720 326" role="img"
+  aria-label="Single-file download throughput in MiB/s over a 50 ms, 1 Gbps link. One connection: 17.5. Two connections: 28.5 on the first call, 35.2 on a repeat call. Four: 45.6 and 63.2. Eight: 53.8 and 82.8.">
+  <text x="0" y="22" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="17" font-weight="600" fill="#1f2328">Single-file download, 128 MiB over a 50 ms / 1 Gbps link</text>
+  <text x="0" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">MiB/s · median of 3 runs · SHA-256 verified every run</text>
+  <rect x="0" y="58" width="12" height="12" rx="3" fill="#818b98"/><text x="18" y="68.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">Single connection</text>
+  <rect x="150" y="58" width="12" height="12" rx="3" fill="#2a78d6"/><text x="168" y="68.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">First call (handshakes included)</text>
+  <rect x="378" y="58" width="12" height="12" rx="3" fill="#eb6834"/><text x="396" y="68.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">Repeat call (pooled connections)</text>
+  <line x1="128" y1="84" x2="128" y2="292" stroke="#d1d9e0" stroke-width="1"/>
+  <text x="128" y="310" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e">0</text>
+  <line x1="247.1111111111111" y1="84" x2="247.1111111111111" y2="292" stroke="#d1d9e0" stroke-width="1"/>
+  <text x="247.1111111111111" y="310" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e">20</text>
+  <line x1="366.2222222222222" y1="84" x2="366.2222222222222" y2="292" stroke="#d1d9e0" stroke-width="1"/>
+  <text x="366.2222222222222" y="310" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e">40</text>
+  <line x1="485.3333333333333" y1="84" x2="485.3333333333333" y2="292" stroke="#d1d9e0" stroke-width="1"/>
+  <text x="485.3333333333333" y="310" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e">60</text>
+  <line x1="604.4444444444443" y1="84" x2="604.4444444444443" y2="292" stroke="#d1d9e0" stroke-width="1"/>
+  <text x="604.4444444444443" y="310" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e">80</text>
+  <text x="116" y="104.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">1 connection</text>
+  <path d="M128 92 H228.22222222222223 a4 4 0 0 1 4 4 V104 a4 4 0 0 1 -4 4 H128 Z" fill="#818b98"/>
+  <text x="240.22222222222223" y="104.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">17.5</text>
+  <text x="116" y="151.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">2 connections</text>
+  <path d="M128 130 H293.73333333333335 a4 4 0 0 1 4 4 V142 a4 4 0 0 1 -4 4 H128 Z" fill="#2a78d6"/>
+  <text x="305.73333333333335" y="142.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">28.5</text>
+  <path d="M128 148 H333.6355555555556 a4 4 0 0 1 4 4 V160 a4 4 0 0 1 -4 4 H128 Z" fill="#eb6834"/>
+  <text x="345.6355555555556" y="160.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">35.2</text>
+  <text x="116" y="207.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">4 connections</text>
+  <path d="M128 186 H395.5733333333334 a4 4 0 0 1 4 4 V198 a4 4 0 0 1 -4 4 H128 Z" fill="#2a78d6"/>
+  <text x="407.5733333333334" y="198.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">45.6</text>
+  <path d="M128 204 H500.3911111111112 a4 4 0 0 1 4 4 V216 a4 4 0 0 1 -4 4 H128 Z" fill="#eb6834"/>
+  <text x="512.3911111111112" y="216.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">63.2</text>
+  <text x="116" y="263.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">8 connections</text>
+  <path d="M128 242 H444.4088888888889 a4 4 0 0 1 4 4 V254 a4 4 0 0 1 -4 4 H128 Z" fill="#2a78d6"/>
+  <text x="456.4088888888889" y="254.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">53.8</text>
+  <path d="M128 260 H617.1199999999999 a4 4 0 0 1 4 4 V272 a4 4 0 0 1 -4 4 H128 Z" fill="#eb6834"/>
+  <text x="629.1199999999999" y="272.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#1f2328">82.8</text>
+  <text x="664" y="310" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e" dx="44">MiB/s</text>
+</svg>
