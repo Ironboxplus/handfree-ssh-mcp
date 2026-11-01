@@ -13,6 +13,7 @@ export const componentSchema = z.object({
   target: z.enum(["local", "ssh"]),
   description: z.string(),
   setup: word.optional(),
+  defaults: settings.default({}),
   entry: argv,
   version: argv,
   source: z.object({ kind: z.string(), location: z.string(), package: z.string().optional() }).strict().optional(),

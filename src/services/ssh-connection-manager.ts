@@ -1075,6 +1075,7 @@ export class SSHConnectionManager {
       maxOutputBytes?: number;
       reuseConnection?: boolean;
       vvv?: boolean;
+      onProgress?: (chunk: string) => void;
     } = {}
   ): Promise<string> {
     // Validate command input and security
@@ -1120,6 +1121,7 @@ export class SSHConnectionManager {
           exitCode = await this.runCommandStream(cmdString, client, timeout, {
             stdoutCollector,
             stderrCollector,
+            onProgress: options.onProgress,
             logWriter: logWriter ?? undefined,
             debug,
             channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),

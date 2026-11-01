@@ -3862,9 +3862,16 @@ export class TransferService {
     const open = new Promise<SFTPWrapper>((resolve, reject) => {
       client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
         if (err) {
-          // A client that cannot open an SFTP channel is unusable, so treat the
-          // failure as connection-shaped regardless of wording. This lets the
-          // caller force-drop the stale cached client and self-heal on retry.
+          // A missing remote subsystem does not mean the SSH transport died.
+          // Retain authenticated exec channels, including short-lived bastions.
+          if (/exit code 127\b.*establishing SFTP session/i.test(err.message)) {
+            return reject(new ToolError(
+              "SFTP_ERROR",
+              `Remote SFTP subsystem is unavailable (${label}); SSH command connections are preserved. Check the server's SFTP installation: ${err.message}`,
+              false,
+            ));
+          }
+          // Other channel failures retain stale-client recovery behavior.
           return reject(new ToolError(
             "SSH_CONNECTION_FAILED",
             `SFTP connection failed (${label}): ${err.message}`,

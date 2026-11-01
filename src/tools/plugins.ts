@@ -20,7 +20,16 @@ export function registerPluginTools(server: McpServer): void {
   server.tool("plugin-activate", "Check the installed version and fetch the current skill catalog. Explicit mode install/update runs the configured package installer on the selected host; first read component setup in plugin-list and resolve installation/initialization choices with the user unless explicitly delegated. Review running workloads. Successful installation is not completed initialization; follow the installed skill for readiness checks. Does not start schedulers or own Web lifetime.",
     {...target, mode: z.enum(["check", "install", "update"]).default("check"),
       timeout: z.number().int().min(1000).max(1800000).optional().describe("Installer timeout in milliseconds (default 300000, maximum 1800000). Set the client request timeout accordingly for slow dependencies.")},
-    async ({mode, timeout, ...selection}) => reply(() => host.activate(selection, mode, timeout)));
+    async ({mode, timeout, ...selection}, extra) => {
+      let progress = 0;
+      const token = extra._meta?.progressToken;
+      const report = token === undefined ? undefined : (message: string) => {
+        void server.server.notification({method: "notifications/progress", params: {
+          progressToken: token, progress: ++progress, message: message.slice(-500),
+        }}).catch(() => {});
+      };
+      return reply(() => host.activate(selection, mode, timeout, report));
+    });
   server.tool("plugin-skill", "Read a skill from the installed plugin. Omit name for its catalog. Fetch again after updating the plugin. This returns instructions; it does not install a global client skill.",
     {...target, name: z.string().min(1).optional()},
     async ({name, ...selection}) => reply(() => host.skill(selection, name)));

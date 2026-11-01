@@ -15,6 +15,35 @@ import { describe, it } from "node:test";
 import assert from "node:assert";
 import { EventEmitter } from "node:events";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
+import { TransferService } from "../services/transfer-service.js";
+import { ToolError } from "../utils/tool-error.js";
+
+describe("unavailable SFTP subsystem", () => {
+  for (const [message, code, dropped] of [
+    ["Received exit code 127 while establishing SFTP session", "SFTP_ERROR", false],
+    ["No response from server", "SSH_CONNECTION_FAILED", true],
+  ] as const) {
+    it(`${message}: preserves transport only for missing subsystem`, async () => {
+      let closed = false;
+      const pool = {
+        acquireSshClient: async () => ({ client: { sftp: (cb: Function) => cb(new Error(message)) } }),
+        normalizeConnectTimeout: () => 1000,
+        withConnectionTimeout: (pending: Promise<unknown>) => pending,
+        isConnectionError: (error: ToolError) => error.code === "SSH_CONNECTION_FAILED",
+        closeClient: () => { closed = true; },
+      };
+      const service = new TransferService(pool as any) as any;
+      const scope = service.openTransferScope("test", {}, undefined, 1);
+      try {
+        await assert.rejects(scope.run(0, () => assert.fail("SFTP is unavailable")),
+          (error: ToolError) => error.code === code && error.retriable === dropped);
+        assert.equal(closed, dropped);
+      } finally {
+        await scope.close();
+      }
+    });
+  }
+});
 
 describe("resolveKeepalive", () => {
   const manager = SSHConnectionManager.getInstance() as any;
