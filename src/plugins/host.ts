@@ -44,22 +44,25 @@ export class PluginHost {
       throw new ToolError("INVALID_CONFIGURATION", "A local component does not accept connectionName");
     const variables = {...resolved.component.defaults, ...resolved.registration.settings,
       ...(connectionName ? resolved.registration.connections[connectionName] || {} : {})};
-    const templates = [...resolved.component.entry, ...resolved.component.version,
-      ...Object.values(resolved.component.env), ...(resolved.component.install || []), ...(resolved.component.update || [])];
+    return {...resolved, connectionName, variables};
+  }
+
+  private validateSettings(c: ReturnType<PluginHost["context"]>, templates: string[], variables = c.variables) {
     const required = [...new Set(templates.flatMap(value => [...value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)].map(m => m[1])))];
     const missing = required.filter(key => !variables[key]);
     if (missing.length) throw new ToolError("INVALID_CONFIGURATION",
       `Missing plugin settings: ${missing.join(", ")}. Registry: ${this.catalog.file}. ` +
-      `Set plugins.${target.plugin}.${connectionName ? `connections.${connectionName}` : "settings"}. ` +
+      `Set plugins.${c.manifest.id}.${c.connectionName ? `connections.${c.connectionName}` : "settings"}. ` +
       `Required keys: ${required.join(", ")}. Read plugin-list setup and ask for user-specific directories before installing.`);
-    return {...resolved, connectionName, variables};
   }
 
   private async execute(target: Target, select: (c: ReturnType<PluginHost["context"]>) => string[],
     timeout = 30000, extra: Record<string, string> = {}, runtimeArgs: string[] = [], onProgress?: (chunk: string) => void) {
     const c = this.context(target);
     const variables = {...c.variables, ...extra};
-    const argv = [...select(c).map(value => expand(value, variables)), ...runtimeArgs];
+    const command = select(c);
+    this.validateSettings(c, [...command, ...Object.values(c.component.env)], variables);
+    const argv = [...command.map(value => expand(value, variables)), ...runtimeArgs];
     if (argv.some(value => value.includes("\0"))) throw new ToolError("INVALID_CONFIGURATION", "NUL is not allowed");
     const env = Object.fromEntries(Object.entries(c.component.env).map(([key, value]) => [key, expand(value, variables)]));
     let output: string;
@@ -68,9 +71,8 @@ export class PluginHost {
         const command = sshCommand(argv, env, variables.commandShell ?? "posix");
         // Use the existing manager, including its command policy, timeout and output limits.
         // Mutations are never automatically retried after an ambiguous SSH disconnect.
-        output = await this.ssh.executeCommand(command, c.connectionName, {timeout, maxRetries: 0, maxOutputBytes: 1024 * 1024, onProgress});
-        if (/\[EXIT CODE: [1-9]\d*\]/.test(output) || /\[OUTPUT TRUNCATED\]/.test(output))
-          throw new ToolError("COMMAND_EXECUTION_ERROR", output);
+        output = await this.ssh.executeCommand(command, c.connectionName, {timeout, maxRetries: 0,
+          maxOutputBytes: 1024 * 1024, onProgress, requireSuccess: true});
       } else {
         output = await this.executeLocal(argv, env, timeout);
       }
@@ -95,17 +97,20 @@ export class PluginHost {
 
   async activate(target: Target, mode: "check" | "install" | "update" = "check", timeout = 300000, onProgress?: (message: string) => void) {
     const c = this.context(target);
+    const command = mode === "check" ? undefined : c.component[mode];
+    if (mode !== "check" && !command)
+      throw new ToolError("INVALID_CONFIGURATION", `No ${mode} command configured for this component`);
+    this.validateSettings(c, [...(command || []), ...c.component.version,
+      ...(c.component.skills?.list || []), ...Object.values(c.component.env)]);
     const key = `${target.plugin}/${c.component.id}/${c.connectionName ?? "local"}`;
     if (this.mutations.has(key)) throw new ToolError("COMMAND_EXECUTION_ERROR", "Plugin maintenance is already in progress", true);
     const task = (async () => {
       if (mode !== "check") {
-        const command = c.component[mode];
-        if (!command) throw new ToolError("INVALID_CONFIGURATION", `No ${mode} command configured for this component`);
         onProgress?.(`Starting ${mode} on ${c.connectionName ?? "local"}`);
         const started = Date.now();
         const timer = setInterval(() => onProgress?.(`Installer running: ${Math.round((Date.now() - started) / 1000)} seconds elapsed`), 10000);
         try {
-          await this.execute(target, () => command, timeout, {}, [], onProgress);
+          await this.execute(target, () => command!, timeout, {}, [], onProgress);
         } catch (error) {
           if (error instanceof ToolError && error.code === "COMMAND_TIMEOUT")
             throw new ToolError("COMMAND_TIMEOUT", `Plugin ${mode} timed out after ${timeout}ms. Inspect the target environment before explicitly retrying; partial downloads/installations may remain. Increase timeout for slow networks or configure the component's dependency index.`, true);

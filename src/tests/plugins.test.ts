@@ -158,18 +158,102 @@ test("PowerShell SSH targets encode arguments and per-host environment for Windo
   } finally {f.clean();}
 });
 
-test("SSH policy rejection, failed exit and truncated output propagate as errors", async () => {
+test("SSH plugins use actual exit/truncation metadata, never markers inside successful logs", async () => {
   const f=fixture("ssh");
-  let output="[EXIT CODE: 2]";
-  const ssh={resolveServer:()=>"alpha",executeCommand:async()=>output} as unknown as SSHConnectionManager;
+  let stdout = "Previous failure: [EXIT CODE: 2]\nExample: [OUTPUT TRUNCATED]\nCurrent state: ready";
+  let stderr = "";
+  let exitCode: number | null = 0;
+  let attempts = 0;
+  // Exercise the real buffered executor and formatting, with only the SSH transport stubbed.
+  const ssh = Object.assign(Object.create(SSHConnectionManager.prototype), {
+    resolveServer: () => "alpha",
+    validateCommand: () => ({isAllowed:true}),
+    acquireSshClient: async () => { attempts++; return {client:{},close:()=>{}}; },
+    getConfig: () => ({}),
+    resolveChannelOpenTimeout: () => 1000,
+    createLogWriter: () => null,
+    isConnectionError: () => false,
+    runCommandStream: async (_cmd: string, _client: unknown, _timeout: number, sinks: any) => {
+      sinks.stdoutCollector.push(stdout);
+      sinks.stderrCollector.push(stderr);
+      return exitCode;
+    },
+  }) as SSHConnectionManager;
   try {
     const host=new PluginHost(f.catalog,ssh);
-    await assert.rejects(host.activate({plugin:"demo"}), /EXIT CODE/);
-    output="[OUTPUT TRUNCATED]\npartial";
-    await assert.rejects(host.skill({plugin:"demo"}), /TRUNCATED/);
-    ssh.executeCommand=async()=>{throw new ToolError("COMMAND_VALIDATION_FAILED","blocked by SSH policy");};
+    assert.equal((await host.run({plugin:"demo"},["logs"])).output, stdout);
+    assert.equal((await host.activate({plugin:"demo"})).output, stdout);
+    exitCode = 2;
+    stdout = "real failure without a marker";
+    const before = attempts;
+    await assert.rejects(host.activate({plugin:"demo"}), /Command exited with code 2/);
+    assert.equal(attempts, before + 1, "failed commands must not be retried");
+    exitCode = null;
+    await assert.rejects(host.run({plugin:"demo"},[]), /without a confirmed exit code/);
+    exitCode = 0;
+    stdout = "x".repeat(1024 * 1024 + 1);
+    await assert.rejects(host.skill({plugin:"demo"}), /output was truncated/);
+    stdout = "ok";
+    stderr = "x".repeat(1024 * 1024 + 1);
+    await assert.rejects(host.run({plugin:"demo"},[]), /output was truncated/);
+    stderr = "";
+    exitCode = 2;
+    assert.match(await ssh.executeCommand("example", "alpha"), /\[EXIT CODE: 2\]/,
+      "ordinary SSH callers retain the existing text response");
+    (ssh as any).validateCommand=()=>({isAllowed:false,reason:"blocked by SSH policy"});
     await assert.rejects(host.run({plugin:"demo"},[]),(err:any)=>err.code==="COMMAND_VALIDATION_FAILED");
   } finally {f.clean();}
+});
+
+test("run, skills and version checks do not require settings for unrelated installers", async () => {
+  const f = fixture();
+  try {
+    f.manifest.components[0].install = ['${installPython}', '${script}', 'install'];
+    f.manifest.components[0].update = ['${updatePython}', '${script}', 'update'];
+    fs.writeFileSync(path.join(f.dir, 'manifest.json'), JSON.stringify(f.manifest));
+    const host = new PluginHost(f.catalog);
+    assert.deepEqual(JSON.parse((await host.run({plugin:'demo'},['status'])).output).args, ['status']);
+    assert.deepEqual(JSON.parse((await host.skill({plugin:'demo'},'ops')).output).args, ['skill','ops']);
+    assert.equal((await host.activate({plugin:'demo'})).mode, 'check');
+    await assert.rejects(host.activate({plugin:'demo'},'install'), /Missing plugin settings: installPython\./);
+    assert.ok(!fs.existsSync(path.join(f.dir,'worker.cjs.version')));
+    f.registry.plugins.demo.settings = {...f.registry.plugins.demo.settings,installPython:process.execPath} as any;
+    fs.writeFileSync(f.file, JSON.stringify(f.registry));
+    assert.equal((await host.activate({plugin:'demo'},'install')).mode, 'install');
+    await assert.rejects(host.activate({plugin:'demo'},'update'), /Missing plugin settings: updatePython\./);
+  } finally { f.clean(); }
+});
+
+test("activation validates its post-install version and skill configuration before changing anything", async () => {
+  const f = fixture();
+  try {
+    f.manifest.components[0].skills.list = ['${skillReader}'];
+    fs.writeFileSync(path.join(f.dir, 'manifest.json'), JSON.stringify(f.manifest));
+    const host = new PluginHost(f.catalog);
+    assert.ok((await host.run({plugin:'demo'},['status'])).output);
+    await assert.rejects(host.activate({plugin:'demo'},'install'), /Missing plugin settings: skillReader\./);
+    assert.ok(!fs.existsSync(path.join(f.dir,'worker.cjs.version')));
+  } finally { f.clean(); }
+});
+
+test("a failed build preserves the previously usable entry point", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'handfree-build-'));
+  try {
+    for (const name of ['scripts','src','build']) fs.mkdirSync(path.join(dir,name));
+    const script = path.join(dir,'scripts/build.mjs');
+    fs.copyFileSync(path.resolve('scripts/build.js'),script);
+    const entry = path.join(dir,'build/index.js');
+    fs.writeFileSync(entry,'// working build');
+    fs.writeFileSync(path.join(dir,'src/index.ts'),'const broken: = ;');
+    fs.writeFileSync(path.join(dir,'tsconfig.json'),JSON.stringify({
+      compilerOptions:{outDir:'build'},include:['src/**/*'],
+    }));
+    assert.throws(() => execFileSync(process.execPath,[script],{
+      env:{...process.env,PATH:path.resolve('node_modules/.bin')+path.delimiter+process.env.PATH},
+      stdio:'pipe',timeout:15000,
+    }), (error: any) => error.status !== 0 && String(error.stdout).includes('error TS'));
+    assert.equal(fs.readFileSync(entry,'utf8'),'// working build');
+  } finally { fs.rmSync(dir,{recursive:true,force:true}); }
 });
 
 test("ambiguous component, maintenance concurrency, installer failure and local timeout", async () => {

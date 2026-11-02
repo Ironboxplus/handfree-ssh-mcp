@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execSync } from "node:child_process";
-import { chmodSync, rmSync } from "node:fs";
+import { chmodSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
@@ -11,12 +11,9 @@ const __dirname = dirname(__filename);
 const rootDir = join(__dirname, "..");
 const buildFile = join(rootDir, "build", "index.js");
 
-// Remove stale output from other branches before compiling.
-rmSync(join(rootDir, "build"), {recursive: true, force: true});
-
 // Run TypeScript compiler
 console.log("Building TypeScript...");
-execSync("tsc", { stdio: "inherit", cwd: rootDir });
+execSync("tsc --noEmitOnError", { stdio: "inherit", cwd: rootDir });
 
 // Make executable on Unix-like systems (Linux, macOS, etc.)
 if (process.platform !== "win32") {

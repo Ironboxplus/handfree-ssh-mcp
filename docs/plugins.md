@@ -65,7 +65,10 @@ A component declares `id`, `target` (`local` or `ssh`), `description`, `entry` a
 
 `${settingName}` substitutes a registry setting in manifest argv/environment values.
 Per-connection settings override common settings. Missing/empty required values fail
-before any command is run. Substitution is single-pass. Runtime `args` are passed
+before the affected command is run. Run and skill calls only require their own command
+and environment settings; installer-only settings do not block an already installed plugin.
+Activation checks the selected maintenance command plus its subsequent version/skill
+queries before making changes. Substitution is single-pass. Runtime `args` are passed
 literally, without interpolation. No arbitrary JavaScript modules are loaded.
 
 For REXP, keep `platformRoot`, `rexpPath` and `platformPython` per server. The root is
@@ -95,8 +98,10 @@ SFTP continues to use existing upload/download/transfer tools and path policies.
 CLI outputs are returned as `{plugin,component,target,connectionName,output}`. Errors
 use existing MCP `isError` / code / message / retriable conventions. Output is limited
 to 1 MiB per stream (SSH), 1 MiB combined (local); detected truncation is an error.
-Remote exit errors are detected from the existing manager's exit markers; this is not a
-new transport protocol. A disconnected mutation is not retried automatically, since the
+Remote success is checked against the existing manager's actual exit code and output
+collector metadata. A zero exit code and complete output are required; marker-like text
+inside logs or skills is treated as ordinary content. Other SSH command callers retain
+their existing text response. A disconnected mutation is not retried automatically, since the
 remote operation might already have happened. Check its state before retrying.
 Normal command timeout defaults to 30 seconds (configurable up to 30 minutes through
 the tool for explicit long setup operations); maintenance defaults to 5 minutes. `plugin-activate.timeout` can explicitly
