@@ -9,7 +9,7 @@ plugin. No REXP command mapping or REXP dependency is built into Handfree.
 The optional registry defaults to `~/.config/handfree-ssh-mcp/plugins.yaml`
 (`$XDG_CONFIG_HOME/handfree-ssh-mcp/plugins.yaml` when set). Override it with
 `--plugins /absolute/path/plugins.yaml` or `HANDFREE_PLUGINS_CONFIG`.
-A missing registry means no plugins. An invalid registry returns a structured error
+Bundled manifests are discoverable even before a user registry exists. Personal registrations override them, and an explicit enabled: false disables a bundled plugin. An invalid registry returns a structured error
 when queried; ordinary SSH tools remain available. Files are reread on every plugin
 request, so restart is unnecessary after changing a manifest.
 Adding a plugin or installing it on another connected node uses the same fixed
@@ -116,8 +116,9 @@ global skills directory. Connection loss does not own the scheduler or an existi
 service. Use each program's explicit lifecycle commands. Foreground long-running servers
 should not be started with `plugin-run`; the REXP Web example uses its existing persistent
 `start/stop/status/logs` helper. Web's installation directory, data and lifecycle remain
-independent. The current Web example controls an existing checkout; it has no published
-update source or skill endpoint, so neither is fabricated by this manifest.
+independent. The Web plugin installs the npm package `rexp-web` on the MCP host and reads its
+versioned `web-operations` skill. Ask about login autostart before `configure --autostart on|off`,
+then call `open` and remind the user to bookmark the page. No postinstall script enables startup.
 
 ## Development verification
 
@@ -167,3 +168,14 @@ Keep private paths in the user registry. Reference the manifest inside the insta
 After isolated installation, `rexp init` registers a terminal command. Verify `rexp version` and `rexp doctor --json` directly in an ordinary target terminal, not only through absolute-path plugin calls. Platform root and experiment environments must match.
 
 If the server exits with code 127 while establishing its SFTP subsystem, file transfer reports a non-retriable `SFTP_ERROR` and preserves the authenticated SSH command connection. Install or configure the server's SFTP subsystem before retrying file transfer; reconnecting SSH cannot repair a missing subsystem.
+
+### Host-provided plugin paths
+
+The generic host provides `nodeExecutable`, `pluginInstallDir`, `pluginRoot`, `sshMcpDir`,
+`sshMcpConfig`, and `pluginRegistry` as default substitution values. A component's defaults
+and personal settings can override them. The default installation prefix is
+`$XDG_DATA_HOME/handfree-ssh-mcp/plugins/<id>` or `~/.local/share/handfree-ssh-mcp/plugins/<id>`;
+`pluginRoot` points at its `node_modules/<source.package>` directory. No package is installed
+merely by discovery. The Web manifest uses these values to retain the host's runtime and
+configuration paths without hardcoding a source checkout. For local source development,
+override `pluginRoot` with the Web checkout directory. Other plugins can use the same variables.

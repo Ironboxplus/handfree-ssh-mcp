@@ -78,13 +78,41 @@ function fixture(target = "local") {
     connections: {alpha: {platformRoot: "/alpha"}, beta: {platformRoot: "/beta"}}}}};
   const file = path.join(dir,"plugins.json");
   fs.writeFileSync(file,JSON.stringify(registry));
-  return {dir, file, manifest, registry, catalog: new PluginCatalog(file), clean: () => fs.rmSync(dir,{recursive:true, force:true})};
+  return {dir, file, manifest, registry, catalog: new PluginCatalog(file,false), clean: () => fs.rmSync(dir,{recursive:true, force:true})};
 }
+
+test('bundled plugins are discoverable before registration and explicit disabling is respected',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'handfree-bundled-'));
+  try{
+    const file=path.join(dir,'plugins.yaml');
+    const catalog=new PluginCatalog(file);
+    assert.deepEqual(catalog.read().map(p=>p.manifest.id).sort(),['rexp','rexp-web']);
+    const web=catalog.resolve('rexp-web');
+    assert.equal(web.component.source?.package,'rexp-web');
+    assert.ok(web.component.skills);assert.deepEqual(web.component.install,web.component.update);
+    fs.writeFileSync(file,JSON.stringify({schemaVersion:1,plugins:{'rexp-web':{enabled:false,manifest:'unused.yaml'}}}));
+    assert.deepEqual(catalog.read().map(p=>p.manifest.id),['rexp']);
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('local npm plugins receive the host runtime and private config paths without extra setup',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'handfree-web-host-'));
+  try{
+    const file=path.join(dir,'plugins.yaml');const calls:any[]=[];
+    const host=new PluginHost(new PluginCatalog(file),undefined,async(argv,env)=>{calls.push({argv,env});return 'ready';});
+    await host.run({plugin:'rexp-web'},['status','--json']);
+    assert.equal(calls[0].argv[0],process.execPath);
+    assert.ok(calls[0].argv[1].endsWith(path.join('node_modules','rexp-web')+'/scripts/web.mjs'));
+    assert.equal(calls[0].env.HANDFREE_PLUGINS_CONFIG,file);
+    assert.ok(path.isAbsolute(calls[0].env.HANDFREE_MCP_DIR));
+    assert.ok(!fs.existsSync(file),'discovery does not create a user registry or startup service');
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});
 
 test("optional user registry, missing argument, strict manifest and required settings", () => {
   const f=fixture();
   try {
-    assert.deepEqual(new PluginCatalog(path.join(f.dir,"absent")).read(), []);
+    assert.deepEqual(new PluginCatalog(path.join(f.dir,"absent"),false).read(), []);
     assert.throws(() => defaultCatalogPath(["--plugins"]), /requires/);
     assert.throws(() => expand("${absent}", {}), /Missing plugin setting/);
     assert.equal(expand("${root}", {root:"/a/${literal}"}), "/a/${literal}");

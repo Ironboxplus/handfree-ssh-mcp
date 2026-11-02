@@ -13,5 +13,4 @@ plugins:
   rexp-web:
     enabled: false
     manifest: ./rexp-web.yaml
-    settings:
-      webRoot: /absolute/path/to/lab-platform-web
+    settings: {}

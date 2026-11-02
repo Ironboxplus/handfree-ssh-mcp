@@ -3,6 +3,10 @@ import { promisify } from "node:util";
 import { PluginCatalog, expand, shellQuote } from "./catalog.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { ToolError } from "../utils/tool-error.js";
+import os from 'node:os';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {getConfigPath} from '../config/config-loader.js';
 
 const execFileAsync = promisify(execFile);
 type Target = {plugin: string; component?: string; connectionName?: string};
@@ -42,7 +46,16 @@ export class PluginHost {
     const connectionName = resolved.component.target === "ssh" ? this.ssh.resolveServer(target.connectionName) : undefined;
     if (resolved.component.target === "local" && target.connectionName)
       throw new ToolError("INVALID_CONFIGURATION", "A local component does not accept connectionName");
-    const variables = {...resolved.component.defaults, ...resolved.registration.settings,
+    const configHome=process.env.XDG_CONFIG_HOME || path.join(os.homedir(),'.config');
+    const installDir=path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(),'.local','share'),
+      'handfree-ssh-mcp','plugins',resolved.manifest.id);
+    const variables: Record<string,string> = {
+      nodeExecutable:process.execPath,pluginInstallDir:installDir,
+      pluginRoot:path.join(installDir,'node_modules',resolved.component.source?.package || resolved.manifest.id),
+      sshMcpDir:fileURLToPath(new URL('../../',import.meta.url)),
+      sshMcpConfig:path.resolve(getConfigPath(process.argv.slice(2)) || process.env.HANDFREE_MCP_CONFIG || path.join(configHome,'handfree-ssh-mcp','servers.yaml')),
+      pluginRegistry:this.catalog.file,
+      ...resolved.component.defaults, ...resolved.registration.settings,
       ...(connectionName ? resolved.registration.connections[connectionName] || {} : {})};
     return {...resolved, connectionName, variables};
   }
