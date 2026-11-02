@@ -8,6 +8,54 @@ import {PluginCatalog, defaultCatalogPath, expand, manifestSchema, shellQuote} f
 import {PluginHost} from "../plugins/host.js";
 import {SSHConnectionManager} from "../services/ssh-connection-manager.js";
 import {ToolError} from "../utils/tool-error.js";
+import yaml from "js-yaml";
+
+test("REXP manifest uses the rexp entry point on Linux and Windows without changing per-node roots", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "handfree-rexp-command-"));
+  const calls: any[] = [];
+  const manifest = fs.readFileSync(path.resolve("examples/plugins/rexp.yaml"), "utf8");
+  try {
+    const parsed = manifestSchema.parse(yaml.load(manifest));
+    const worker = parsed.components[0];
+    assert.equal(worker.source?.package, "rexprun");
+    assert.equal(worker.source?.location, "https://pypi.org/simple/");
+    for (const command of [worker.install, worker.update]) {
+      assert.ok(command?.some(arg => arg.includes("https://pypi.org/pypi/rexprun/json")));
+      assert.ok(command?.some(arg => arg.includes("sha256")));
+      assert.ok(!command?.some(arg => arg.includes("test.pypi.org")));
+    }
+    assert.match(worker.setup ?? "", /--install-manager/);
+    assert.match(worker.setup ?? "", /env\/default/);
+    assert.match(worker.setup ?? "", /安装 uv（推荐）/);
+    assert.match(worker.setup ?? "", /安装 Conda/);
+    assert.match(worker.setup ?? "", /Python venv、不安装管理器/);
+    assert.match(worker.setup ?? "", /UV_OFFLINE=true/);
+    for (const command of [worker.install, worker.update]) {
+      assert.ok(command?.some(arg => arg.includes("PIP_DEFAULT_TIMEOUT") && arg.includes("PIP_RETRIES")));
+    }
+    assert.deepEqual(worker.entry, ["${rexpPath}"]);
+    assert.ok(!manifest.includes("labPath"));
+    fs.writeFileSync(path.join(dir, "rexp.yaml"), manifest);
+    const registry = {schemaVersion:1,plugins:{rexp:{manifest:"rexp.yaml",connections:{
+      linux:{rexpPath:"/opt/conda/bin/rexp",platformRoot:"/data/experiments",platformPython:"/opt/conda/bin/python"},
+      windows:{rexpPath:"D:\\conda\\envs\\platform\\Scripts\\rexp.exe",platformRoot:"D:\\Experiments",platformPython:"D:\\conda\\envs\\platform\\python.exe",commandShell:"powershell"},
+    }}}};
+    const file = path.join(dir,"plugins.json");
+    fs.writeFileSync(file,JSON.stringify(registry));
+    const ssh = {resolveServer:(name?:string)=>name,executeCommand:async (...args:any[])=>{calls.push(args);return "ok";}} as unknown as SSHConnectionManager;
+    const host = new PluginHost(new PluginCatalog(file),ssh);
+    await host.run({plugin:"rexp",connectionName:"linux"},["status","--json"]);
+    await host.skill({plugin:"rexp",connectionName:"linux"},"platform-operations");
+    assert.match(calls[0][0], /'PLATFORM_ROOT=\/data\/experiments' '\/opt\/conda\/bin\/rexp' 'status' '--json'$/);
+    assert.match(calls[1][0], /'rexp'|'\/opt\/conda\/bin\/rexp'/);
+    assert.ok(calls[1][0].endsWith("'skills' 'show' 'platform-operations' '--json'"));
+    await host.run({plugin:"rexp",connectionName:"windows"},["runs","--json"]);
+    const script = Buffer.from(calls[2][0].split(" ").at(-1),"base64").toString("utf16le");
+    assert.ok(script.includes("& 'D:\\conda\\envs\\platform\\Scripts\\rexp.exe' 'runs' '--json'"));
+    assert.ok(script.includes("$env:PLATFORM_ROOT = 'D:\\Experiments'"));
+    assert.deepEqual(calls.map(call=>call[1]),["linux","linux","windows"]);
+  } finally {fs.rmSync(dir,{recursive:true,force:true});}
+});
 
 function fixture(target = "local") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "handfree-plugin-"));
@@ -178,4 +226,32 @@ test("MCP tools expose discovery, activation, skill and run with structured fail
     if(previous===undefined)delete process.env.HANDFREE_PLUGINS_CONFIG;else process.env.HANDFREE_PLUGINS_CONFIG=previous;
     f.clean();
   }
+});
+
+test("missing configuration lists actionable registry location and all required keys", async () => {
+  const f = fixture('ssh');
+  try {
+    f.manifest.components[0].entry = ['${missingEntry}', '${missingRoot}'];
+    fs.writeFileSync(path.join(f.dir, 'manifest.json'), JSON.stringify(f.manifest));
+    const ssh = {resolveServer: () => 'alpha'} as unknown as SSHConnectionManager;
+    const host = new PluginHost(f.catalog, ssh);
+    await assert.rejects(host.run({plugin:'demo',connectionName:'alpha'},[]), (error:Error) =>
+      error.message.includes(f.file) && error.message.includes('missingEntry') && error.message.includes('missingRoot') && error.message.includes('connections.alpha'));
+  } finally { f.clean(); }
+});
+
+test("installer progress and timeout guidance do not automatically retry mutations", async () => {
+  const f = fixture('ssh');
+  let calls=0;
+  const ssh = {resolveServer:()=> 'alpha', executeCommand:async (_cmd:string,_alias:string,opts:any)=> {
+    calls++; opts.onProgress?.('Downloaded 100 bytes');
+    throw new ToolError('COMMAND_TIMEOUT','slow network');
+  }} as unknown as SSHConnectionManager;
+  const progress:string[]=[];
+  try {
+    await assert.rejects(new PluginHost(f.catalog,ssh).activate({plugin:'demo',connectionName:'alpha'},'install',1000,message=>progress.push(message)),
+      (error:any)=>error.code==='COMMAND_TIMEOUT' && error.retriable===true && /Inspect the target/.test(error.message));
+    assert.equal(calls,1);
+    assert.ok(progress.includes('Downloaded 100 bytes'));
+  } finally {f.clean();}
 });

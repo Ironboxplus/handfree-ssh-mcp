@@ -68,16 +68,17 @@ Per-connection settings override common settings. Missing/empty required values 
 before any command is run. Substitution is single-pass. Runtime `args` are passed
 literally, without interpolation. No arbitrary JavaScript modules are loaded.
 
-For REXP, keep `platformRoot`, `labPath` and `platformPython` per server. The root is
+For REXP, keep `platformRoot`, `rexpPath` and `platformPython` per server. The root is
 passed through `PLATFORM_ROOT`; omitting a required root fails instead of selecting an
 arbitrary directory. Existing roots are not initialized, migrated or deleted by activation.
-The example assumes an existing Python installation; an agent may select a dedicated
-Conda platform environment after resolving setup choices with the user. It does not
-install Conda or silently create experiment environments. REXP setup requires at least
-one registered compatible experiment environment, preferably separate from the platform
-runtime; inspect existing Conda environments before creating one. It requires a REXP release with
-`lab skills list/show`; upgrading Handfree alone does not add that interface to old workers.
-The TestPyPI example is a development source; change installer argv for production.
+The example assumes an existing Python installation. REXP 0.2.0 initialization
+binds an existing uv/Conda manager (uv preferred), or asks the user about installing
+one. Declining uses Python venv. Agent setup passes that choice explicitly;
+--yes alone never authorizes manager installation. Platform and default experiment
+runtimes are separate; managed environments live in platformRoot/env/. Existing
+registrations are preserved. After initialization, inspect doctor.environment_manager
+and update the private plugin platformPython to runtime_python if a dedicated
+platform runtime was provisioned. The plugin source is official PyPI.
 
 ## Execution and lifetime
 
@@ -136,3 +137,28 @@ concurrent maintenance and timeouts. Existing SSH tests remain separate.
 - REXP Web uses `plugin-run` with `runs --json` and `run show --json`; pass both
   `--config` and `--plugins` when starting its MCP child. Its personal configuration
   selects the same node and plugin registries as the agent.
+
+
+The REXP product is distributed on PyPI as `rexprun` (0.1.66+); its CLI, Python
+module and plugin id remain `rexp`. The example manifest uses the official PyPI
+index for install/update. Publication must precede an index-based installation.
+For an existing `rexp-server` installation, stop workloads and the scheduler,
+download/verify the new wheel, then uninstall the old distribution before installing
+`rexprun`; both distributions own the same Python module and must not coexist.
+Keep the existing data root, environments and `rexpPath` setting.
+
+### Installation diagnostics and progress
+
+REXP first-use setup must offer all three manager choices when none is installed: install uv (recommended), install Conda, or use existing Python venv. A recommendation must not remove Conda from the choices. Confirm the data root and manager together, follow the manifest, and retain established SSH connections.
+
+Pip dependency downloads default to a 15-second request timeout and one retry, preserving explicit operator configuration. An unreachable source should lead to a clear failure-stage report and an agreed mirror or prepared wheelhouse rather than repeated online attempts. Offline uv initialization uses `UV_OFFLINE=true UV_FIND_LINKS=<wheelhouse>`; pip uses `PIP_NO_INDEX=1 PIP_FIND_LINKS=<wheelhouse>`. Include Python-version-specific seed packages for `uv venv --seed` as well as the default environment's complete dependencies. `UV_NO_INDEX` is not an offline-mode substitute. Resource monitoring works independently of whether REXP has been installed.
+
+Component `defaults` supplies optional setting defaults; registry settings and per-connection settings override them. Missing settings report the registry path, target section and required keys before starting commands. Installation never automatically retries an ambiguous mutation; a timeout reports inspection and explicit retry guidance.
+
+The REXP example downloads and checksums the current universal wheel from official PyPI, then installs its dependencies using `dependencyIndex` (default official PyPI, configurable mirror). It does not source the REXP wheel from that mirror. Installer output and elapsed-time heartbeats are forwarded through MCP progress notifications when the client supplies a progress token. Clients without progress support still receive the final result; normal SSH command logs retain output.
+
+Keep private paths in the user registry. Reference the manifest inside the installed SSH-MCP package, rather than leaving a copied manifest stale after upgrades. The catalog reloads the referenced file on each request; reading skills after a platform upgrade does not require restarting SSH connections.
+
+After isolated installation, `rexp init` registers a terminal command. Verify `rexp version` and `rexp doctor --json` directly in an ordinary target terminal, not only through absolute-path plugin calls. Platform root and experiment environments must match.
+
+If the server exits with code 127 while establishing its SFTP subsystem, file transfer reports a non-retriable `SFTP_ERROR` and preserves the authenticated SSH command connection. Install or configure the server's SFTP subsystem before retrying file transfer; reconnecting SSH cannot repair a missing subsystem.

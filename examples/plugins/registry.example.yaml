@@ -8,7 +8,7 @@ plugins:
     connections:
       my-server: # Replace with an alias from list-servers; add any number of servers.
         platformRoot: /absolute/path/to/experiment-data
-        labPath: /absolute/path/to/conda/bin/lab
+        rexpPath: /absolute/path/to/conda/bin/rexp
         platformPython: /absolute/path/to/conda/bin/python
   rexp-web:
     enabled: false
