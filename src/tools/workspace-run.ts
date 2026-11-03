@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { RunService } from "../run/run-service.js";
 import { runErrorEnvelope, toToolResult } from "./run-envelope.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 /**
  * Registers the durable Linux runner: optional push -> launch -> optional
@@ -11,7 +12,7 @@ import { runErrorEnvelope, toToolResult } from "./run-envelope.js";
 export function registerWorkspaceRunTool(server: McpServer): void {
   const runService = RunService.getInstance();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "workspace-run",
     "Start a durable task on a Linux remote with bash, setsid and /proc. Pass remoteRoot, entrypoint and venv/executable inline, or use a saved profile. Optionally push code before launch and collect artifacts after completion. Returns after startup unless collect is requested. State survives SSH disconnects and MCP restarts; poll run-status/run-logs with the returned runId and server. jobId equals runId.",
     {
@@ -62,5 +63,5 @@ export function registerWorkspaceRunTool(server: McpServer): void {
         return toToolResult(runErrorEnvelope(error), true);
       }
     },
-  );
+  ));
 }

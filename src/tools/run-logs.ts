@@ -2,11 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { RunService, DEFAULT_LOG_MAX_BYTES } from "../run/run-service.js";
 import { runErrorEnvelope, toToolResult } from "./run-envelope.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 export function registerRunLogsTool(server: McpServer): void {
   const runService = RunService.getInstance();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "run-logs",
     "Read stdout or stderr of a workspace-run task from the remote file. Continue with offset=nextOffset; hasMore means additional bytes are already available.",
     {
@@ -34,5 +35,5 @@ export function registerRunLogsTool(server: McpServer): void {
         return toToolResult(runErrorEnvelope(error), true);
       }
     },
-  );
+  ));
 }

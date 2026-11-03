@@ -4,6 +4,7 @@ import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { formatToolErrorResponse, ToolError, toToolError } from "../utils/tool-error.js";
 import { transferStrategySchema } from "../contracts/transfer-contract.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 /**
  * Register unified file transfer tool
@@ -18,12 +19,12 @@ export function registerTransferTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
   const transferService = sshManager.getTransferService();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "transfer",
-    "Transfer files or directories between the MCP host and remote servers, or between two remotes. mode=relay selects remote-to-remote copying; strategy selects relay/direct/auto. Use recursive for directory upload/download, archive for tar packing, and array localPath for batch upload. See help for mode-specific constraints.",
+    "Transfer files or directories between the MCP host and remote servers, or between two remotes. Upload/download take connectionName, localPath and remotePath; mode=relay selects remote-to-remote copying and takes sourceServer, sourceRemotePath, destServer and destRemotePath; strategy selects relay/direct/auto. Use recursive for directory upload/download, archive for tar packing, and array localPath for batch upload. See help for mode-specific constraints.",
     {
       mode: z.enum(["upload", "download", "relay"]).describe(
-        "upload: local to remote; download: remote to local; relay: remote to remote, with transport selected by strategy.",
+        "upload: local to remote; download: remote to local; relay: remote to remote (sourceServer/sourceRemotePath to destServer/destRemotePath), with transport selected by strategy.",
       ),
       localPath: z.union([
         z.string(),
@@ -250,5 +251,5 @@ export function registerTransferTool(server: McpServer): void {
         };
       }
     },
-  );
+  ));
 }

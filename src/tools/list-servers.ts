@@ -3,12 +3,13 @@ import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 /**
  * Register list-servers tool
  */
 export function registerListServersTool(server: McpServer): void {
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "list-servers",
     "List configured servers with enabled/connected state and jump hosts. Use the returned names as connectionName (server in workspace-run). verbose includes cached system status; refresh probes enabled servers for live status.",
     {
@@ -42,5 +43,5 @@ export function registerListServersTool(server: McpServer): void {
         };
       }
     },
-  );
+  ));
 }

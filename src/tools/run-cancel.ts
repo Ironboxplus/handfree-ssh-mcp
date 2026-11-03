@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { RunService, DEFAULT_CANCEL_GRACE_MS } from "../run/run-service.js";
 import { runErrorEnvelope, toToolResult } from "./run-envelope.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 /**
  * PLAN.MD P2-04: cancel re-verifies the recorded process identity (remote
@@ -13,7 +14,7 @@ import { runErrorEnvelope, toToolResult } from "./run-envelope.js";
 export function registerRunCancelTool(server: McpServer): void {
   const runService = RunService.getInstance();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "run-cancel",
     "Cancel a workspace-run task after verifying its live process identity. Send TERM to the process group, then KILL after graceMs if needed. An identity mismatch marks it orphaned without signalling; repeated cancellation is safe.",
     {
@@ -50,5 +51,5 @@ export function registerRunCancelTool(server: McpServer): void {
         return toToolResult(runErrorEnvelope(error), true);
       }
     },
-  );
+  ));
 }

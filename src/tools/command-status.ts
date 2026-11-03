@@ -3,11 +3,12 @@ import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 export function registerCommandStatusTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "command-status",
     "Read status and output for execute-command with stream=true. Incremental polling advances a process-local cursor per runId; offset overrides it. After MCP restart, status is unavailable; read the saved logPath directly.",
     {
@@ -49,5 +50,5 @@ export function registerCommandStatusTool(server: McpServer): void {
         };
       }
     },
-  );
+  ));
 }

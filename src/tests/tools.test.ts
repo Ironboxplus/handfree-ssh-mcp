@@ -116,7 +116,7 @@ class MockSSHConnectionManager {
 }
 
 function captureRegisteredTools(): {
-  server: { tool: (...args: any[]) => void };
+  server: { tool: (...args: any[]) => object };
   handlers: Map<string, (args: any, extra?: any) => Promise<any>>;
   schemas: Map<string, Record<string, unknown>>;
 } {
@@ -129,6 +129,8 @@ function captureRegisteredTools(): {
       tool(name: string, _description: string, schema: Record<string, unknown>, handler: (args: any, extra?: any) => Promise<any>) {
         handlers.set(name, handler);
         schemas.set(name, schema);
+        // Like McpServer.tool(): return the registered tool record.
+        return { inputSchema: z.object(schema as z.ZodRawShape) };
       },
     },
   };

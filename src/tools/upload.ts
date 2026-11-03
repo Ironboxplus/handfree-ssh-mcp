@@ -3,6 +3,7 @@ import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { formatToolErrorResponse, ToolError, toToolError } from "../utils/tool-error.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 /**
  * Register file upload tool
@@ -11,7 +12,7 @@ export function registerUploadTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
   const transferService = sshManager.getTransferService();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "upload",
     "Upload a file or batch of files from the MCP host over SFTP. Batch localPath requires a destination directory and returns per-file results. Shell scripts with CRLF are converted to LF. A file is skipped only when the remote file already has the MD5 of the bytes that would be written (computed on the server); with no remote md5sum it is uploaded. Path policy is available through show-whitelist.",
     {
@@ -79,5 +80,5 @@ export function registerUploadTool(server: McpServer): void {
         };
       }
     }
-  );
+  ));
 }

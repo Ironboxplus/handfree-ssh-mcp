@@ -3,6 +3,7 @@ import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 /**
  * Register file download tool
@@ -11,7 +12,7 @@ export function registerDownloadTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
   const transferService = sshManager.getTransferService();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "download",
     "Download one remote file to the MCP host over SFTP. Use transfer with recursive=true for directories. Path policy is available through show-whitelist.",
     {
@@ -52,5 +53,5 @@ export function registerDownloadTool(server: McpServer): void {
         };
       }
     }
-  );
+  ));
 }

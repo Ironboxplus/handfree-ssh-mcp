@@ -2,11 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { RunService, DEFAULT_RUN_LIST_LIMIT, MAX_RUN_LIST_LIMIT } from "../run/run-service.js";
 import { runErrorEnvelope, toToolResult } from "./run-envelope.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 export function registerRunListTool(server: McpServer): void {
   const runService = RunService.getInstance();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "run-list",
     "List workspace-run tasks on the selected server, newest first. Reads remote state; corrupt or incomplete entries are omitted (query run-status for their errors). Default limit 50, maximum 200.",
     {
@@ -30,5 +31,5 @@ export function registerRunListTool(server: McpServer): void {
         return toToolResult(runErrorEnvelope(error), true);
       }
     },
-  );
+  ));
 }

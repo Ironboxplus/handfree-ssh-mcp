@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 const TOOL_HELP: Record<string, string> = {
   "list-servers": `list-servers — Discover available SSH servers.
@@ -706,7 +707,7 @@ export const TOOL_HELP_FOR_TEST: Readonly<Record<string, string>> = TOOL_HELP;
 export const TOOL_OVERVIEW_FOR_TEST: string = TOOL_OVERVIEW;
 
 export function registerHelpTool(server: McpServer): void {
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "help",
     "Show a tool overview, or full parameter docs and examples for the selected tool.",
     {
@@ -726,5 +727,5 @@ export function registerHelpTool(server: McpServer): void {
 
       return { content: [{ type: "text", text: TOOL_OVERVIEW }] };
     },
-  );
+  ));
 }

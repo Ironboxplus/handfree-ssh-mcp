@@ -3,6 +3,7 @@ import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 /**
  * Register execute command tool
@@ -14,7 +15,7 @@ import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
 export function registerExecuteCommandTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "execute-command",
     "Execute cmdString unchanged in the remote default shell. stream=false waits for output; stream=true (default) returns runId/logPath immediately for polling with command-status. Each call has separate shell state. Background status is lost on MCP restart; use workspace-run for durable tasks. Full output is saved locally; returned output is capped.",
     {
@@ -117,5 +118,5 @@ export function registerExecuteCommandTool(server: McpServer): void {
         };
       }
     }
-  );
+  ));
 }

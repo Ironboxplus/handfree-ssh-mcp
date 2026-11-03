@@ -8,6 +8,7 @@ import {
 } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { ToolError, formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 export function formatCommandPolicy(config: SSHConfig): string {
   const whitelist = config.commandWhitelist || [];
@@ -87,7 +88,7 @@ export function formatCommandPolicy(config: SSHConfig): string {
 export function registerShowWhitelistTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "show-whitelist",
     "Show the full command policy (blacklist/whitelist), SFTP path policy and output log location. The legacy tool name does not imply whitelist mode. Use after a policy rejection or to inspect configured restrictions.",
     {
@@ -195,7 +196,7 @@ export function registerShowWhitelistTool(server: McpServer): void {
         };
       }
     }
-  );
+  ));
 }
 
 /**

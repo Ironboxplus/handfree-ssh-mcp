@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { RunService } from "../run/run-service.js";
 import { runErrorEnvelope, toToolResult } from "./run-envelope.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 /**
  * PLAN.MD P2-04: run-retry launches a fresh run from an EARLIER run's own
@@ -14,7 +15,7 @@ import { runErrorEnvelope, toToolResult } from "./run-envelope.js";
 export function registerRunRetryTool(server: McpServer): void {
   const runService = RunService.getInstance();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "run-retry",
     "Start a new workspace-run task using an earlier task's saved config snapshot. Returns a new runId with parentRunId; jobId equals the new runId. Missing snapshots return RETRY_SNAPSHOT_UNAVAILABLE; snapshots with secretEnv return SECRET_REQUIRED.",
     {
@@ -38,5 +39,5 @@ export function registerRunRetryTool(server: McpServer): void {
         return toToolResult(runErrorEnvelope(error), true);
       }
     },
-  );
+  ));
 }

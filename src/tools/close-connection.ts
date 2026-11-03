@@ -3,6 +3,7 @@ import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 
 /**
  * Register close-connection tool
@@ -10,7 +11,7 @@ import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
 export function registerCloseConnectionTool(server: McpServer): void {
   const sshManager = SSHConnectionManager.getInstance();
 
-  server.tool(
+  rejectUnknownArguments(server.tool(
     "close-connection",
     "Close cached SSH connections for a server, including transfer connections. Closing a jump host also closes dependent target connections. Fresh connections from reuseConnection=false close after use.",
     {
@@ -39,5 +40,5 @@ export function registerCloseConnectionTool(server: McpServer): void {
         };
       }
     },
-  );
+  ));
 }
