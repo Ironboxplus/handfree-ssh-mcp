@@ -34,6 +34,7 @@ export function registerPluginTools(server: McpServer): void {
     {...target, name: z.string().min(1).optional()},
     async ({name, ...selection}) => reply(() => host.skill(selection, name)));
   server.tool("plugin-run", "Invoke a plugin CLI with an argv array, using its configured entry point and settings. Read plugin-skill first. SSH components use the selected SSH connection and its existing command policy. Transfer files with the existing SFTP tools; all supplied paths belong to the component host.",
-    {...target, args: z.array(z.string().refine(s => !s.includes("\0"))).max(256), timeout: z.number().int().min(1000).max(1800000).optional().describe("Command timeout in milliseconds (default 30000, up to 1800000 for explicit long setup operations). Match the client request timeout.")},
-    async ({args, timeout, ...selection}) => reply(() => host.run(selection, args, timeout)));
+    {...target, args: z.array(z.string().refine(s => !s.includes("\0"))).max(256), timeout: z.number().int().min(1000).max(1800000).optional().describe("Command timeout in milliseconds (default 30000, up to 1800000 for explicit long setup operations). Match the client request timeout."),
+      maxOutputBytes: z.number().int().min(1024).max(32 * 1024 * 1024).optional().describe("Output limit per stream in bytes (default 1048576, maximum 33554432). Structured-data clients may request larger results; truncated output is always an error.")},
+    async ({args, timeout, maxOutputBytes, ...selection}) => reply(() => host.run(selection, args, timeout, maxOutputBytes)));
 }

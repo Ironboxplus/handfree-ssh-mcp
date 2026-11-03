@@ -10,7 +10,7 @@ import {getConfigPath} from '../config/config-loader.js';
 
 const execFileAsync = promisify(execFile);
 type Target = {plugin: string; component?: string; connectionName?: string};
-type ExecuteLocal = (argv: string[], env: Record<string, string>, timeout: number) => Promise<string>;
+type ExecuteLocal = (argv: string[], env: Record<string, string>, timeout: number, maxOutputBytes?: number) => Promise<string>;
 function powershellQuote(value: string): string {
   return "'" + value.replace(/'/g, "''") + "'";
 }
@@ -27,9 +27,9 @@ function sshCommand(argv: string[], env: Record<string, string>, shell: string):
   return [...(Object.keys(env).length ? ["env", ...Object.entries(env).map(([k,v]) => `${k}=${v}`)] : []), ...argv].map(shellQuote).join(" ");
 }
 
-const localExec: ExecuteLocal = async (argv, env, timeout) => {
+const localExec: ExecuteLocal = async (argv, env, timeout, maxOutputBytes = 1024 * 1024) => {
   const result = await execFileAsync(argv[0], argv.slice(1), {
-    env: {...process.env, ...env}, timeout, maxBuffer: 1024 * 1024, windowsHide: true,
+    env: {...process.env, ...env}, timeout, maxBuffer: maxOutputBytes, windowsHide: true,
   });
   return result.stdout;
 };
@@ -70,7 +70,7 @@ export class PluginHost {
   }
 
   private async execute(target: Target, select: (c: ReturnType<PluginHost["context"]>) => string[],
-    timeout = 30000, extra: Record<string, string> = {}, runtimeArgs: string[] = [], onProgress?: (chunk: string) => void) {
+    timeout = 30000, extra: Record<string, string> = {}, runtimeArgs: string[] = [], onProgress?: (chunk: string) => void, maxOutputBytes = 1024 * 1024) {
     const c = this.context(target);
     const variables = {...c.variables, ...extra};
     const command = select(c);
@@ -85,9 +85,9 @@ export class PluginHost {
         // Use the existing manager, including its command policy, timeout and output limits.
         // Mutations are never automatically retried after an ambiguous SSH disconnect.
         output = await this.ssh.executeCommand(command, c.connectionName, {timeout, maxRetries: 0,
-          maxOutputBytes: 1024 * 1024, onProgress, requireSuccess: true});
+          maxOutputBytes, onProgress, requireSuccess: true});
       } else {
-        output = await this.executeLocal(argv, env, timeout);
+        output = await this.executeLocal(argv, env, timeout, maxOutputBytes);
       }
     } catch (error) {
       if (error instanceof ToolError) throw error;
@@ -97,8 +97,10 @@ export class PluginHost {
       connectionName: c.connectionName ?? null, output};
   }
 
-  async run(target: Target, args: string[], timeout?: number) {
-    return this.execute(target, c => c.component.entry, timeout, {}, args);
+  async run(target: Target, args: string[], timeout?: number, maxOutputBytes = 1024 * 1024) {
+    if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1024 || maxOutputBytes > 32 * 1024 * 1024)
+      throw new ToolError("INVALID_CONFIGURATION", "maxOutputBytes must be an integer between 1024 and 33554432");
+    return this.execute(target, c => c.component.entry, timeout, {}, args, undefined, maxOutputBytes);
   }
 
   async skill(target: Target, name?: string) {

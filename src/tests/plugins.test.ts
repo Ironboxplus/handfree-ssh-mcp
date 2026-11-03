@@ -330,6 +330,11 @@ test("MCP tools expose discovery, activation, skill and run with structured fail
     assert.deepEqual(JSON.parse(JSON.parse((skills.content as any)[0].text).output).args,["skill","ops"]);
     const run=await client.callTool({name:"plugin-run",arguments:{plugin:"demo",args:["runs","--json"]}});
     assert.deepEqual(JSON.parse(JSON.parse((run.content as any)[0].text).output).args,["runs","--json"]);
+    const larger=await client.callTool({name:"plugin-run",arguments:{plugin:"demo",args:["runs"],maxOutputBytes:32*1024*1024}});
+    assert.equal(larger.isError,undefined);
+    for(const maxOutputBytes of [0,33*1024*1024]) {
+      await assert.rejects(client.callTool({name:"plugin-run",arguments:{plugin:"demo",args:[],maxOutputBytes}}),/Invalid arguments/);
+    }
     const missing=await client.callTool({name:"plugin-run",arguments:{plugin:"missing",args:[]}});
     assert.equal(missing.isError,true);
     assert.equal(JSON.parse((missing.content as any)[0].text).code,"INVALID_CONFIGURATION");
@@ -366,4 +371,30 @@ test("installer progress and timeout guidance do not automatically retry mutatio
     assert.equal(calls,1);
     assert.ok(progress.includes('Downloaded 100 bytes'));
   } finally {f.clean();}
+});
+
+
+test('structured plugin clients can read multi-MiB JSON without changing ordinary command limits',async()=>{
+  const f=fixture();
+  try {
+    const output={description:'实验说明'.repeat(120000),trials:[{trial_id:'first'},{trial_id:'last'}]};
+    assert.ok(Buffer.byteLength(JSON.stringify(output))>1024*1024);
+    fs.writeFileSync(path.join(f.dir,'large.cjs'),'process.stdout.write(JSON.stringify('+JSON.stringify(output)+'));');
+    f.manifest.components[0].entry=[process.execPath,path.join(f.dir,'large.cjs')];
+    fs.writeFileSync(path.join(f.dir,'manifest.json'),JSON.stringify(f.manifest));
+    const local=new PluginHost(f.catalog);
+    await assert.rejects(local.run({plugin:'demo'},[]),/maxBuffer/);
+    assert.deepEqual(JSON.parse((await local.run({plugin:'demo'},[],undefined,32*1024*1024)).output),output);
+    const limits:number[]=[];
+    f.manifest.components[0].target='ssh';
+    fs.writeFileSync(path.join(f.dir,'manifest.json'),JSON.stringify(f.manifest));
+    const ssh={resolveServer:(name:string)=>name,executeCommand:async(_command:string,_name:string,options:any)=>{limits.push(options.maxOutputBytes);assert.equal(options.requireSuccess,true);assert.equal(options.maxRetries,0);return JSON.stringify(output);}} as unknown as SSHConnectionManager;
+    const remote=new PluginHost(f.catalog,ssh);
+    await remote.run({plugin:'demo',connectionName:'alpha'},[]);
+    const result=await remote.run({plugin:'demo',connectionName:'alpha'},[],undefined,32*1024*1024);
+    assert.deepEqual(JSON.parse(result.output),output);
+    assert.deepEqual(limits,[1024*1024,32*1024*1024]);
+    for(const limit of [0,512,1.5,NaN,33*1024*1024])
+      await assert.rejects(remote.run({plugin:'demo',connectionName:'alpha'},[],undefined,limit),/maxOutputBytes/);
+  }finally{f.clean();}
 });

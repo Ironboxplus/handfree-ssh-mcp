@@ -179,3 +179,9 @@ and personal settings can override them. The default installation prefix is
 merely by discovery. The Web manifest uses these values to retain the host's runtime and
 configuration paths without hardcoding a source checkout. For local source development,
 override `pluginRoot` with the Web checkout directory. Other plugins can use the same variables.
+
+Structured-data clients can set `plugin-run.maxOutputBytes` per request (1 MiB by default,
+1 KiB–32 MiB). This applies to both SSH output collection and local execution.
+For example, Web requests 32 MiB for Tune details so searches with hundreds of trials
+are not truncated at the Agent-oriented default. Truncation remains an explicit error;
+raise neither the default for ordinary commands nor automatically rerun mutations.
