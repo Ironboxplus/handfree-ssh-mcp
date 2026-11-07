@@ -119,6 +119,11 @@ should not be started with `plugin-run`; the REXP Web example uses its existing 
 independent. The Web plugin installs the npm package `rexp-web` on the MCP host and reads its
 versioned `web-operations` skill. Ask about login autostart before `configure --autostart on|off`,
 then call `open` and remind the user to bookmark the page. No postinstall script enables startup.
+The public package is [rexp-web](https://www.npmjs.com/package/rexp-web), installed
+as `rexp-web@latest` from `https://registry.npmjs.org/` using Node.js 22+ and npm.
+Its prebuilt dashboard requires no source checkout or build step. The package page
+is separate from the local console: use the URL returned by `open` or `status`
+(default `http://127.0.0.1:5173/`). Upgrade through `plugin-activate update`.
 
 ## Development verification
 
@@ -177,5 +182,6 @@ and personal settings can override them. The default installation prefix is
 `$XDG_DATA_HOME/handfree-ssh-mcp/plugins/<id>` or `~/.local/share/handfree-ssh-mcp/plugins/<id>`;
 `pluginRoot` points at its `node_modules/<source.package>` directory. No package is installed
 merely by discovery. The Web manifest uses these values to retain the host's runtime and
-configuration paths without hardcoding a source checkout. For local source development,
-override `pluginRoot` with the Web checkout directory. Other plugins can use the same variables.
+configuration paths without hardcoding a source checkout. Keep the default `pluginRoot`
+when using the npm package so installation, updates and commands address the same files.
+Other plugins can use the same variables.

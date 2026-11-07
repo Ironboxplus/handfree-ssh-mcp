@@ -198,3 +198,10 @@ the installed version’s instructions with `plugin-skill`, and invoke its CLI w
 `plugin-run`. SSH components use existing connection aliases and command policies.
 See [plugin configuration and lifecycle](docs/plugins.md) and
 [example manifests](examples/plugins/registry.example.yaml).
+
+The optional [REXP Web](https://www.npmjs.com/package/rexp-web) plugin installs the
+published `rexp-web@latest` package locally (Node.js 22+ and npm required), including
+the ready-to-use dashboard. Discover `rexp-web` with `plugin-list`, install/update
+with `plugin-activate`, then call `plugin-run` with `args: ["open"]`.
+Use the URL returned by `open` or `status` (default `http://127.0.0.1:5173/`).
+No source checkout or frontend build is required; ask about login autostart during setup.

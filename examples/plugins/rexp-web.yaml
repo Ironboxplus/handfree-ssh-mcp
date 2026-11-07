@@ -6,11 +6,15 @@ components:
     target: local
     description: Install and manage the independent rexp-web application on this MCP host.
     setup: >
-      本插件安装在 MCP 控制端，不安装到远端实验服务器。使用 plugin-activate install 安装，
+      本插件安装在 MCP 控制端，不安装到远端实验服务器。需要 Node.js 22 或以上及 npm。
+      正式包地址为 https://www.npmjs.com/package/rexp-web ，从官方 npm registry 安装 rexp-web@latest。
+      使用 plugin-activate install 安装；已安装时使用 plugin-activate update 更新，
       安装目录由宿主提供 pluginInstallDir，个人连接配置保留在用户目录。安装不注册自启动项。
+      使用发行包自带的页面与 CLI，无需克隆源码、运行 npm run build 或启动 Vite，勿将 pluginRoot 指向开发目录。
       安装后读取 web-operations skill，询问用户是否开启登录自启动，再执行 plugin-run
       args=[configure,--autostart,on] 或 [configure,--autostart,off]，随后执行 [open]。
-      用户已提供选择时不重复询问。提醒用户把打开的地址加入书签。
+      用户已提供选择时不重复询问。访问地址以 open / status 返回为准，默认 http://127.0.0.1:5173/ 。
+      此地址是本机控制台，npm 页面仅用于下载和查看说明。提醒用户把控制台地址加入书签。
       查看状态用 [status,--json]；修改自启动用 [autostart,on] 或 [autostart,off]；
       启停用 [start] / [stop]。Agent 退出不关闭 Web。升级前明确告知需要重启 Web 才能加载新版，
       保留用户的自启动偏好和个人配置，不为升级重新初始化远端平台。
