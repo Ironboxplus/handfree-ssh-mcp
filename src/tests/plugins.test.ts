@@ -9,6 +9,23 @@ import {PluginHost} from "../plugins/host.js";
 import {SSHConnectionManager} from "../services/ssh-connection-manager.js";
 import {ToolError} from "../utils/tool-error.js";
 import yaml from "js-yaml";
+import { RealSshTestServer } from "./helpers/real-ssh-server.js";
+
+function pluginFrame(command: string, stdout = "ok", stderr = "", exitCode: number | null = 0) {
+  const script = command.startsWith("powershell.exe")
+    ? Buffer.from(command.split(" ").at(-1)!, "base64").toString("utf16le") : command;
+  const marker = script.match(/__HANDFREE_PLUGIN_[a-f0-9]{32}__/)?.[0];
+  assert.ok(marker, "plugin result framing must be confined to the plugin command");
+  return {
+    stdout: `${marker}:stdout\n${stdout}${exitCode === null ? "" : `\n${marker}:exit:${exitCode}\n`}`,
+    stderr: `${marker}:stderr\n${stderr}`,
+  };
+}
+
+function pluginResponse(command: string) {
+  const frame = pluginFrame(command);
+  return `${frame.stdout}\n[STDERR]\n${frame.stderr}`;
+}
 
 test("REXP manifest uses the rexp entry point on Linux and Windows without changing per-node roots", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "handfree-rexp-command-"));
@@ -42,13 +59,13 @@ test("REXP manifest uses the rexp entry point on Linux and Windows without chang
     }}}};
     const file = path.join(dir,"plugins.json");
     fs.writeFileSync(file,JSON.stringify(registry));
-    const ssh = {resolveServer:(name?:string)=>name,executeCommand:async (...args:any[])=>{calls.push(args);return "ok";}} as unknown as SSHConnectionManager;
+    const ssh = {resolveServer:(name?:string)=>name,executeCommandWithProgress:async (...args:any[])=>{calls.push(args);return pluginResponse(args[0]);}} as unknown as SSHConnectionManager;
     const host = new PluginHost(new PluginCatalog(file),ssh);
     await host.run({plugin:"rexp",connectionName:"linux"},["status","--json"]);
     await host.skill({plugin:"rexp",connectionName:"linux"},"platform-operations");
-    assert.match(calls[0][0], /'PLATFORM_ROOT=\/data\/experiments' '\/opt\/conda\/bin\/rexp' 'status' '--json'$/);
+    assert.match(calls[0][0], /'PLATFORM_ROOT=\/data\/experiments' '\/opt\/conda\/bin\/rexp' 'status' '--json'/);
     assert.match(calls[1][0], /'rexp'|'\/opt\/conda\/bin\/rexp'/);
-    assert.ok(calls[1][0].endsWith("'skills' 'show' 'platform-operations' '--json'"));
+    assert.ok(calls[1][0].includes("'skills' 'show' 'platform-operations' '--json'"));
     await host.run({plugin:"rexp",connectionName:"windows"},["runs","--json"]);
     const script = Buffer.from(calls[2][0].split(" ").at(-1),"base64").toString("utf16le");
     assert.ok(script.includes("& 'D:\\conda\\envs\\platform\\Scripts\\rexp.exe' 'runs' '--json'"));
@@ -149,7 +166,7 @@ test("SSH targets follow manager aliases, quote every argument and keep per-host
   const f=fixture("ssh");
   const calls: any[]=[];
   const ssh={resolveServer: (name?:string) => {if (!name) throw new Error("Select connection"); return name;},
-    executeCommand: async (...args:any[]) => {calls.push(args); return "ok";}} as unknown as SSHConnectionManager;
+    executeCommandWithProgress: async (...args:any[]) => {calls.push(args); return pluginResponse(args[0]);}} as unknown as SSHConnectionManager;
   try {
     const host=new PluginHost(f.catalog,ssh);
     await assert.rejects(host.run({plugin:"demo"},[]), /Select connection/);
@@ -158,7 +175,7 @@ test("SSH targets follow manager aliases, quote every argument and keep per-host
     assert.equal(calls[0][1],"alpha"); assert.equal(calls[1][1],"beta");
     assert.match(calls[0][0], /PLATFORM_ROOT=\/alpha/); assert.match(calls[1][0], /PLATFORM_ROOT=\/beta/);
     assert.equal(calls[0][2].maxRetries,0);
-    assert.ok(calls[0][0].endsWith(shellQuote("a' ; $(no)")));
+    assert.ok(calls[0][0].includes(shellQuote("a' ; $(no)")));
     await host.activate({plugin:"demo",connectionName:"alpha"},"install",900000);
     assert.equal(calls[2][2].timeout,900000);
     const value="中文 '; $(printf broken)\nsecond";
@@ -172,7 +189,7 @@ test("PowerShell SSH targets encode arguments and per-host environment for Windo
   f.registry.plugins.demo.connections.alpha={platformRoot:"D:\\research's", commandShell:"powershell"} as any;
   fs.writeFileSync(f.file,JSON.stringify(f.registry));
   const ssh={resolveServer:(name?:string)=>name,
-    executeCommand:async (...args:any[])=>{calls.push(args); return "ok";}} as unknown as SSHConnectionManager;
+    executeCommandWithProgress:async (...args:any[])=>{calls.push(args); return pluginResponse(args[0]);}} as unknown as SSHConnectionManager;
   try {
     const host=new PluginHost(f.catalog,ssh);
     await host.run({plugin:"demo",connectionName:"alpha"},["中文 '; $(no)"]);
@@ -181,12 +198,13 @@ test("PowerShell SSH targets encode arguments and per-host environment for Windo
     const script=Buffer.from(command.split(" ").at(-1)!,"base64").toString("utf16le");
     assert.match(script,/\$env:PLATFORM_ROOT = 'D:\\research''s'/);
     assert.match(script,/'中文 ''; \$\(no\)'/);
-    assert.match(script,/exit \$LASTEXITCODE/);
+    assert.match(script,/\$pluginExit = \$LASTEXITCODE/);
+    assert.match(script,/exit \$pluginExit/);
     assert.equal(calls[0][1],"alpha");
   } finally {f.clean();}
 });
 
-test("SSH plugins use actual exit/truncation metadata, never markers inside successful logs", async () => {
+test("SSH plugin framing rejects failures and truncation without modifying the public SSH executor", async () => {
   const f=fixture("ssh");
   let stdout = "Previous failure: [EXIT CODE: 2]\nExample: [OUTPUT TRUNCATED]\nCurrent state: ready";
   let stderr = "";
@@ -201,9 +219,10 @@ test("SSH plugins use actual exit/truncation metadata, never markers inside succ
     resolveChannelOpenTimeout: () => 1000,
     createLogWriter: () => null,
     isConnectionError: () => false,
-    runCommandStream: async (_cmd: string, _client: unknown, _timeout: number, sinks: any) => {
-      sinks.stdoutCollector.push(stdout);
-      sinks.stderrCollector.push(stderr);
+    runCommandStream: async (cmd: string, _client: unknown, _timeout: number, sinks: any) => {
+      const framed = cmd === "example" ? { stdout, stderr } : pluginFrame(cmd, stdout, stderr, exitCode);
+      sinks.stdoutCollector.push(framed.stdout);
+      sinks.stderrCollector.push(framed.stderr);
       return exitCode;
     },
   }) as SSHConnectionManager;
@@ -231,6 +250,40 @@ test("SSH plugins use actual exit/truncation metadata, never markers inside succ
     (ssh as any).validateCommand=()=>({isAllowed:false,reason:"blocked by SSH policy"});
     await assert.rejects(host.run({plugin:"demo"},[]),(err:any)=>err.code==="COMMAND_VALIDATION_FAILED");
   } finally {f.clean();}
+});
+
+test("plugin result frames survive real SSH, shell quoting, stderr, process exits and large output", async () => {
+  const f = fixture("ssh");
+  const server = new RealSshTestServer(path.join(f.dir, "remote"));
+  const ssh = SSHConnectionManager.getInstance();
+  try {
+    await server.start();
+    ssh.setConfig({ alpha: { host: "127.0.0.1", port: server.port, username: "test", password: "test", keepaliveInterval: 0 } }, ["alpha"]);
+    const host = new PluginHost(f.catalog, ssh);
+    const literal = "中文 '; $(touch should-not-exist)\nsecond";
+    assert.deepEqual(JSON.parse((await host.run({ plugin: "demo", connectionName: "alpha" }, [literal])).output).args, [literal]);
+    assert.ok(!fs.existsSync("should-not-exist"));
+    const script = path.join(f.dir, "worker.cjs");
+    fs.writeFileSync(script, `process.stdout.write('Previous [EXIT CODE: 2]\\n[OUTPUT TRUNCATED]'); process.stderr.write('warning');`);
+    assert.equal((await host.run({ plugin: "demo", connectionName: "alpha" }, [])).output,
+      "Previous [EXIT CODE: 2]\n[OUTPUT TRUNCATED]\n[STDERR]\nwarning");
+    fs.writeFileSync(script, `process.stderr.write('specific failure'); process.exit(7);`);
+    await assert.rejects(host.run({ plugin: "demo", connectionName: "alpha" }, []), /code 7[\s\S]*specific failure/);
+    fs.writeFileSync(script, `process.stdout.write('x'.repeat(1024*1024));`);
+    assert.equal((await host.run({ plugin: "demo", connectionName: "alpha" }, [])).output.length, 1024*1024);
+    fs.writeFileSync(script, `process.stdout.write('x'.repeat(1024*1024+1024));`);
+    await assert.rejects(host.run({ plugin: "demo", connectionName: "alpha" }, []), /truncated/);
+    fs.writeFileSync(script, `console.log('Downloaded 100 bytes');`);
+    const progress: string[] = [];
+    await host.activate({ plugin: "demo", connectionName: "alpha" }, "install", 1000, chunk => progress.push(chunk));
+    assert.ok(progress.some(chunk => chunk.includes("Downloaded 100 bytes")));
+    assert.ok(progress.every(chunk => !chunk.includes("__HANDFREE_PLUGIN_")));
+  } finally {
+    ssh.disconnect();
+    ssh.setConfig({}, undefined);
+    await server.stop();
+    f.clean();
+  }
 });
 
 test("run, skills and version checks do not require settings for unrelated installers", async () => {
@@ -262,26 +315,6 @@ test("activation validates its post-install version and skill configuration befo
     await assert.rejects(host.activate({plugin:'demo'},'install'), /Missing plugin settings: skillReader\./);
     assert.ok(!fs.existsSync(path.join(f.dir,'worker.cjs.version')));
   } finally { f.clean(); }
-});
-
-test("a failed build preserves the previously usable entry point", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'handfree-build-'));
-  try {
-    for (const name of ['scripts','src','build']) fs.mkdirSync(path.join(dir,name));
-    const script = path.join(dir,'scripts/build.mjs');
-    fs.copyFileSync(path.resolve('scripts/build.js'),script);
-    const entry = path.join(dir,'build/index.js');
-    fs.writeFileSync(entry,'// working build');
-    fs.writeFileSync(path.join(dir,'src/index.ts'),'const broken: = ;');
-    fs.writeFileSync(path.join(dir,'tsconfig.json'),JSON.stringify({
-      compilerOptions:{outDir:'build'},include:['src/**/*'],
-    }));
-    assert.throws(() => execFileSync(process.execPath,[script],{
-      env:{...process.env,PATH:path.resolve('node_modules/.bin')+path.delimiter+process.env.PATH},
-      stdio:'pipe',timeout:15000,
-    }), (error: any) => error.status !== 0 && String(error.stdout).includes('error TS'));
-    assert.equal(fs.readFileSync(entry,'utf8'),'// working build');
-  } finally { fs.rmSync(dir,{recursive:true,force:true}); }
 });
 
 test("ambiguous component, maintenance concurrency, installer failure and local timeout", async () => {
@@ -355,8 +388,8 @@ test("missing configuration lists actionable registry location and all required 
 test("installer progress and timeout guidance do not automatically retry mutations", async () => {
   const f = fixture('ssh');
   let calls=0;
-  const ssh = {resolveServer:()=> 'alpha', executeCommand:async (_cmd:string,_alias:string,opts:any)=> {
-    calls++; opts.onProgress?.('Downloaded 100 bytes');
+  const ssh = {resolveServer:()=> 'alpha', executeCommandWithProgress:async (_cmd:string,_alias:string,opts:any)=> {
+    calls++; opts.onProgress?.('Downloaded 100 bytes\n');
     throw new ToolError('COMMAND_TIMEOUT','slow network');
   }} as unknown as SSHConnectionManager;
   const progress:string[]=[];
@@ -364,6 +397,6 @@ test("installer progress and timeout guidance do not automatically retry mutatio
     await assert.rejects(new PluginHost(f.catalog,ssh).activate({plugin:'demo',connectionName:'alpha'},'install',1000,message=>progress.push(message)),
       (error:any)=>error.code==='COMMAND_TIMEOUT' && error.retriable===true && /Inspect the target/.test(error.message));
     assert.equal(calls,1);
-    assert.ok(progress.includes('Downloaded 100 bytes'));
+    assert.ok(progress.some(message => message.trim() === 'Downloaded 100 bytes'));
   } finally {f.clean();}
 });

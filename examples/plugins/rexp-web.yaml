@@ -11,6 +11,7 @@ components:
       使用 plugin-activate install 安装；已安装时使用 plugin-activate update 更新，
       安装目录由宿主提供 pluginInstallDir，个人连接配置保留在用户目录。安装不注册自启动项。
       使用发行包自带的页面与 CLI，无需克隆源码、运行 npm run build 或启动 Vite，勿将 pluginRoot 指向开发目录。
+      Windows 节点状态兼容由 rexp-web 0.1.2 及以上版本处理，无需修改 SSH-MCP 核心或安装远端 REXP。
       安装后读取 web-operations skill，询问用户是否开启登录自启动，再执行 plugin-run
       args=[configure,--autostart,on] 或 [configure,--autostart,off]，随后执行 [open]。
       用户已提供选择时不重复询问。访问地址以 open / status 返回为准，默认 http://127.0.0.1:5173/ 。
