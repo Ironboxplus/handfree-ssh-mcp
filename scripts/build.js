@@ -13,7 +13,7 @@ const buildFile = join(rootDir, "build", "index.js");
 
 // Run TypeScript compiler
 console.log("Building TypeScript...");
-execSync("tsc --noEmitOnError", { stdio: "inherit", cwd: rootDir });
+execSync("tsc", { stdio: "inherit", cwd: rootDir });
 
 // Make executable on Unix-like systems (Linux, macOS, etc.)
 if (process.platform !== "win32") {

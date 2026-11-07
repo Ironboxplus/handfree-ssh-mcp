@@ -98,10 +98,13 @@ SFTP continues to use existing upload/download/transfer tools and path policies.
 CLI outputs are returned as `{plugin,component,target,connectionName,output}`. Errors
 use existing MCP `isError` / code / message / retriable conventions. Output is limited
 to 1 MiB per stream (SSH), 1 MiB combined (local); detected truncation is an error.
-Remote success is checked against the existing manager's actual exit code and output
-collector metadata. A zero exit code and complete output are required; marker-like text
-inside logs or skills is treated as ordinary content. Other SSH command callers retain
-their existing text response. A disconnected mutation is not retried automatically, since the
+The plugin adapter uses the existing public streaming executor. A per-call random
+result frame carries the plugin exit code and identifies each output stream; incomplete
+frames or output over the limit are errors. Ordinary log text such as `[EXIT CODE: 2]`
+does not determine success. This protocol stays in the plugin layer; the SSH manager,
+transfer service and system status probes retain their upstream implementation.
+Command policies inspect the complete wrapped command, so custom allowlists must also
+permit its shell wrapper. A disconnected mutation is not retried automatically, since the
 remote operation might already have happened. Check its state before retrying.
 Normal command timeout defaults to 30 seconds (configurable up to 30 minutes through
 the tool for explicit long setup operations); maintenance defaults to 5 minutes. `plugin-activate.timeout` can explicitly
@@ -133,21 +136,16 @@ policy failures, installer failure, rereading skills after updates, component se
 concurrent maintenance and timeouts. Existing SSH tests remain separate.
 
 
-### Validation for this implementation
+The plugin tests also run framed commands through a real local SSH server and
+shell, checking quoting, stderr, failed exits, output limits and installer progress.
+The core SSH manager, transfer service, status collector and build script are kept
+unchanged from upstream; Windows status enrichment belongs to the Web client.
+Use rexp-web 0.1.2+ for that Windows compatibility path. The remote REXP CLI and
+its JSON interfaces do not change when switching the plugin transport adapter.
 
-- Plugin and status tests: 14 passed, including an actual MCP client/server exchange,
-  Windows probe fallback and installer timeout forwarding.
-- Full suite: 739 passed, 3 failed, 11 skipped in the run including the first five
-  plugin tests. The three failures were reproduced from a clean archive of origin/main
-  (290c446): one missing-authentication assertion and two direct-transfer host-key fixtures.
-- The actual local REXP CLI was invoked through the generic plugin host: version,
-  release skills, status, queue and fixed root identity passed. No experiment scheduler
-  was started and no remote worker was updated.
-- Package dry run includes the new host and example manifests, excludes private SSH
-  configuration and the former REXP JavaScript adapter.
-- REXP Web uses `plugin-run` with `runs --json` and `run show --json`; pass both
-  `--config` and `--plugins` when starting its MCP child. Its personal configuration
-  selects the same node and plugin registries as the agent.
+REXP Web uses `plugin-run` with `runs --json`, `run show --json` and the paged Tune
+commands. Pass both `--config` and `--plugins` when starting its MCP child. Its
+personal configuration selects the same node and plugin registries as the agent.
 
 
 The REXP product is distributed on PyPI as `rexprun` (0.1.66+); its CLI, Python
@@ -171,8 +169,6 @@ The REXP example downloads and checksums the current universal wheel from offici
 Keep private paths in the user registry. Reference the manifest inside the installed SSH-MCP package, rather than leaving a copied manifest stale after upgrades. The catalog reloads the referenced file on each request; reading skills after a platform upgrade does not require restarting SSH connections.
 
 After isolated installation, `rexp init` registers a terminal command. Verify `rexp version` and `rexp doctor --json` directly in an ordinary target terminal, not only through absolute-path plugin calls. Platform root and experiment environments must match.
-
-If the server exits with code 127 while establishing its SFTP subsystem, file transfer reports a non-retriable `SFTP_ERROR` and preserves the authenticated SSH command connection. Install or configure the server's SFTP subsystem before retrying file transfer; reconnecting SSH cannot repair a missing subsystem.
 
 ### Host-provided plugin paths
 

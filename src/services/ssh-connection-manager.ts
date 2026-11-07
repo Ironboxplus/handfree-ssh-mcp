@@ -1075,9 +1075,6 @@ export class SSHConnectionManager {
       maxOutputBytes?: number;
       reuseConnection?: boolean;
       vvv?: boolean;
-      onProgress?: (chunk: string) => void;
-      /** Require exit code 0 and complete output, using execution metadata rather than text markers. */
-      requireSuccess?: boolean;
     } = {}
   ): Promise<string> {
     // Validate command input and security
@@ -1123,7 +1120,6 @@ export class SSHConnectionManager {
           exitCode = await this.runCommandStream(cmdString, client, timeout, {
             stdoutCollector,
             stderrCollector,
-            onProgress: options.onProgress,
             logWriter: logWriter ?? undefined,
             debug,
             channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
@@ -1139,13 +1135,6 @@ export class SSHConnectionManager {
           logWriter,
           maxOutputBytes,
         });
-
-        if (options.requireSuccess && (exitCode !== 0 ||
-            stdoutCollector.isTruncated() || stderrCollector.isTruncated())) {
-          const reason = exitCode === null ? "Command ended without a confirmed exit code" :
-            exitCode !== 0 ? `Command exited with code ${exitCode}` : "Command output was truncated";
-          throw new ToolError("COMMAND_EXECUTION_ERROR", `${reason}\n${result}`, false);
-        }
 
         // Success - log if this was a retry
         if (attempt > 0) {

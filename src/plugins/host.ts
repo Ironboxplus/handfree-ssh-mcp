@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { PluginCatalog, expand, shellQuote } from "./catalog.js";
+import { PluginCatalog, expand } from "./catalog.js";
+import { executePluginSsh } from "./ssh-executor.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { ToolError } from "../utils/tool-error.js";
 import os from 'node:os';
@@ -11,22 +12,6 @@ import {getConfigPath} from '../config/config-loader.js';
 const execFileAsync = promisify(execFile);
 type Target = {plugin: string; component?: string; connectionName?: string};
 type ExecuteLocal = (argv: string[], env: Record<string, string>, timeout: number) => Promise<string>;
-function powershellQuote(value: string): string {
-  return "'" + value.replace(/'/g, "''") + "'";
-}
-
-function sshCommand(argv: string[], env: Record<string, string>, shell: string): string {
-  if (shell === "powershell") {
-    const assignments = Object.entries(env).map(([key, value]) => `$env:${key} = ${powershellQuote(value)};`).join(" ");
-    const invoke = `& ${argv.map(powershellQuote).join(" ")}`;
-    const script = `$ErrorActionPreference = 'Stop'; try { ${assignments} ${invoke}; if ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE } exit 0 } catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }`;
-    const encoded = Buffer.from(script, "utf16le").toString("base64");
-    return `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`;
-  }
-  if (shell !== "posix") throw new ToolError("INVALID_CONFIGURATION", `Unknown plugin commandShell: ${shell}`);
-  return [...(Object.keys(env).length ? ["env", ...Object.entries(env).map(([k,v]) => `${k}=${v}`)] : []), ...argv].map(shellQuote).join(" ");
-}
-
 const localExec: ExecuteLocal = async (argv, env, timeout) => {
   const result = await execFileAsync(argv[0], argv.slice(1), {
     env: {...process.env, ...env}, timeout, maxBuffer: 1024 * 1024, windowsHide: true,
@@ -81,11 +66,10 @@ export class PluginHost {
     let output: string;
     try {
       if (c.connectionName) {
-        const command = sshCommand(argv, env, variables.commandShell ?? "posix");
         // Use the existing manager, including its command policy, timeout and output limits.
         // Mutations are never automatically retried after an ambiguous SSH disconnect.
-        output = await this.ssh.executeCommand(command, c.connectionName, {timeout, maxRetries: 0,
-          maxOutputBytes: 1024 * 1024, onProgress, requireSuccess: true});
+        output = await executePluginSsh(this.ssh, c.connectionName, argv, env,
+          variables.commandShell ?? "posix", timeout, onProgress);
       } else {
         output = await this.executeLocal(argv, env, timeout);
       }

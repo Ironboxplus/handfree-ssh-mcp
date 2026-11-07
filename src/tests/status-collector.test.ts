@@ -140,49 +140,6 @@ describe("collectSystemStatus hang-hardening", () => {
     assert.strictEqual(status.reachable, true);
     assert.strictEqual(status.hostname, "partial-host");
   });
-
-  for (const [output, exitCode] of [
-    ["__STATUS_BEGIN__\nKERNEL=5.15.0\nMEMORY=free:8G total:16G\n__STATUS_END__\n", 1],
-    ["KERNEL=5.15.0\nMEMORY=free:8G total:16G\n", 0],
-  ] as const) {
-    it(`retains partial POSIX data without hostname or OS name (exit ${exitCode})`, async () => {
-      let execCount = 0;
-      const client = makeClient((_cmd, channel) => {
-        execCount++;
-        channel.writeStdout(output);
-        channel.finish(exitCode);
-      });
-      const status = await collectSystemStatus(client, "restricted-posix", { timeoutMs: 1000 });
-      assert.equal(execCount, 1, "partial POSIX data must not trigger PowerShell");
-      assert.equal(status.reachable, true);
-      assert.equal(status.kernelVersion, "5.15.0");
-      assert.deepEqual(status.memory, { free: "8G", total: "16G" });
-    });
-  }
-
-  for (const posixExitCode of [0, 1]) {
-    it(`falls back to Windows after unusable POSIX output (exit ${posixExitCode}) and remembers the shell`, async () => {
-      const commands: string[] = [];
-      const client = makeClient((cmd, channel) => {
-        commands.push(cmd);
-        if (!cmd.startsWith("powershell.exe")) {
-          channel.stderr.emit("data", Buffer.from("sh is not recognized"));
-          channel.finish(posixExitCode);
-        } else {
-          channel.writeStdout("__STATUS_BEGIN__\r\nHOSTNAME=laptop\r\nOS_NAME=Windows\r\nGPUS=NVIDIA|RTX 3060|42;NVIDIA|RTX 3060|0\r\n__STATUS_END__");
-          channel.finish();
-        }
-      });
-      const status = await collectSystemStatus(client, "windows", { timeoutMs: 2000 });
-      assert.equal(status.reachable, true);
-      assert.equal(status.osName, "Windows");
-      assert.equal(status.gpus?.length, 2);
-      assert.equal(status.gpus?.[0].usage, "42.0%");
-      await collectSystemStatus(client, "windows", { timeoutMs: 2000 });
-      assert.equal(commands.length, 3);
-      assert.ok(commands[2].startsWith("powershell.exe"));
-    });
-  }
 });
 
 describe("refreshStatus connect/probe budgets", () => {

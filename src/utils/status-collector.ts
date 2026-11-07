@@ -114,42 +114,6 @@ export type CollectSystemStatusOptions = {
   timeoutMs?: number;
 };
 
-const probeShells = new WeakMap<Client, "posix" | "powershell">();
-// Same KEY=value contract as the POSIX probe; one bounded SSH channel.
-const WINDOWS_STATUS_PROBE = `
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Write-Output '__STATUS_BEGIN__'
-Write-Output ('HOSTNAME=' + $env:COMPUTERNAME)
-Write-Output 'OS_NAME=Windows'
-try {
-  $os = Get-CimInstance Win32_OperatingSystem
-  Write-Output ('OS_VERSION=' + $os.Caption)
-  Write-Output ('KERNEL=' + $os.Version)
-  Write-Output ('MEMORY=free:' + [math]::Round($os.FreePhysicalMemory/1MB, 1) + 'G total:' + [math]::Round($os.TotalVisibleMemorySize/1MB, 1) + 'G')
-} catch {}
-try {
-  $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-  Write-Output ('CPU_NAME=' + $cpu.Name)
-  if ($null -ne $cpu.LoadPercentage) { Write-Output ('CPU_USAGE=' + $cpu.LoadPercentage) }
-} catch {}
-try {
-  if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
-    $rows = @(& nvidia-smi --query-gpu=name,utilization.gpu --format=csv,noheader,nounits)
-    if ($LASTEXITCODE -eq 0) {
-      $gpus = @($rows | ForEach-Object { $p = $_ -split ','; 'NVIDIA|' + $p[0].Trim() + '|' + $p[1].Trim() })
-      Write-Output ('GPUS=' + ($gpus -join ';'))
-    }
-  }
-} catch {}
-Write-Output '__STATUS_END__'
-exit 0
-`;
-
-function windowsProbeCommand(): string {
-  return `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(WINDOWS_STATUS_PROBE, "utf16le").toString("base64")}`;
-}
-
 /**
  * Run a single remote command with a hard client-side timeout.
  * On timeout the SSH channel is closed so the remote process is not left
@@ -292,25 +256,7 @@ export async function collectSystemStatus(
   };
 
   try {
-    const started = Date.now();
-    let raw: string;
-    if (probeShells.get(client) === "powershell") {
-      raw = await execWithTimeout(client, windowsProbeCommand(), timeoutMs);
-    } else {
-      try {
-        raw = await execWithTimeout(client, buildProbeCommand(), timeoutMs);
-        // Preserve partial POSIX results even when hostname/uname are unavailable.
-        // Fall back only when the shell returned no recognizable probe output.
-        if (!raw.includes("__STATUS_BEGIN__") && parseKvLines(raw).size === 0)
-          throw new Error("No status data in POSIX probe");
-        probeShells.set(client, "posix");
-      } catch (error) {
-        const remaining = timeoutMs - (Date.now() - started);
-        if (remaining <= 0) throw error;
-        raw = await execWithTimeout(client, windowsProbeCommand(), remaining);
-        if (/^OS_NAME=Windows\r?$/m.test(raw)) probeShells.set(client, "powershell");
-      }
-    }
+    const raw = await execWithTimeout(client, buildProbeCommand(), timeoutMs);
     const kv = parseKvLines(raw);
 
     const hostname = kv.get("HOSTNAME");
