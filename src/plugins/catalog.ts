@@ -4,6 +4,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
 import { ToolError } from "../utils/tool-error.js";
+import {fileURLToPath} from 'node:url';
 
 const word = z.string().min(1).refine(s => !s.includes("\0"), "NUL is not allowed");
 const argv = z.array(word).min(1);
@@ -52,12 +53,22 @@ export function defaultCatalogPath(args = process.argv.slice(2)): string {
 
 /** Trusted user configuration is re-read per request; manifests are never executable JS. */
 export class PluginCatalog {
-  constructor(readonly file = defaultCatalogPath()) {}
+  constructor(readonly file = defaultCatalogPath(), readonly includeBundled = true) {}
 
   read(): Array<{manifest: Manifest; registration: Registration}> {
-    if (!fs.existsSync(this.file)) return [];
     try {
-      const registry = registrySchema.parse(yaml.load(fs.readFileSync(this.file, "utf8")));
+      const registry = fs.existsSync(this.file)
+        ? registrySchema.parse(yaml.load(fs.readFileSync(this.file, "utf8")))
+        : {schemaVersion:1,plugins:{} as Record<string, Registration>};
+      if(this.includeBundled) {
+        const directory=fileURLToPath(new URL('../../examples/plugins/',import.meta.url));
+        for(const name of fs.readdirSync(directory).filter(name=>name.endsWith('.yaml')&&!name.endsWith('.example.yaml'))) {
+          const file=path.join(directory,name);
+          const manifest=manifestSchema.parse(yaml.load(fs.readFileSync(file,'utf8')));
+          if(!Object.hasOwn(registry.plugins,manifest.id))
+            registry.plugins[manifest.id]=registration.parse({manifest:file});
+        }
+      }
       return Object.entries(registry.plugins).filter(([, item]) => item.enabled).map(([id, item]) => {
         const manifest = manifestSchema.parse(yaml.load(fs.readFileSync(path.resolve(path.dirname(this.file), item.manifest), "utf8")));
         if (manifest.id !== id) throw new Error(`Manifest id ${manifest.id} does not match registry key ${id}`);

@@ -1,13 +1,51 @@
 schemaVersion: 1
 id: rexp-web
-description: Optional REXP Hub Web interface on the MCP host.
+description: Local Web dashboard for SSH nodes, GPU/NPU resources and REXP experiments.
 components:
   - id: web
     target: local
-    description: Controls an existing Web checkout using its persistent start/stop/status/logs commands.
+    description: Install and manage the independent rexp-web application on this MCP host.
+    setup: >
+      本插件安装在 MCP 控制端，不安装到远端实验服务器。需要 Node.js 22 或以上及 npm。
+      正式包地址为 https://www.npmjs.com/package/rexp-web ，从官方 npm registry 安装 rexp-web@latest。
+      使用 plugin-activate install 安装；已安装时使用 plugin-activate update 更新，
+      安装目录由宿主提供 pluginInstallDir，个人连接配置保留在用户目录。安装不注册自启动项。
+      使用发行包自带的页面与 CLI，无需克隆源码、运行 npm run build 或启动 Vite，勿将 pluginRoot 指向开发目录。
+      安装后读取 web-operations skill，询问用户是否开启登录自启动，再执行 plugin-run
+      args=[configure,--autostart,on] 或 [configure,--autostart,off]，随后执行 [open]。
+      用户已提供选择时不重复询问。访问地址以 open / status 返回为准，默认 http://127.0.0.1:5173/ 。
+      此地址是本机控制台，npm 页面仅用于下载和查看说明。提醒用户把控制台地址加入书签。
+      查看状态用 [status,--json]；修改自启动用 [autostart,on] 或 [autostart,off]；
+      启停用 [start] / [stop]。Agent 退出不关闭 Web。升级前明确告知需要重启 Web 才能加载新版，
+      保留用户的自启动偏好和个人配置，不为升级重新初始化远端平台。
     source:
-      kind: local-checkout
-      location: Set webRoot to your separately installed lab-platform-web checkout.
-    entry: [node, '${webRoot}/scripts/web.mjs']
-    version: [npm, --prefix, '${webRoot}', pkg, get, version]
-    install: [npm, --prefix, '${webRoot}', install]
+      kind: npm
+      location: https://registry.npmjs.org/
+      package: rexp-web
+    entry: ['${nodeExecutable}', '${pluginRoot}/scripts/web.mjs']
+    version: ['${nodeExecutable}', '${pluginRoot}/scripts/web.mjs', version, '--json']
+    env:
+      HANDFREE_MCP_DIR: '${sshMcpDir}'
+      HANDFREE_MCP_CONFIG: '${sshMcpConfig}'
+      HANDFREE_PLUGINS_CONFIG: '${pluginRegistry}'
+    install: &install
+      - '${nodeExecutable}'
+      - '-e'
+      - |
+        const fs = require('node:fs'), path = require('node:path'), cp = require('node:child_process');
+        const roots = [path.dirname(process.execPath), ...(process.env.PATH || '').split(path.delimiter)];
+        const candidates = [process.env.npm_execpath];
+        for (const root of roots) {
+          candidates.push(path.join(root, 'node_modules/npm/bin/npm-cli.js'), path.resolve(root, '../lib/node_modules/npm/bin/npm-cli.js'));
+          try { candidates.push(fs.realpathSync(path.join(root, 'npm'))); } catch {}
+        }
+        const cli = candidates.find(file => file && file.endsWith('npm-cli.js') && fs.existsSync(file));
+        if (!cli) throw new Error('npm CLI not found beside Node or on PATH. Install Node.js with npm first.');
+        const result = cp.spawnSync(process.execPath, [cli, 'install', '--prefix', process.argv[1], '--omit=dev', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org/', 'rexp-web@latest'], {stdio:'inherit'});
+        if (result.error) throw result.error;
+        process.exit(result.status ?? 1);
+      - '${pluginInstallDir}'
+    update: *install
+    skills:
+      list: ['${nodeExecutable}', '${pluginRoot}/scripts/web.mjs', skills, list, '--json']
+      show: ['${nodeExecutable}', '${pluginRoot}/scripts/web.mjs', skills, show, '${skill}', '--json']
