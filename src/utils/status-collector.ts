@@ -299,7 +299,10 @@ export async function collectSystemStatus(
     } else {
       try {
         raw = await execWithTimeout(client, buildProbeCommand(), timeoutMs);
-        if (!/^(?:HOSTNAME|OS_NAME)=.+/m.test(raw)) throw new Error("No host identity in POSIX probe");
+        // Preserve partial POSIX results even when hostname/uname are unavailable.
+        // Fall back only when the shell returned no recognizable probe output.
+        if (!raw.includes("__STATUS_BEGIN__") && parseKvLines(raw).size === 0)
+          throw new Error("No status data in POSIX probe");
         probeShells.set(client, "posix");
       } catch (error) {
         const remaining = timeoutMs - (Date.now() - started);

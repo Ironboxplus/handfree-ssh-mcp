@@ -653,6 +653,95 @@ Example:
   run-retry { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box" }
   run-retry { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box", push: false }`,
 
+  "plugin-list": `plugin-list — Discover available CLI plugins.
+
+Parameters: none.
+
+Returns: JSON array of enabled plugin manifests, including plugin ids,
+components, local/SSH targets, package sources and setup instructions.
+Discovery does not install programs or open SSH connections. Personal
+registrations and manifests are reread on each request.
+
+Read the component's setup before installing. Confirm user-specific paths
+and initialization choices unless already supplied or delegated. Then use
+plugin-activate, plugin-skill and plugin-run with the discovered plugin id.
+
+Example:
+  plugin-list`,
+
+  "plugin-activate": `plugin-activate — Check, install or update a CLI plugin.
+
+Parameters:
+  plugin          (string, required)   Plugin id from plugin-list.
+  component       (string, optional)   Required for plugins with multiple components.
+  connectionName  (string, optional)   SSH alias for an SSH component. Required
+                  with multiple enabled servers; auto-selected for one.
+                  Omit for local components, which reject connectionName.
+  mode            (check | install | update, optional) Default check.
+                  check reads the installed version and skill catalog.
+                  install/update explicitly runs the manifest's installer,
+                  then checks the actual version and skill catalog.
+  timeout         (number, optional)   Installer timeout in ms, default 300000;
+                  range 1000-1800000. Match the client's request timeout.
+                  Version and skill queries each use a separate 30000ms limit.
+
+Read plugin-list setup first. Confirm paths and initialization choices, and
+review running workloads before installation or update. Successful package
+installation is not completed initialization: follow the installed skill.
+The host does not start schedulers or take ownership of Web lifetime.
+Inspect the target after an ambiguous failure before explicitly retrying.
+
+Returns: JSON with plugin/component/target, connectionName, mode, version
+command output and optional skill catalog result.
+
+Examples:
+  plugin-activate { plugin: "rexp", connectionName: "gpu-box" }
+  plugin-activate { plugin: "rexp-web", mode: "install" }
+  plugin-activate { plugin: "rexp-web", mode: "update", timeout: 600000 }`,
+
+  "plugin-skill": `plugin-skill — Read instructions from an installed plugin.
+
+Parameters:
+  plugin          (string, required)   Plugin id from plugin-list.
+  component       (string, optional)   Required for plugins with multiple components.
+  connectionName  (string, optional)   SSH alias for an SSH component. Required
+                  with multiple enabled servers; auto-selected for one.
+                  Omit for local components.
+  name            (string, optional)   Skill name. Omit to list the skill catalog.
+
+Returns: JSON identifying the plugin/component/target and its skill command
+output. Fetch again after updating the plugin so usage matches the installed
+version. This reads instructions; it does not install a global client skill.
+Queries use a 30000ms command timeout.
+
+Examples:
+  plugin-skill { plugin: "rexp-web" }
+  plugin-skill { plugin: "rexp-web", name: "web-operations" }`,
+
+  "plugin-run": `plugin-run — Invoke an installed plugin's CLI.
+
+Parameters:
+  plugin          (string, required)   Plugin id from plugin-list.
+  component       (string, optional)   Required for plugins with multiple components.
+  connectionName  (string, optional)   SSH alias for an SSH component. Required
+                  with multiple enabled servers; auto-selected for one.
+                  Omit for local components.
+  args            (string[], required) Literal argv, up to 256 arguments;
+                  an empty array is allowed. NUL characters are rejected.
+  timeout         (number, optional)   Command timeout in ms, default 30000;
+                  range 1000-1800000. Match the client's request timeout.
+
+Read plugin-skill first. SSH components use the existing connection alias
+and command policy; local components execute on the MCP host. Paths belong
+to the selected component's host. Use existing SFTP tools for transfers.
+Plugin commands are not automatically retried after an ambiguous disconnect.
+
+Returns: JSON with plugin/component/target, connectionName and command output.
+
+Examples:
+  plugin-run { plugin: "rexp", connectionName: "gpu-box", args: ["runs", "--json"] }
+  plugin-run { plugin: "rexp-web", args: ["open"] }`,
+
   "help": `help — Show detailed usage for one or all tools.
 
 Parameters:
@@ -680,6 +769,10 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   run-list          List runs on a server, newest first.
   run-cancel        Cancel a run (TERM, then KILL after graceMs; identity-verified).
   run-retry         Launch a fresh run from an earlier run's stored config snapshot.
+  plugin-list       Discover CLI plugins, components, package sources and setup instructions.
+  plugin-activate   Check the installed version, or explicitly install/update a plugin.
+  plugin-skill      Read the installed plugin's skill catalog or one skill.
+  plugin-run        Invoke the plugin CLI on its local or SSH target.
   help              Show this help or detailed per-tool usage.
 
 Quick start:
