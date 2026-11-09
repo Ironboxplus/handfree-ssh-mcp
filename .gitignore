@@ -48,3 +48,9 @@ id_ed25519.*
 # Local secrets / scratch
 pass/
 .omx/
+
+# Personal plugin registries (default location is outside the checkout).
+plugins.yaml
+plugins.yml
+*.plugins.yaml
+*.plugins.yml

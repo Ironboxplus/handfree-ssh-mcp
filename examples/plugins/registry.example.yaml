@@ -1,0 +1,16 @@
+# Copy to ~/.config/handfree-ssh-mcp/plugins.yaml and edit the paths.
+# Copy the manifest files beside it. No SSH credentials belong in these manifests.
+schemaVersion: 1
+plugins:
+  rexp:
+    manifest: ./rexp.yaml
+    settings: {}
+    connections:
+      my-server: # Replace with an alias from list-servers; add any number of servers.
+        platformRoot: /absolute/path/to/experiment-data
+        rexpPath: /absolute/path/to/conda/bin/rexp
+        platformPython: /absolute/path/to/conda/bin/python
+  rexp-web:
+    enabled: false
+    manifest: ./rexp-web.yaml
+    settings: {}

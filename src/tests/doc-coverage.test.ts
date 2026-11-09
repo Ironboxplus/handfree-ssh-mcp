@@ -13,6 +13,9 @@ import { registerRunLogsTool } from "../tools/run-logs.js";
 import { registerRunListTool } from "../tools/run-list.js";
 import { registerRunCancelTool } from "../tools/run-cancel.js";
 import { registerRunRetryTool } from "../tools/run-retry.js";
+import { registerPluginTools } from "../tools/plugins.js";
+import { registerSftpListTool } from '../tools/sftp-list.js';
+import { registerSftpManageTool } from '../tools/sftp-manage.js';
 import { SERVER_INSTRUCTIONS } from "../config/server.js";
 
 /**
@@ -48,6 +51,9 @@ async function listRegisteredTools(): Promise<Map<string, string[]>> {
   registerRunListTool(server);
   registerRunCancelTool(server);
   registerRunRetryTool(server);
+  registerPluginTools(server);
+  registerSftpListTool(server);
+  registerSftpManageTool(server);
   registerHelpTool(server);
   const client = new Client({ name: "doc-coverage-client", version: "0.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -67,12 +73,14 @@ async function listRegisteredTools(): Promise<Map<string, string[]>> {
 }
 
 describe("documentation coverage: every tool parameter appears in that tool's help text", () => {
-  test("download / transfer / upload / run-* parameters are all documented in help", async () => {
+  test("download / transfer / upload / run-* / plugin-* parameters are all documented in help", async () => {
     const tools = await listRegisteredTools();
     const missing: string[] = [];
 
     for (const toolName of [
       "download",
+      "sftp-list",
+      "sftp-manage",
       "transfer",
       "upload",
       "workspace-run",
@@ -81,6 +89,9 @@ describe("documentation coverage: every tool parameter appears in that tool's he
       "run-list",
       "run-cancel",
       "run-retry",
+      "plugin-activate",
+      "plugin-skill",
+      "plugin-run",
     ]) {
       const parameters = tools.get(toolName);
       assert.ok(parameters && parameters.length > 0, `expected ${toolName} to expose parameters`);
@@ -102,6 +113,30 @@ describe("documentation coverage: every tool parameter appears in that tool's he
         `Adding a parameter without documenting it makes \`help\` an incomplete list of that tool's own options -- ` +
         `exactly how \`connections\` shipped undocumented in 2.0.0.`,
     );
+  });
+
+  test("all plugin tools appear in the overview and have working MCP help responses", async () => {
+    const server = new McpServer({ name: "plugin-help", version: "0.0.0" });
+    registerHelpTool(server);
+    const client = new Client({ name: "plugin-help-client", version: "0.0.0" });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await server.connect(a);
+    await client.connect(b);
+    try {
+      const tools = await listRegisteredTools();
+      assert.deepEqual(tools.get("plugin-list"), [], "discovery takes no parameters");
+      const overview = await client.callTool({ name: "help", arguments: {} });
+      for (const name of ["plugin-list", "plugin-activate", "plugin-skill", "plugin-run"]) {
+        assert.ok((overview.content as Array<{ text: string }>)[0].text.includes(name));
+        const result = await client.callTool({ name: "help", arguments: { tool: name } });
+        assert.notEqual(result.isError, true, `help must recognize ${name}`);
+        const text = (result.content as Array<{ text: string }>)[0].text;
+        assert.ok(text.startsWith(`${name} —`));
+        assert.ok(text.includes("Parameters"));
+      }
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+    }
   });
 
   test("every run-* tool actually exposes reuseConnection, not just workspace-run", async () => {

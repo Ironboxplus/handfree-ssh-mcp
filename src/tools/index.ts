@@ -1,3 +1,6 @@
+import { registerPluginTools } from "./plugins.js";
+import { registerSftpListTool } from './sftp-list.js';
+import { registerSftpManageTool } from './sftp-manage.js';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerExecuteCommandTool } from "./execute-command.js";
 import { registerUploadTool } from "./upload.js";
@@ -23,6 +26,8 @@ export function registerAllTools(server: McpServer): void {
   registerExecuteCommandTool(server);
   registerUploadTool(server);
   registerDownloadTool(server);
+  registerSftpListTool(server);
+  registerSftpManageTool(server);
   registerListServersTool(server);
   registerShowWhitelistTool(server);
   registerCloseConnectionTool(server);
@@ -35,4 +40,5 @@ export function registerAllTools(server: McpServer): void {
   registerRunCancelTool(server);
   registerRunRetryTool(server);
   registerHelpTool(server);
+  registerPluginTools(server);
 }

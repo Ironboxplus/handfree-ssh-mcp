@@ -132,7 +132,7 @@ That's it — ask your agent to check the logs on `dev`, deploy to `prod`, or tr
 |---|---|
 | Discover | `list-servers`, `show-whitelist`, `help` |
 | Execute | `execute-command` (streams in the background; poll with `command-status`), `close-connection` |
-| Transfer | `upload`, `download`, `transfer` (upload / download / relay, recursive, batch, archive) |
+| Transfer | `sftp-list` (directory browsing with pagination, filtering and sorting), `sftp-manage` (rename and confirmed deletion), `upload`, `download`, `transfer` (upload / download / relay, recursive, batch, archive) |
 | Run | `workspace-run`, `run-status`, `run-logs`, `run-list`, `run-cancel`, `run-retry` |
 
 Every parameter is documented in [docs/tools.md](docs/tools.md).
@@ -189,3 +189,19 @@ Handfree started as a fork of [classfang/ssh-mcp-server](https://github.com/clas
 ISC License · Original work © 2025 junki.cn · Modifications © 2026 woqucc
 
 <sub>🧪 Almost entirely AI-written, this README included.</sub>
+
+## Optional plugins
+
+Handfree supports independent CLI plugins through a personal declarative registry.
+Discover them with `plugin-list`, check/install/update with `plugin-activate`, read
+the installed version’s instructions with `plugin-skill`, and invoke its CLI with
+`plugin-run`. SSH components use existing connection aliases and command policies.
+See [plugin configuration and lifecycle](docs/plugins.md) and
+[example manifests](examples/plugins/registry.example.yaml).
+
+The optional [REXP Web](https://www.npmjs.com/package/rexp-web) plugin installs the
+published `rexp-web@latest` package locally (Node.js 22+ and npm required), including
+the ready-to-use dashboard. Discover `rexp-web` with `plugin-list`, install/update
+with `plugin-activate`, then call `plugin-run` with `args: ["open"]`.
+Use the URL returned by `open` or `status` (default `http://127.0.0.1:5173/`).
+No source checkout or frontend build is required; ask about login autostart during setup.

@@ -653,6 +653,135 @@ Example:
   run-retry { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box" }
   run-retry { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box", push: false }`,
 
+  "sftp-manage": `sftp-manage — Rename or permanently delete remote entries over SFTP.
+
+Parameters:
+  connectionName  (string, optional) SSH alias; required with multiple enabled servers.
+  action          (rename | delete, required) Operation to perform.
+  remotePath      (string, required) Existing absolute SFTP path, subject to remote path policy.
+  newName         (string, optional) Rename only: one filename, no path separators. Never overwrites.
+  recursive       (boolean, optional) Delete only: allow nonempty directories, default false.
+  confirm         (boolean, optional) Delete only: true after user confirms server and full path.
+
+Deletion is permanent. Symlinks are unlinked without following the target.
+Filesystem roots cannot be modified. Directory policy applies to original paths
+and resolved parents; no shell command is used. Do not automatically retry an
+uncertain mutation: first refresh the directory to check its actual state.
+
+Example:
+  sftp-manage { connectionName: "gpu-box", action: "rename", remotePath: "/data/old.txt", newName: "new.txt" }`,
+
+  "sftp-list": `sftp-list — Browse a remote directory over SFTP.
+
+Parameters:
+  connectionName  (string, optional) SSH alias; required with multiple enabled servers.
+  remotePath      (string, optional) Absolute SFTP path. Defaults to an allowed root or SSH home.
+  page            (integer, optional) One-based page, default 1.
+  pageSize        (integer, optional) Entries per page, default 50, maximum 200.
+  showHidden      (boolean, optional) Include dotfiles, default false.
+  query           (string, optional) Case-insensitive filename filter.
+  names           (string[], optional) Exact filenames to inspect, including hidden entries.
+  sort            (name | modified | size, optional) Default name; directories first.
+  direction       (asc | desc, optional) Default asc.
+
+Returns: JSON with canonical path, permitted parent, page, pageSize, total and
+entries (name, type, size, modifiedAt). Symlinks are identified without following
+their targets. Remote path policy applies before listing and after resolving the
+directory. Pagination limits the response; SFTP still reads that directory's names.
+No shell command or remote runtime is required.
+
+Example:
+  sftp-list { connectionName: "gpu-box", remotePath: "/data", pageSize: 50 }`,
+
+  "plugin-list": `plugin-list — Discover available CLI plugins.
+
+Parameters: none.
+
+Returns: JSON array of enabled plugin manifests, including plugin ids,
+components, local/SSH targets, package sources and setup instructions.
+Discovery does not install programs or open SSH connections. Personal
+registrations and manifests are reread on each request.
+
+Read the component's setup before installing. Confirm user-specific paths
+and initialization choices unless already supplied or delegated. Then use
+plugin-activate, plugin-skill and plugin-run with the discovered plugin id.
+
+Example:
+  plugin-list`,
+
+  "plugin-activate": `plugin-activate — Check, install or update a CLI plugin.
+
+Parameters:
+  plugin          (string, required)   Plugin id from plugin-list.
+  component       (string, optional)   Required for plugins with multiple components.
+  connectionName  (string, optional)   SSH alias for an SSH component. Required
+                  with multiple enabled servers; auto-selected for one.
+                  Omit for local components, which reject connectionName.
+  mode            (check | install | update, optional) Default check.
+                  check reads the installed version and skill catalog.
+                  install/update explicitly runs the manifest's installer,
+                  then checks the actual version and skill catalog.
+  timeout         (number, optional)   Installer timeout in ms, default 300000;
+                  range 1000-1800000. Match the client's request timeout.
+                  Version and skill queries each use a separate 30000ms limit.
+
+Read plugin-list setup first. Confirm paths and initialization choices, and
+review running workloads before installation or update. Successful package
+installation is not completed initialization: follow the installed skill.
+The host does not start schedulers or take ownership of Web lifetime.
+Inspect the target after an ambiguous failure before explicitly retrying.
+
+Returns: JSON with plugin/component/target, connectionName, mode, version
+command output and optional skill catalog result.
+
+Examples:
+  plugin-activate { plugin: "rexp", connectionName: "gpu-box" }
+  plugin-activate { plugin: "rexp-web", mode: "install" }
+  plugin-activate { plugin: "rexp-web", mode: "update", timeout: 600000 }`,
+
+  "plugin-skill": `plugin-skill — Read instructions from an installed plugin.
+
+Parameters:
+  plugin          (string, required)   Plugin id from plugin-list.
+  component       (string, optional)   Required for plugins with multiple components.
+  connectionName  (string, optional)   SSH alias for an SSH component. Required
+                  with multiple enabled servers; auto-selected for one.
+                  Omit for local components.
+  name            (string, optional)   Skill name. Omit to list the skill catalog.
+
+Returns: JSON identifying the plugin/component/target and its skill command
+output. Fetch again after updating the plugin so usage matches the installed
+version. This reads instructions; it does not install a global client skill.
+Queries use a 30000ms command timeout.
+
+Examples:
+  plugin-skill { plugin: "rexp-web" }
+  plugin-skill { plugin: "rexp-web", name: "web-operations" }`,
+
+  "plugin-run": `plugin-run — Invoke an installed plugin's CLI.
+
+Parameters:
+  plugin          (string, required)   Plugin id from plugin-list.
+  component       (string, optional)   Required for plugins with multiple components.
+  connectionName  (string, optional)   SSH alias for an SSH component. Required
+                  with multiple enabled servers; auto-selected for one.
+                  Omit for local components.
+  args            (string[], required) Literal argv, up to 256 arguments;
+                  an empty array is allowed. NUL characters are rejected.
+  timeout         (number, optional)   Command timeout in ms, default 30000;
+                  range 1000-1800000. Match the client's request timeout.
+
+Read plugin-skill first. SSH components use the existing connection alias
+and command policy; local components execute on the MCP host. Paths belong
+to the selected component's host. Use existing SFTP tools for transfers.
+Plugin commands are not automatically retried after an ambiguous disconnect.
+
+Returns: JSON with plugin/component/target, connectionName and command output.
+
+Examples:
+  plugin-run { plugin: "rexp", connectionName: "gpu-box", args: ["runs", "--json"] }
+  plugin-run { plugin: "rexp-web", args: ["open"] }`,
+
   "help": `help — Show detailed usage for one or all tools.
 
 Parameters:
@@ -673,6 +802,8 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   command-status    Poll background status and incremental live output.
   upload            Upload a single file, or a batch of files, to a remote server.
   download          Download a single file from a remote server.
+  sftp-list         Browse a paginated remote directory over SFTP.
+  sftp-manage       Rename or permanently delete remote entries with path policy.
   transfer          Move files/directories; mode=relay selects remote-to-remote, strategy selects relay/direct/auto.
   workspace-run     Start a durable Linux task; no YAML run profile needed. Pass remoteRoot + venv/executable inline, or use a saved profile. Optional push/collect.
   run-status        Query a workspace-run's current status by runId.
@@ -680,6 +811,10 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   run-list          List runs on a server, newest first.
   run-cancel        Cancel a run (TERM, then KILL after graceMs; identity-verified).
   run-retry         Launch a fresh run from an earlier run's stored config snapshot.
+  plugin-list       Discover CLI plugins, components, package sources and setup instructions.
+  plugin-activate   Check the installed version, or explicitly install/update a plugin.
+  plugin-skill      Read the installed plugin's skill catalog or one skill.
+  plugin-run        Invoke the plugin CLI on its local or SSH target.
   help              Show this help or detailed per-tool usage.
 
 Quick start:

@@ -1,0 +1,174 @@
+schemaVersion: 1
+id: rexp
+description: Independent experiment queue, scheduler, checkpoints and environment catalog.
+components:
+  - id: worker
+    target: ssh
+    description: Run rexp on the selected SSH server. File transfer uses SSH MCP SFTP tools.
+    setup: >
+      安装前确认目标节点、平台安装环境和数据根目录 platformRoot。已有路径优先保留；
+
+      未指定的目录和初始化选项应询问用户，只有明确授权“看着办”时才自行选择，
+
+      并说明最终位置、磁盘容量与选择理由。不要在源码、临时目录或 cache 下散放安装与实验数据。
+
+      先检测 uv、Conda 与现有解释器；首次配置两者都有时绑定 uv，只有一个则使用该管理器。
+
+      都没有时，必须完整提供三个并列选项：①安装 uv（推荐）；②安装 Conda；③使用现有 Python venv、不安装管理器。推荐 uv 不代表可省略 Conda；除非目标架构确实不支持并说明原因，不得隐藏
+      Conda。不要未经确认下载管理器。
+
+      平台和实验环境分开；初始化会复用独立运行环境，或在 platformRoot/env/platform 准备平台环境，
+
+      并在 platformRoot/env/default 创建轻量 default。已有环境不覆盖，不重装 Torch/CANN/驱动。
+
+      按目标系统设置 platformPython、rexpPath（Windows 的 venv 通常为 Scripts/python.exe、
+
+      Scripts/rexp.exe；Conda 环境的 Python 在环境根目录）及 commandShell: powershell。
+
+      插件本体从正式 PyPI 安装 rexprun>=0.2.0；不要用临时 wheel 链接替代清单来源。
+
+      旧 rexp-server 迁移前先确认实验及调度器已停，下载校验 rexprun，再卸载旧包并安装新版；
+
+      不让两个发行包覆盖相同 rexp 模块，保留原根目录，不为升级重新初始化。
+
+      安装后读取 platform-operations skill。确认用户选择后执行 rexp init --root <已确认目录>
+
+      --save-default --env-manager <uv|conda|venv> --yes；需安装管理器时改用 --install-manager <uv|conda>。
+
+      --yes 不会自行安装管理器。确需仅初始化存储才用 --skip-default-env。
+
+      初始化可能下载依赖，请求留足超时（例如 900000ms）。读取 doctor --json 的 environment_manager，
+
+      将 platformPython 更新为 runtime_python，并核对 rexpPath 指向的全局入口或新环境入口可用。
+
+      初始化完成后检查 rexp node env list --json，必须有可用 default。default 仅适合轻量分析，
+
+      不预装 PyTorch/CUDA；训练推理先核对依赖，优先复用已有兼容环境，确需隔离时使用
+
+      rexp node env create NAME --python <版本或解释器> --description <中文用途和限制>，统一存放在根目录 env/。
+
+      新实验的 Python/依赖由实验要求决定，要求不清楚时询问用户；未经委托不要猜测科研依赖。
+
+      若无 default 注册名，实验配置必须显式指定已登记 environment，不能默默使用平台 Python。
+
+      最后检查插件内 rexp doctor --json，并通过普通 SSH 终端调用相同 rexp 路径执行 doctor --json
+
+      （不注入 PLATFORM_ROOT），确认平台根目录和已登记环境一致。未登记实验环境应报告初始化
+
+      尚未完成，不自动启动调度器。
+
+
+      隔离安装后必须通过 init 登记全局 rexp，并在普通新终端直接执行 rexp version 和 rexp doctor --json 验收。
+
+      uv 引导工具可能位于 .platform/bootstrap，它不是实验环境。
+
+      可设置 dependencyIndex 为依赖镜像；REXP 本体始终从正式 PyPI 下载并校验 SHA256。
+
+      安装会发送 MCP progress 通知；超时后先检查环境，再显式重试，避免盲目重复安装。
+
+
+      首次安装按以下顺序执行，避免重复探查：先用 plugin-list 获取清单；只检查目标系统/架构、磁盘、现有 Python 与 uv/Conda
+      常见位置，然后一次询问根目录和环境管理方式。不要为安装遍历本机整个配置/技能目录或反复阅读平台源码。
+
+      新建节点后等待配置文件监听生效，可用 list-servers 确认；保留现有 SSH 长连接，不因安装或监控而重启 MCP/Web。资源监控独立于 REXP，未安装平台不应阻止
+      nvidia-smi/npu-smi 采样。
+
+      网络安装使用明确的超时与低重试：pip 配置 PIP_DEFAULT_TIMEOUT=15 PIP_RETRIES=1，uv 配置 UV_HTTP_TIMEOUT=15
+      UV_HTTP_RETRIES=1；保留用户已有设置。发现同一来源不可达后不要再次做长时间在线安装。先报告失败阶段、耗时和下一步，选择用户认可的依赖镜像，或在控制端从官方 PyPI 下载匹配远端
+      OS/架构/Python ABI 的 wheel，经 SHA256 校验后通过已有 SSH 通道传输。勿通过修改远端 sshd 来兜底上传。
+
+      如果已有本地 wheelhouse，则直接用 --no-index --find-links 安装；uv 初始化必须设置 UV_OFFLINE=true
+      UV_FIND_LINKS=<wheelhouse>，pip 使用 PIP_NO_INDEX=1 PIP_FIND_LINKS=<wheelhouse>。uv venv --seed 也会获取
+      pip/setuptools/wheel，离线集合须包含所选 Python 对应的这些种子包与 default 所需的 NumPy/PyYAML/pydantic/packaging
+      等依赖。UV_NO_INDEX=1 不能代替 UV_OFFLINE=true，避免先离线准备又重新联网。
+    source:
+      kind: pip
+      location: https://pypi.org/simple/
+      package: rexprun
+    entry:
+      - ${rexpPath}
+    version:
+      - ${rexpPath}
+      - version
+    env:
+      PLATFORM_ROOT: ${platformRoot}
+    install:
+      - ${platformPython}
+      - '-u'
+      - '-c'
+      - |
+        import hashlib, json, os, pathlib, subprocess, sys, tempfile, urllib.request
+        print("Fetching rexprun release metadata from official PyPI...", flush=True)
+        with urllib.request.urlopen("https://pypi.org/pypi/rexprun/json", timeout=30) as response:
+            release = json.load(response)
+        wheel = next(item for item in release['urls'] if item['filename'].endswith('py3-none-any.whl'))
+        with tempfile.TemporaryDirectory(prefix='rexprun-install-') as temporary:
+            target = pathlib.Path(temporary) / wheel['filename']
+            digest = hashlib.sha256()
+            received = 0
+            print("Downloading " + wheel['filename'], flush=True)
+            with urllib.request.urlopen(wheel['url'], timeout=30) as response, target.open('wb') as output:
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    output.write(chunk)
+                    received += len(chunk)
+                    print("Downloaded %d / %d bytes" % (received, wheel['size']), flush=True)
+            if digest.hexdigest() != wheel['digests']['sha256']:
+                raise RuntimeError('Official PyPI wheel checksum mismatch')
+            print("Verified official wheel; installing with the configured dependency index...", flush=True)
+            install_env = os.environ.copy()
+            install_env.setdefault('PIP_DEFAULT_TIMEOUT', '15')
+            install_env.setdefault('PIP_RETRIES', '1')
+            install_env.setdefault('PIP_DISABLE_PIP_VERSION_CHECK', '1')
+            subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', '--index-url', sys.argv[1], str(target)], check=True, env=install_env)
+      - ${dependencyIndex}
+    update:
+      - ${platformPython}
+      - '-u'
+      - '-c'
+      - |
+        import hashlib, json, os, pathlib, subprocess, sys, tempfile, urllib.request
+        print("Fetching rexprun release metadata from official PyPI...", flush=True)
+        with urllib.request.urlopen("https://pypi.org/pypi/rexprun/json", timeout=30) as response:
+            release = json.load(response)
+        wheel = next(item for item in release['urls'] if item['filename'].endswith('py3-none-any.whl'))
+        with tempfile.TemporaryDirectory(prefix='rexprun-install-') as temporary:
+            target = pathlib.Path(temporary) / wheel['filename']
+            digest = hashlib.sha256()
+            received = 0
+            print("Downloading " + wheel['filename'], flush=True)
+            with urllib.request.urlopen(wheel['url'], timeout=30) as response, target.open('wb') as output:
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    output.write(chunk)
+                    received += len(chunk)
+                    print("Downloaded %d / %d bytes" % (received, wheel['size']), flush=True)
+            if digest.hexdigest() != wheel['digests']['sha256']:
+                raise RuntimeError('Official PyPI wheel checksum mismatch')
+            print("Verified official wheel; installing with the configured dependency index...", flush=True)
+            install_env = os.environ.copy()
+            install_env.setdefault('PIP_DEFAULT_TIMEOUT', '15')
+            install_env.setdefault('PIP_RETRIES', '1')
+            install_env.setdefault('PIP_DISABLE_PIP_VERSION_CHECK', '1')
+            subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', '--index-url', sys.argv[1], str(target)], check=True, env=install_env)
+      - ${dependencyIndex}
+    skills:
+      list:
+        - ${rexpPath}
+        - skills
+        - list
+        - '--json'
+      show:
+        - ${rexpPath}
+        - skills
+        - show
+        - ${skill}
+        - '--json'
+    defaults:
+      dependencyIndex: https://pypi.org/simple/

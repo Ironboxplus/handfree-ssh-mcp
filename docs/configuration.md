@@ -60,7 +60,7 @@ servers:
     # Safe directory for destructive commands (rm, etc.)
     safeDirectory: /home/user   # rm allowed only within this path
 
-    # SFTP path policy — applies ONLY to upload / download / transfer.
+    # SFTP path policy — applies to upload / download / transfer / sftp-list / sftp-manage.
     # execute-command is NOT affected by these lists.
     # Default is OPEN: with `allowedRemoteDirectories` unset/empty, any absolute
     # POSIX remote path is allowed. Configure it to opt into an allowlist instead.
@@ -109,7 +109,7 @@ runProfiles:
 
 | Field | Scope | Default behavior |
 |---|---|---|
-| `allowedRemoteDirectories` | `upload` / `download` / `transfer` only | **Unset/empty = open.** Any absolute POSIX path is allowed. Configuring this list opts into restricting SFTP to those directories. |
+| `allowedRemoteDirectories` | `upload` / `download` / `transfer` / `sftp-list` / `sftp-manage` | **Unset/empty = open.** Any absolute POSIX path is allowed. Configuring this list opts into restricting SFTP to those directories. |
 | `allowedLocalDirectories` | `upload` / `download` only | Unset = only the MCP working directory is allowed. |
 | `disableSftpPathPolicy` | all SFTP tools | When `true`, bypasses both checks above entirely — any remote path, any local path. |
 
