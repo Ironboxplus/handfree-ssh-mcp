@@ -68,3 +68,17 @@ Measured relaying a 128 MiB file between two lab containers, with the source →
 | `connections: 8` | 31.71 MiB/s |
 
 `8` was no faster than `4` there; use `4`. Repeated relays on pooled connections measured 26.6 MiB/s at `2`, 37.3 at `4` and 37.0 at `8`.
+
+## Browse a remote directory
+
+Use `sftp-list` before choosing files to transfer. It opens an SFTP channel on the existing SSH connection and needs no remote shell, Python or experiment platform. It respects the configured remote path policy, including the resolved directory target.
+
+```json
+{"connectionName":"my-server","remotePath":"/home/user","page":1,"pageSize":50,"showHidden":false,"sort":"name","direction":"asc"}
+```
+
+The response includes the canonical `path`, allowed `parent` (or null), `total`, `page`, `pageSize`, and `entries` containing `name`, `type`, `size` in bytes and ISO `modifiedAt`. Directories appear first. `query` filters names case-insensitively; optional `names` inspects exact names including hidden entries. Pages start at 1 and contain at most 200 entries. SFTP still reads the directory listing to sort/filter it; only the requested page is returned. Omit `remotePath` to open the first allowed root or the SFTP home directory. Windows SFTP paths use `/C:/...`. Symlinks are identified separately.
+
+## Rename and delete remote entries
+
+`sftp-manage` uses the same remote directory allowlist, including resolved parent paths, and no shell commands. Pass `action: "rename"`, `remotePath` and a single `newName` to rename within the same directory. Existing targets are never overwritten. Pass `action: "delete"` and `confirm: true` only after the user has confirmed the exact server and full path. Nonempty directories additionally require `recursive: true`. Deletion is permanent; symlinks are unlinked rather than traversed. Filesystem roots cannot be modified. Mutations are not automatically retried after an uncertain connection failure: inspect the current directory state first.
