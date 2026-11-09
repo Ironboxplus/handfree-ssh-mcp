@@ -14,6 +14,8 @@ import { registerRunListTool } from "../tools/run-list.js";
 import { registerRunCancelTool } from "../tools/run-cancel.js";
 import { registerRunRetryTool } from "../tools/run-retry.js";
 import { registerPluginTools } from "../tools/plugins.js";
+import { registerSftpListTool } from '../tools/sftp-list.js';
+import { registerSftpManageTool } from '../tools/sftp-manage.js';
 import { SERVER_INSTRUCTIONS } from "../config/server.js";
 
 /**
@@ -50,6 +52,8 @@ async function listRegisteredTools(): Promise<Map<string, string[]>> {
   registerRunCancelTool(server);
   registerRunRetryTool(server);
   registerPluginTools(server);
+  registerSftpListTool(server);
+  registerSftpManageTool(server);
   registerHelpTool(server);
   const client = new Client({ name: "doc-coverage-client", version: "0.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -75,6 +79,8 @@ describe("documentation coverage: every tool parameter appears in that tool's he
 
     for (const toolName of [
       "download",
+      "sftp-list",
+      "sftp-manage",
       "transfer",
       "upload",
       "workspace-run",

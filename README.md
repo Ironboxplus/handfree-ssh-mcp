@@ -132,7 +132,7 @@ That's it — ask your agent to check the logs on `dev`, deploy to `prod`, or tr
 |---|---|
 | Discover | `list-servers`, `show-whitelist`, `help` |
 | Execute | `execute-command` (streams in the background; poll with `command-status`), `close-connection` |
-| Transfer | `upload`, `download`, `transfer` (upload / download / relay, recursive, batch, archive) |
+| Transfer | `sftp-list` (directory browsing with pagination, filtering and sorting), `sftp-manage` (rename and confirmed deletion), `upload`, `download`, `transfer` (upload / download / relay, recursive, batch, archive) |
 | Run | `workspace-run`, `run-status`, `run-logs`, `run-list`, `run-cancel`, `run-retry` |
 
 Every parameter is documented in [docs/tools.md](docs/tools.md).

@@ -786,6 +786,11 @@ export class RealSshTestServer {
       fs.unlink(this.toLocalPath(remotePath), (error) =>
         error ? fail(requestId, error) : sftp.status(requestId, STATUS_CODE.OK));
     });
+    sftp.on("RMDIR", (requestId: number, remotePath: string) => {
+      trace("RMDIR", remotePath);
+      fs.rmdir(this.toLocalPath(remotePath), (error) =>
+        error ? fail(requestId, error) : sftp.status(requestId, STATUS_CODE.OK));
+    });
     sftp.on("OPENDIR", (requestId: number, remotePath: string) => {
       trace("OPENDIR", remotePath);
       // Counts from the OPENDIR request itself (not after the local

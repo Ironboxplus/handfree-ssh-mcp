@@ -9,6 +9,8 @@
 | `close-connection` | Close a cached SSH connection for a server |
 | `upload` | Upload local file(s) to a remote server (CRLF-fix for shell scripts, skip-if-identical, optional `reuseConnection`, `vvv`, `fast`; `localPath` accepts an array for batch upload — see [Upload behaviors](transfer.md#upload-behaviors)) |
 | `download` | Download remote file to local disk (optional `reuseConnection`, `vvv`, `fast`, or `connections` for a multi-connection ranged download — see [Multi-connection download](transfer.md#multi-connection-download)) |
+| `sftp-list` | Browse a remote directory using the existing SSH connection and remote path policy; filter, sort and page the results. |
+| `sftp-manage` | Rename an entry without overwriting, or permanently delete confirmed entries under the remote path policy. |
 | `transfer` | Unified upload / download / server-to-server relay. Supports recursive small-file concurrency (`fileConcurrency`), batch upload (array `localPath`), temporary tar packing (`archive`, `archiveCompression`), fast SFTP by default, a bounded relay read-ahead window, and relay `strategy: "relay" \| "direct" \| "auto"` for a source-to-destination direct copy that bypasses this host — see [Upload behaviors](transfer.md#upload-behaviors). |
 | `list-servers` | List configured (enabled) servers. Lean by default; `verbose:true` adds cached system status, `refresh:true` re-collects it (implies verbose). |
 | `workspace-run` | Start a durable Linux task — **no YAML run profile needed**: pass `remoteRoot` + `venv`/`executable` inline, or use a saved `runProfiles.<name>` preset. `[push] → preflight → launching → remote-running → [collect]`. Durable: survives SSH disconnect and MCP adapter restart because all state lives on the remote filesystem, not locally — see [workspace-run (remote runner)](workspace-run.md). |
@@ -17,7 +19,46 @@
 | `run-list` | List runs on a server, newest first. |
 | `run-cancel` | Cancel a run: TERM to its process group, then KILL after `graceMs`; re-verifies process identity before signalling. |
 | `run-retry` | Launch a fresh run from an earlier run's own stored (non-secret) config snapshot, not the live config; records `parentRunId`. |
+| `plugin-list` | Discover plugin manifests, components, sources and setup instructions without installing anything. |
+| `plugin-activate` | Check an installed plugin, or explicitly install/update it, then fetch its version and skill catalog. |
+| `plugin-skill` | Read the installed plugin's skill catalog or a named skill. |
+| `plugin-run` | Invoke a configured local or SSH plugin CLI using literal arguments. See [Declarative CLI plugins](plugins.md) for configuration and parameters. |
 | `help` | Self-describing help text for the MCP client |
+
+## sftp-list
+
+| Param | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `connectionName` | With multiple enabled servers | Sole enabled server | Existing SSH server alias. |
+| `remotePath` | No | First allowed root or SFTP home | Absolute remote SFTP path; Windows uses `/C:/...`. |
+| `page` | No | `1` | One-based page; clamped to the last available page. |
+| `pageSize` | No | `50` | Entries per page, from 1 to 200. |
+| `showHidden` | No | `false` | Include dotfiles. |
+| `query` | No | Empty | Case-insensitive filename filter, at most 200 characters. |
+| `names` | No | Unset | Up to 500 exact filenames; when supplied, replaces the query and hidden-file filters. |
+| `sort` | No | `name` | `name`, `modified` or `size`; directories always appear first. |
+| `direction` | No | `asc` | `asc` or `desc`. |
+
+Returns the canonical path, permitted parent, total count and requested entries.
+SFTP reads the directory listing before sorting/filtering; pagination limits the
+returned result. Both the requested and resolved directory must satisfy the
+existing remote path policy. See [directory browsing](transfer.md#browse-a-remote-directory).
+
+## sftp-manage
+
+| Param | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `connectionName` | With multiple enabled servers | Sole enabled server | Existing SSH server alias. |
+| `action` | Yes | — | `rename` or `delete`. |
+| `remotePath` | Yes | — | Absolute path of the existing entry. |
+| `newName` | For rename | Unset | Single filename within the same directory; an existing destination is rejected. |
+| `recursive` | No | `false` | Required for directory deletion, including empty directories. |
+| `confirm` | For delete | `false` | Set only after the user confirms the exact server and path. |
+
+Deletion is permanent. Symlinks are unlinked rather than traversed; filesystem
+roots are rejected. The existing remote path policy also checks resolved parent
+directories. An uncertain operation is never automatically retried. See
+[rename and deletion](transfer.md#rename-and-delete-remote-entries).
 
 ## show-whitelist
 

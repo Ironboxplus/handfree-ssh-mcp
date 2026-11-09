@@ -653,6 +653,46 @@ Example:
   run-retry { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box" }
   run-retry { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box", push: false }`,
 
+  "sftp-manage": `sftp-manage — Rename or permanently delete remote entries over SFTP.
+
+Parameters:
+  connectionName  (string, optional) SSH alias; required with multiple enabled servers.
+  action          (rename | delete, required) Operation to perform.
+  remotePath      (string, required) Existing absolute SFTP path, subject to remote path policy.
+  newName         (string, optional) Rename only: one filename, no path separators. Never overwrites.
+  recursive       (boolean, optional) Delete only: allow nonempty directories, default false.
+  confirm         (boolean, optional) Delete only: true after user confirms server and full path.
+
+Deletion is permanent. Symlinks are unlinked without following the target.
+Filesystem roots cannot be modified. Directory policy applies to original paths
+and resolved parents; no shell command is used. Do not automatically retry an
+uncertain mutation: first refresh the directory to check its actual state.
+
+Example:
+  sftp-manage { connectionName: "gpu-box", action: "rename", remotePath: "/data/old.txt", newName: "new.txt" }`,
+
+  "sftp-list": `sftp-list — Browse a remote directory over SFTP.
+
+Parameters:
+  connectionName  (string, optional) SSH alias; required with multiple enabled servers.
+  remotePath      (string, optional) Absolute SFTP path. Defaults to an allowed root or SSH home.
+  page            (integer, optional) One-based page, default 1.
+  pageSize        (integer, optional) Entries per page, default 50, maximum 200.
+  showHidden      (boolean, optional) Include dotfiles, default false.
+  query           (string, optional) Case-insensitive filename filter.
+  names           (string[], optional) Exact filenames to inspect, including hidden entries.
+  sort            (name | modified | size, optional) Default name; directories first.
+  direction       (asc | desc, optional) Default asc.
+
+Returns: JSON with canonical path, permitted parent, page, pageSize, total and
+entries (name, type, size, modifiedAt). Symlinks are identified without following
+their targets. Remote path policy applies before listing and after resolving the
+directory. Pagination limits the response; SFTP still reads that directory's names.
+No shell command or remote runtime is required.
+
+Example:
+  sftp-list { connectionName: "gpu-box", remotePath: "/data", pageSize: 50 }`,
+
   "plugin-list": `plugin-list — Discover available CLI plugins.
 
 Parameters: none.
@@ -762,6 +802,8 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   command-status    Poll background status and incremental live output.
   upload            Upload a single file, or a batch of files, to a remote server.
   download          Download a single file from a remote server.
+  sftp-list         Browse a paginated remote directory over SFTP.
+  sftp-manage       Rename or permanently delete remote entries with path policy.
   transfer          Move files/directories; mode=relay selects remote-to-remote, strategy selects relay/direct/auto.
   workspace-run     Start a durable Linux task; no YAML run profile needed. Pass remoteRoot + venv/executable inline, or use a saved profile. Optional push/collect.
   run-status        Query a workspace-run's current status by runId.
