@@ -182,6 +182,16 @@ Details: [docs/configuration.md](docs/configuration.md#security-note-command-pol
 - [Transfers](docs/transfer.md) — skip-if-identical, archive mode, batch upload, multi-connection, direct copy
 - [workspace-run](docs/workspace-run.md) — remote runner pipeline, state, cancel and retry
 
+## Contributors
+
+<table>
+  <tr>
+    <td align="center"><a href="https://github.com/woqucc"><img src="https://github.com/woqucc.png" width="64" alt="woqucc"/><br/>@woqucc</a></td>
+    <td align="center"><a href="https://github.com/Ironboxplus"><img src="https://github.com/Ironboxplus.png" width="64" alt="Ironboxplus"/><br/>@Ironboxplus</a></td>
+    <td align="center"><a href="https://github.com/Lum0sss"><img src="https://github.com/Lum0sss.png" width="64" alt="Lum0sss"/><br/>@Lum0sss</a></td>
+  </tr>
+</table>
+
 ## Credits & license
 
 Handfree started as a fork of [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server). Thanks to the original author for the foundation.

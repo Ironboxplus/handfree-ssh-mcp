@@ -182,6 +182,16 @@ servers:
 - [文件传输](docs/zh/transfer.md)：分块预取、直传、打包、批量上传、多连接
 - [workspace-run](docs/zh/workspace-run.md)：远程运行流水线、状态、取消与重试
 
+## 贡献者
+
+<table>
+  <tr>
+    <td align="center"><a href="https://github.com/woqucc"><img src="https://github.com/woqucc.png" width="64" alt="woqucc"/><br/>@woqucc</a></td>
+    <td align="center"><a href="https://github.com/Ironboxplus"><img src="https://github.com/Ironboxplus.png" width="64" alt="Ironboxplus"/><br/>@Ironboxplus</a></td>
+    <td align="center"><a href="https://github.com/Lum0sss"><img src="https://github.com/Lum0sss.png" width="64" alt="Lum0sss"/><br/>@Lum0sss</a></td>
+  </tr>
+</table>
+
 ## 致谢与许可
 
 Handfree 起源于 [classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server) 的分支，感谢原作者打下的基础。
