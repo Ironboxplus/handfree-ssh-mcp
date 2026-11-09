@@ -48,7 +48,7 @@ describe("tools reject unknown arguments instead of silently dropping them", () 
 
   test("every registered tool rejects a misspelled argument by name", async () => {
     const { tools } = await client.listTools();
-    assert.ok(tools.length >= 15, `expected all tools, got ${tools.length}`);
+    assert.ok(tools.length >= 21, `expected all tools, got ${tools.length}`);
     for (const tool of tools) {
       await assert.rejects(
         client.callTool({ name: tool.name, arguments: { handfreeMisspelledArg: 1 } }),

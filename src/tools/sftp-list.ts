@@ -3,6 +3,7 @@ import type {SFTPWrapper, FileEntry} from 'ssh2';
 import {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js';
 import {z} from 'zod';
 import {SSHConnectionManager} from '../services/ssh-connection-manager.js';
+import {rejectUnknownArguments} from './strict-arguments.js';
 import {formatToolErrorResponse, toToolError} from '../utils/tool-error.js';
 
 export const directoryQuery = {
@@ -59,9 +60,9 @@ export async function readDirectory(input:Query, manager=SSHConnectionManager.ge
 }
 
 export function registerSftpListTool(server:McpServer) {
-  server.tool('sftp-list','Browse a remote directory over the existing SFTP connection. Returns a sorted, filtered page with file types, sizes and modification times. Respects remote path policy; no shell or remote Python required.',directoryQuery,
+  rejectUnknownArguments(server.tool('sftp-list','Browse a remote directory over the existing SFTP connection. Returns a sorted, filtered page with file types, sizes and modification times. Respects remote path policy; no shell or remote Python required.',directoryQuery,
     async input=>{
       try{return {content:[{type:'text' as const,text:JSON.stringify(await readDirectory(input))}]};}
       catch(e){return {content:[{type:'text' as const,text:formatToolErrorResponse(toToolError(e,'SFTP_ERROR'))}],isError:true};}
-    });
+    }));
 }

@@ -179,7 +179,8 @@ test("SSH targets follow manager aliases, quote every argument and keep per-host
     await host.activate({plugin:"demo",connectionName:"alpha"},"install",900000);
     assert.equal(calls[2][2].timeout,900000);
     const value="中文 '; $(printf broken)\nsecond";
-    assert.equal(execFileSync("/bin/sh",["-c",`printf %s ${shellQuote(value)}`],{encoding:"utf8"}),value);
+    // Round-trip through a real POSIX shell where one exists (not on a Windows dev box).
+    if (fs.existsSync("/bin/sh")) assert.equal(execFileSync("/bin/sh",["-c",`printf %s ${shellQuote(value)}`],{encoding:"utf8"}),value);
   } finally {f.clean();}
 });
 

@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { PluginHost } from "../plugins/host.js";
+import { rejectUnknownArguments } from "./strict-arguments.js";
 import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
 
 const target = {
@@ -15,9 +16,9 @@ const reply = async (operation: () => unknown) => {
 
 export function registerPluginTools(server: McpServer): void {
   const host = new PluginHost();
-  server.tool("plugin-list", "Discover enabled plugins, components, installation targets, sources and setup instructions before installation. Read component setup: ask for user-specific directories and initialization choices unless supplied or explicitly delegated. Does not install anything or open SSH connections.", {},
-    async () => reply(() => host.catalog.read().map(({manifest}) => manifest)));
-  server.tool("plugin-activate", "Check the installed version and fetch the current skill catalog. Explicit mode install/update runs the configured package installer on the selected host; first read component setup in plugin-list and resolve installation/initialization choices with the user unless explicitly delegated. Review running workloads. Successful installation is not completed initialization; follow the installed skill for readiness checks. Does not start schedulers or own Web lifetime.",
+  rejectUnknownArguments(server.tool("plugin-list", "Discover enabled plugins, components, installation targets, sources and setup instructions before installation. Read component setup: ask for user-specific directories and initialization choices unless supplied or explicitly delegated. Does not install anything or open SSH connections.", {},
+    async () => reply(() => host.catalog.read().map(({manifest}) => manifest))));
+  rejectUnknownArguments(server.tool("plugin-activate", "Check the installed version and fetch the current skill catalog. Explicit mode install/update runs the configured package installer on the selected host; first read component setup in plugin-list and resolve installation/initialization choices with the user unless explicitly delegated. Review running workloads. Successful installation is not completed initialization; follow the installed skill for readiness checks. Does not start schedulers or own Web lifetime.",
     {...target, mode: z.enum(["check", "install", "update"]).default("check"),
       timeout: z.number().int().min(1000).max(1800000).optional().describe("Installer timeout in milliseconds (default 300000, maximum 1800000). Set the client request timeout accordingly for slow dependencies.")},
     async ({mode, timeout, ...selection}, extra) => {
@@ -29,11 +30,11 @@ export function registerPluginTools(server: McpServer): void {
         }}).catch(() => {});
       };
       return reply(() => host.activate(selection, mode, timeout, report));
-    });
-  server.tool("plugin-skill", "Read a skill from the installed plugin. Omit name for its catalog. Fetch again after updating the plugin. This returns instructions; it does not install a global client skill.",
+    }));
+  rejectUnknownArguments(server.tool("plugin-skill", "Read a skill from the installed plugin. Omit name for its catalog. Fetch again after updating the plugin. This returns instructions; it does not install a global client skill.",
     {...target, name: z.string().min(1).optional()},
-    async ({name, ...selection}) => reply(() => host.skill(selection, name)));
-  server.tool("plugin-run", "Invoke a plugin CLI with an argv array, using its configured entry point and settings. Read plugin-skill first. SSH components use the selected SSH connection and its existing command policy. Transfer files with the existing SFTP tools; all supplied paths belong to the component host.",
+    async ({name, ...selection}) => reply(() => host.skill(selection, name))));
+  rejectUnknownArguments(server.tool("plugin-run", "Invoke a plugin CLI with an argv array, using its configured entry point and settings. Read plugin-skill first. SSH components use the selected SSH connection and its existing command policy. Transfer files with the existing SFTP tools; all supplied paths belong to the component host.",
     {...target, args: z.array(z.string().refine(s => !s.includes("\0"))).max(256), timeout: z.number().int().min(1000).max(1800000).optional().describe("Command timeout in milliseconds (default 30000, up to 1800000 for explicit long setup operations). Match the client request timeout.")},
-    async ({args, timeout, ...selection}) => reply(() => host.run(selection, args, timeout)));
+    async ({args, timeout, ...selection}) => reply(() => host.run(selection, args, timeout))));
 }

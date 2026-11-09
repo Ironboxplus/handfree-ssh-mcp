@@ -3,6 +3,7 @@ import type {SFTPWrapper,Stats} from 'ssh2';
 import {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js';
 import {z} from 'zod';
 import {SSHConnectionManager} from '../services/ssh-connection-manager.js';
+import {rejectUnknownArguments} from './strict-arguments.js';
 import {ToolError,formatToolErrorResponse,toToolError} from '../utils/tool-error.js';
 
 export const fileMutationQuery={
@@ -74,8 +75,8 @@ export async function manageRemoteEntry(input:Mutation,manager=SSHConnectionMana
 }
 
 export function registerSftpManageTool(server:McpServer) {
-  server.tool('sftp-manage','Rename or permanently delete remote entries over SFTP. Uses existing remote directory policy; no shell. Delete requires explicit confirmation; rename never overwrites. No automatic retry after an uncertain result.',fileMutationQuery,async input=>{
+  rejectUnknownArguments(server.tool('sftp-manage','Rename or permanently delete remote entries over SFTP. Uses existing remote directory policy; no shell. Delete requires explicit confirmation; rename never overwrites. No automatic retry after an uncertain result.',fileMutationQuery,async input=>{
     try{return {content:[{type:'text' as const,text:JSON.stringify(await manageRemoteEntry(input))}]};}
     catch(error){return {content:[{type:'text' as const,text:formatToolErrorResponse(toToolError(error,'SFTP_ERROR'))}],isError:true};}
-  });
+  }));
 }
