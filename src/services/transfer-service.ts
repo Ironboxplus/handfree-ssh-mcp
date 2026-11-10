@@ -37,7 +37,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import os from "os";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import {
   buildDirectRsyncCommand,
   buildDirectTarSshCommand,
@@ -269,8 +269,8 @@ export function flattenRemoteDirTree(
  * parses an absolute `X:\...` path as a `host:path` remote spec and tries to
  * open an rsh connection to a one-letter "host". `--force-local` tells it
  * every path argument, including any that contain a colon, is on the local
- * filesystem. Only add it on win32: bsdtar (macOS) does not support the
- * flag, and POSIX paths never contain a drive letter that could be misread.
+ * filesystem. Only add it for GNU tar on win32: bsdtar (including the
+ * Windows system tar) does not support the flag.
  *
  * Separately, this MSYS tar build also mis-resolves a backslash-separated
  * `-C <dir>` argument during extraction (its path-safety canonicalization
@@ -286,11 +286,25 @@ export function flattenRemoteDirTree(
  * apply blanket on win32 — and it must never run on other platforms, where
  * backslash is a perfectly legal POSIX filename character.
  */
-export function buildLocalTarArgv(args: readonly string[], platform: NodeJS.Platform): string[] {
+export function buildLocalTarArgv(args: readonly string[], platform: NodeJS.Platform, gnuTar = true): string[] {
   if (platform !== "win32") {
     return [...args];
   }
-  return ["--force-local", ...args.map((arg) => arg.replace(/\\/g, "/"))];
+  return [...(gnuTar ? ["--force-local"] : []), ...args.map((arg) => arg.replace(/\\/g, "/"))];
+}
+
+let localTarIsGnu: Promise<boolean> | undefined;
+
+/** Detect Windows' system bsdtar versus Git/MSYS GNU tar once per process. */
+export async function prepareLocalTarArgv(args: readonly string[]): Promise<string[]> {
+  if (process.platform !== "win32") return [...args];
+  localTarIsGnu ??= new Promise<boolean>((resolve, reject) => {
+    execFile("tar", ["--version"], { windowsHide: true, timeout: 5000 }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(/GNU tar/i.test(stdout));
+    });
+  });
+  return buildLocalTarArgv(args, process.platform, await localTarIsGnu);
 }
 
 /**
@@ -3692,13 +3706,18 @@ export class TransferService {
     description: string,
     errorCode: "LOCAL_FILE_READ_FAILED" | "LOCAL_FILE_WRITE_FAILED",
   ): Promise<void> {
+    let localArgs: string[];
+    try {
+      localArgs = await prepareLocalTarArgv(args);
+    } catch (error) {
+      throw new ToolError(errorCode, `Failed to ${description}: ${(error as Error).message}`, false);
+    }
     await new Promise<void>((resolve, reject) => {
       const stderr = new OutputCollector(TransferService.ARCHIVE_ERROR_OUTPUT_BYTES);
       let settled = false;
       // See buildLocalTarArgv's doc comment for why this platform-conditional
       // rewrite exists (drive-letter misparse + extraction path corruption on
       // Windows/MSYS tar builds).
-      const localArgs = buildLocalTarArgv(args, process.platform);
       const child = spawn("tar", localArgs, {
         stdio: ["ignore", "ignore", "pipe"],
         windowsHide: true,

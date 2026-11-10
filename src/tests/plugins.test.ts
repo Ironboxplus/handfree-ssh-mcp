@@ -106,7 +106,7 @@ test('bundled plugins are discoverable before registration and explicit disablin
     assert.deepEqual(catalog.read().map(p=>p.manifest.id).sort(),['rexp','rexp-web']);
     const web=catalog.resolve('rexp-web');
     assert.equal(web.component.source?.package,'rexp-web');
-    assert.ok(web.component.skills);assert.deepEqual(web.component.install,web.component.update);
+    assert.ok(web.component.skills);assert.ok(web.component.install);assert.ok(web.component.update);assert.equal(web.component.install.at(-1),'install');assert.equal(web.component.update.at(-1),'update');
     fs.writeFileSync(file,JSON.stringify({schemaVersion:1,plugins:{'rexp-web':{enabled:false,manifest:'unused.yaml'}}}));
     assert.deepEqual(catalog.read().map(p=>p.manifest.id),['rexp']);
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
@@ -400,4 +400,79 @@ test("installer progress and timeout guidance do not automatically retry mutatio
     assert.equal(calls,1);
     assert.ok(progress.some(message => message.trim() === 'Downloaded 100 bytes'));
   } finally {f.clean();}
+});
+
+test('discovery adopts existing SSH-user settings without registration and install reuses the package',async()=>{
+  const f=fixture('ssh');const calls:string[]=[];
+  try {
+    f.manifest.components[0].entry=['${existingEntry}'];
+    f.manifest.components[0].version=['${existingEntry}','version'];
+    f.manifest.components[0].skills={list:['${existingEntry}','skills'],show:['${existingEntry}','skill','${skill}']};
+    (f.manifest.components[0] as any).discover={posix:['discover-existing']};
+    fs.writeFileSync(path.join(f.dir,'manifest.json'),JSON.stringify(f.manifest));
+    const ssh={resolveServer:(name:string)=>name,getServerConfig:()=>({host:'server',port:22,username:'alice'}),executeCommandWithProgress:async(command:string)=>{
+      calls.push(command);
+      const output=command.includes("'discover-existing'")?JSON.stringify({state:'ready',settings:{existingEntry:'/alice/venv/bin/tool',platformRoot:'/detected-root'}}):'installed';
+      const frame=pluginFrame(command,output);return `${frame.stdout}\n[STDERR]\n${frame.stderr}`;
+    }} as unknown as SSHConnectionManager;
+    const host=new PluginHost(f.catalog,ssh);
+    await host.run({plugin:'demo',connectionName:'alpha'},['runs']);
+    const reused=await host.activate({plugin:'demo',connectionName:'alpha'},'install');
+    assert.equal(reused.action,'reused');assert.equal(calls.filter(c=>c.includes("'discover-existing'")).length,1);
+    assert.ok(calls.some(c=>c.includes("'/alice/venv/bin/tool' 'runs'")));
+    assert.ok(calls.some(c=>c.includes("'PLATFORM_ROOT=/alpha'")),'explicit root overrides discovered default');
+    assert.ok(!calls.some(c=>c.includes("'install'")),'no installer runs');
+  }finally{f.clean();}
+});
+
+test('uncertain discovery and SSH failures never become installation permission',async()=>{
+  const f=fixture();const calls:string[][]=[];
+  try {
+    f.manifest.components[0].entry=['${existingEntry}'];f.manifest.components[0].version=['${existingEntry}','version'];
+    (f.manifest.components[0] as any).discover={posix:['discover-existing']};
+    fs.writeFileSync(path.join(f.dir,'manifest.json'),JSON.stringify(f.manifest));
+    const host=new PluginHost(f.catalog,undefined,async(argv)=>{calls.push(argv);return JSON.stringify({state:'unconfigured',message:'Existing virtualenv needs a path',settings:{}});});
+    await assert.rejects(host.activate({plugin:'demo'},'install'),/Plugin discovery \(unconfigured\)/);
+    assert.deepEqual(calls,[['discover-existing']]);
+    const disconnected=new PluginHost(f.catalog,undefined,async()=>{throw Error('SSH connection closed');});
+    await assert.rejects(disconnected.activate({plugin:'demo'},'install'),/Do not install automatically/);
+  }finally{f.clean();}
+});
+
+test('REXP discovery finds an isolated runtime without PATH activation, PyYAML, or local registry',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'rexp-discovery-'));
+  try {
+    const manifest=manifestSchema.parse(yaml.load(fs.readFileSync('examples/plugins/rexp.yaml','utf8')));
+    const script=manifest.components[0].discover!.script!;
+    const home=path.join(dir,'ssh-user'),root=path.join(home,"platform '中文' data"),venv=path.join(home,'private-runtime');
+    fs.mkdirSync(home,{recursive:true});
+    const windows=process.platform==='win32';
+    execFileSync(windows?'python':'python3',['-m','venv','--without-pip',venv]);
+    const python=path.join(venv,windows?'Scripts':'bin',windows?'python.exe':'python');
+    const purelib=execFileSync(python,['-c','import sysconfig;print(sysconfig.get_path("purelib"))'],{encoding:'utf8'}).trim();
+    fs.mkdirSync(path.join(purelib,'rexp'),{recursive:true});
+    fs.writeFileSync(path.join(purelib,'rexp','__init__.py'),'');fs.writeFileSync(path.join(purelib,'rexp','version.py'),'__version__="0.test"\n');
+    fs.mkdirSync(path.join(root,'configs'),{recursive:true});fs.writeFileSync(path.join(root,'configs','platform.yaml'),'node_id: test\n');
+    fs.mkdirSync(path.join(home,'.rexp'));fs.writeFileSync(path.join(home,'.rexp','config.yaml'),`platform_root: ${JSON.stringify(root)}\n`);
+    const localAppData=path.join(home,'AppData','Local');
+    const entry=windows?path.join(localAppData,'rexprun','bin','rexp.cmd'):path.join(home,'.local','bin','rexp');
+    fs.mkdirSync(path.dirname(entry),{recursive:true});fs.writeFileSync(entry,windows?`@echo off\n"${python}" -m rexp %*\n`:`#!${python}\n`);
+    const env={...process.env,HOME:home,USERPROFILE:home,LOCALAPPDATA:localAppData,REXP_HOME:path.join(home,'.rexp'),PYTHONDONTWRITEBYTECODE:'1',PYTHONIOENCODING:'ascii'};
+    const result=JSON.parse(execFileSync(python,['-c',script,'{}'],{env:{...env,PLATFORM_ROOT:path.join(dir,'someone-else-platform')},encoding:'utf8'}));
+    assert.equal(result.state,'ready',result.message);assert.equal(result.settings.platformRoot,root);assert.equal(result.settings.rexpPath,entry);
+    assert.equal(fs.realpathSync(path.dirname(result.settings.platformPython)),fs.realpathSync(path.dirname(python)));assert.ok(!fs.existsSync(path.join(purelib,'rexp','__pycache__')));
+    // Exercise the native Python -c payload used by Windows PowerShell 5.1;
+    // JSON and source quotes must survive via Base64, not native argv quoting.
+    const bootstrap=manifest.components[0].discover!.powershell!.at(-1)!;
+    const code=expand(bootstrap.match(/^\s*\$code = '(.+)'$/m)![1].replaceAll("''","'"),{
+      pluginSettingsBase64:Buffer.from(JSON.stringify({platformRoot:root})).toString('base64'),
+      discoveryScriptBase64:Buffer.from(script).toString('base64'),
+    });
+    assert.ok(!code.includes('"'));
+    const forwarded=JSON.parse(execFileSync(python,['-c',code],{env,encoding:'utf8'}));
+    assert.equal(forwarded.state,'ready');assert.equal(forwarded.settings.platformRoot,root);
+    fs.rmSync(entry);
+    const unresolved=JSON.parse(execFileSync(python,['-c',script,'{}'],{env,encoding:'utf8'}));
+    assert.equal(unresolved.state,'unconfigured');assert.match(unresolved.message,/do not reinstall/);
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });

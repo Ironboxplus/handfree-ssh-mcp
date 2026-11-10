@@ -230,7 +230,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     // no EMPTY range worker runs -- the server saw exactly 3 one-byte READs.
     assert.equal(server.stats.connectionCount, 8);
     assert.deepEqual(
-      [...server.stats.readRequests].sort((a, b) => a.offset - b.offset),
+      [...server.stats.readRequests].sort((a, b) => a.offset - b.offset).map(({ offset, length }) => ({ offset, length })),
       [{ offset: 0, length: 1 }, { offset: 1, length: 1 }, { offset: 2, length: 1 }],
     );
   });
@@ -487,24 +487,13 @@ describe("multi-connection download real execution", { concurrency: false }, () 
   });
 
   test("failure/cleanup: one connection failing stops a DIFFERENT, still-healthy connection from scheduling further reads", async () => {
-    // The test above injects a failure via a GLOBAL request-count threshold,
-    // which fails every connection's next read once the shared counter is
-    // past it -- so it cannot tell "the healthy worker got cancelled" apart
-    // from "the healthy worker failed anyway because the fault applied to
-    // it too". This test isolates the failure to exactly ONE connection
-    // (index 0) via injectReadFailureForConnectionIndex, so connection 1
-    // stays genuinely healthy throughout, and proves cancellation via the
-    // server's own real READ-request COUNT (deterministic) rather than a
-    // wall-clock race: ssh2 does not reliably reject a request that is
-    // ALREADY in flight just because this side subsequently ends the
-    // channel/connection (no Client/SFTP option changes that), so
-    // cancellation here is cooperative -- a worker checks an abort flag
-    // before starting its NEXT chunk, not preemptively mid-request. What
-    // this DOES prove, deterministically: once one connection fails, a
-    // healthy sibling assigned many more chunks than it has completed does
-    // not go on to fetch the rest of them.
-    const rangeBytes = 8 * 1024 * 1024; // 256 real READ requests at the 32 KiB internal chunk size, if uncancelled
-    const perReadDelayMs = 20; // slow enough that connection 0's near-instant failure reliably lands before connection 1's first response
+    // Hold healthy replies until the failing worker has returned its error.
+    // Release the failure only after the healthy worker's first pipeline is
+    // in flight, so scheduler load cannot change the expected request bound.
+    const rangeBytes = 8 * 1024 * 1024; // 256 reads per range
+    const PIPELINE_DEPTH = 64;
+    const healthyReplies: Array<() => void> = [];
+    const failureReplies: Array<() => void> = [];
     const size = rangeBytes * 2;
     const remotePath = "/cancel-healthy-worker.bin";
     fs.writeFileSync(server.toLocalPath(remotePath), randomBytes(size));
@@ -512,12 +501,17 @@ describe("multi-connection download real execution", { concurrency: false }, () 
 
     server.resetConnectionCount();
     server.resetReadLog();
-    // Connection index 0 (assigned the file's first range, offset 0) fails
-    // its very first READ, immediately (0ms delay). Connection index 1
-    // (assigned the file's second range, starting at offset rangeBytes) is
-    // fully healthy but deliberately slow, so its first response arrives
-    // well after connection 0 has already failed and set the abort flag.
-    server.setConnectionReadDelaysMs([0, perReadDelayMs]);
+    server.setReadResponseGate((index, reply) => {
+      if (index === 0) {
+        if (healthyReplies.length >= PIPELINE_DEPTH) reply();
+        else failureReplies.push(reply);
+      } else {
+        healthyReplies.push(reply);
+        if (healthyReplies.length >= PIPELINE_DEPTH) {
+          for (const fail of failureReplies.splice(0)) fail();
+        }
+      }
+    });
     server.injectReadFailureForConnectionIndex([0]);
     try {
       const result = await mcpClient.callTool({
@@ -527,35 +521,21 @@ describe("multi-connection download real execution", { concurrency: false }, () 
       assert.equal(result.isError, true, "expected the injected per-connection failure to fail the download");
       assert.match(responseText(result), /injected per-connection read failure/);
     } finally {
-      server.clearConnectionReadDelaysMs();
+      server.setReadResponseGate(null);
+      for (const reply of healthyReplies) reply();
+      for (const reply of failureReplies) reply();
       server.clearReadFailureForConnectionIndex();
     }
     assert.equal(fs.existsSync(localPath), false);
 
-    // Ground truth from the server's own READ log: connection 1's range
-    // needed 256 real READ requests to complete uncancelled. If cancellation
-    // did nothing, this count would be 32 (or very close to it, minus
-    // whichever races connection 0's failure). A healthy count of 1-2 proves
-    // it stopped scheduling further reads once connection 0 failed.
-    const connection1Reads = server.stats.readRequests.filter((read) => read.offset >= rangeBytes);
+    // The healthy range needs 256 reads; cancellation must stop after the
+    // first outstanding wave. No healthy response was delivered before the
+    // client received the failure, regardless of handshake/event-loop timing.
+    const connection1Reads = server.stats.readRequests.filter((read) => read.connectionIndex === 1);
     assert.ok(
       connection1Reads.length > 0,
       "expected connection 1 to have made at least its first (already in-flight) real READ request",
     );
-    // Reviewer-adjusted bound. Each connection keeps
-    // MULTI_CONNECTION_PIPELINE_DEPTH (8) reads outstanding at once -- that
-    // pipelining is the whole point of the feature, see the long comment in
-    // downloadByteRangeWorker. So when the abort flag is set, up to one full
-    // wave of 8 reads is ALREADY in flight and cannot be recalled (ssh2 will
-    // not reject an in-flight request because this side later ends the
-    // channel). The cancellation property is therefore "at most one pipeline
-    // wave", not "at most one read" -- the original <= 3 bound was calibrated
-    // against a serial loop that has since been replaced, and that serial
-    // loop would have made this feature pointless.
-    //
-    // The bound still has real teeth: 32 reads are needed to finish the range,
-    // so anything up to 64 proves the remaining 192 were never scheduled.
-    const PIPELINE_DEPTH = 64;
     assert.ok(
       connection1Reads.length <= PIPELINE_DEPTH,
       `expected connection 1 to stop scheduling reads after at most one pipeline wave (${PIPELINE_DEPTH}) once ` +

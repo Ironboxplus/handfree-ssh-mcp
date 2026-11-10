@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import ssh2 from "ssh2";
-import { buildLocalTarArgv } from "../../services/ssh-connection-manager.js";
+import { prepareLocalTarArgv } from "../../services/transfer-service.js";
 
 type FileHandleState = { kind: "file"; fd: number; localPath: string };
 type DirectoryHandleState = {
@@ -39,7 +39,7 @@ export interface RealSshServerStats {
   // ranges the client actually requested -- not on the client's own
   // bookkeeping -- to prove striped download's ranges are non-overlapping
   // and exactly cover the file.
-  readRequests: Array<{ offset: number; length: number }>;
+  readRequests: Array<{ offset: number; length: number; connectionIndex: number }>;
   // Multi-connection upload: the WRITE-side twin of readRequests -- every
   // real WRITE's (offset, length) and the index of the connection it arrived
   // on, since the last resetWriteLog(). Proves the ranges written are
@@ -216,6 +216,7 @@ export class RealSshTestServer {
   // failReadsAfterCount alone cannot make that distinction, since it fails
   // every connection's next read once the shared counter is past threshold.
   private failReadsForConnectionIndex: Set<number> | null = null;
+  private readResponseGate: ((connectionIndex: number, reply: () => void) => void) | null = null;
   // A real delay before accepting authentication, i.e. a handshake that
   // genuinely takes this long -- the in-process stand-in for a
   // high-latency link, where each SSH handshake costs several round trips.
@@ -280,13 +281,10 @@ export class RealSshTestServer {
     // exec fallback below (see executeCommand), which is what a direct
     // transfer's rsync/tar|ssh backend commands run against when this
     // instance plays "source" or "destination" in a real-fixture test.
-    //   - execEnv: environment passed to that spawned shell. Overriding HOME
-    //     here lets a test point ssh's own default identity/known_hosts
-    //     resolution at a throwaway temp directory instead of this test
-    //     machine's real ~/.ssh -- exactly mirroring "the key/host-key trust
-    //     already present on the source server", without ever touching a
-    //     real developer's actual SSH state. Defaults to process.env
-    //     (unchanged behavior) when omitted.
+    //   - execEnv: environment passed to that spawned shell.
+    //   - sshConfigFile: isolated real OpenSSH config for source-side ssh.
+    //     OpenSSH uses the passwd home on Linux, ignoring HOME for identity
+    //     and known_hosts lookup, so HOME alone cannot isolate these tests.
     //   - authorizedPublicKeyOpenSsh: a public key in OpenSSH single-line
     //     format ("ssh-rsa AAAA...", i.e. `<type> <base64>`, no comment
     //     needed) this instance additionally accepts for publickey auth, on
@@ -298,7 +296,7 @@ export class RealSshTestServer {
     //     return an Error), only PEM PRIVATE keys or this OpenSSH line
     //     format; derive this from a real private key with
     //     `const k = ssh2.utils.parseKey(privateKeyPem); \`${k.type} ${k.getPublicSSH().toString("base64")}\``.
-    private readonly directExecOptions: { execEnv?: NodeJS.ProcessEnv; authorizedPublicKeyOpenSsh?: string } = {},
+    private readonly directExecOptions: { execEnv?: NodeJS.ProcessEnv; sshConfigFile?: string; authorizedPublicKeyOpenSsh?: string } = {},
   ) {
     const { privateKey } = generateKeyPairSync("rsa", {
       modulusLength: 2048,
@@ -603,6 +601,11 @@ export class RealSshTestServer {
     this.failReadsForConnectionIndex = null;
   }
 
+  /** Coordinate real SFTP responses without depending on wall-clock timing. */
+  public setReadResponseGate(gate: typeof this.readResponseGate): void {
+    this.readResponseGate = gate;
+  }
+
   public toLocalPath(remotePath: string): string {
     if (!remotePath.startsWith("/")) throw new Error(`Remote path is not absolute: ${remotePath}`);
     const components = remotePath.split("/").filter(Boolean);
@@ -690,13 +693,19 @@ export class RealSshTestServer {
       });
     });
     sftp.on("READ", (requestId: number, handle: Buffer, offset: number, length: number) => {
+      const send = (reply: () => void): void => {
+        const deliver = () => { if (!sftp.destroyed) reply(); };
+        if (this.readResponseGate) this.readResponseGate(connectionIndex, deliver);
+        else deliver();
+      };
       trace("READ", `offset=${offset} length=${length}`);
-      this.stats.readRequests.push({ offset, length });
+      this.stats.readRequests.push({ offset, length, connectionIndex });
       if (this.failReadsAfterCount !== null && this.stats.readRequests.length > this.failReadsAfterCount) {
         return sftp.status(requestId, STATUS_CODE.FAILURE, "injected read failure (test)");
       }
       if (this.failReadsForConnectionIndex?.has(connectionIndex)) {
-        return sftp.status(requestId, STATUS_CODE.FAILURE, "injected per-connection read failure (test)");
+        send(() => sftp.status(requestId, STATUS_CODE.FAILURE, "injected per-connection read failure (test)"));
+        return;
       }
       const state = lookupHandle(handle);
       if (!state || state.kind !== "file") return sftp.status(requestId, STATUS_CODE.FAILURE);
@@ -705,9 +714,11 @@ export class RealSshTestServer {
       this.stats.maxActiveReads = Math.max(this.stats.maxActiveReads, this.stats.activeReads);
       const respond = (error: NodeJS.ErrnoException | null, bytesRead: number): void => {
         this.stats.activeReads--;
-        if (error) return fail(requestId, error);
-        if (bytesRead === 0) return sftp.status(requestId, STATUS_CODE.EOF);
-        sftp.data(requestId, buffer.subarray(0, bytesRead));
+        send(() => {
+          if (error) return fail(requestId, error);
+          if (bytesRead === 0) return sftp.status(requestId, STATUS_CODE.EOF);
+          sftp.data(requestId, buffer.subarray(0, bytesRead));
+        });
       };
       fs.read(state.fd, buffer, 0, length, offset, (error, bytesRead) => {
         const delayMs = this.connectionReadDelaysMs?.[connectionIndex] ?? this.readResponseDelayMs;
@@ -914,22 +925,26 @@ export class RealSshTestServer {
     // the Windows host. Absolute `X:\...` paths are substituted in above, so
     // the same drive-letter-as-remote-host misparse applies here, plus this
     // MSYS tar build separately corrupts a backslash-separated `-C <dir>`
-    // argument during extraction. Shares buildLocalTarArgv with
-    // ssh-connection-manager.ts's runLocalTar so the two stay in lockstep
+    // argument during extraction. Shares prepareLocalTarArgv with
+    // transfer-service.ts so the two stay in lockstep
     // instead of drifting apart as two hand-maintained copies.
-    const localArgs = buildLocalTarArgv(args, process.platform);
-    const child = spawn("tar", localArgs, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-    child.stdout.pipe(channel, { end: false });
-    child.stderr.pipe(channel.stderr, { end: false });
-    child.once("error", (error) => {
+    void prepareLocalTarArgv(args).then((localArgs) => {
+      const child = spawn("tar", localArgs, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      child.stdout.pipe(channel, { end: false });
+      child.stderr.pipe(channel.stderr, { end: false });
+      child.once("error", (error) => {
+        channel.stderr.write(`${error.message}\n`);
+        finish(127);
+      });
+      child.once("close", (code) => {
+        if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
+          process.stderr.write(`[real-ssh ${this.port}] TAR CLOSE code=${code}\n`);
+        }
+        finish(code ?? 1);
+      });
+    }, (error: Error) => {
       channel.stderr.write(`${error.message}\n`);
       finish(127);
-    });
-    child.once("close", (code) => {
-      if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
-        process.stderr.write(`[real-ssh ${this.port}] TAR CLOSE code=${code}\n`);
-      }
-      finish(code ?? 1);
     });
   }
 
@@ -974,6 +989,10 @@ export class RealSshTestServer {
     const sourceTarMatch = rawCommand.match(/^tar -cf - -C '([^']*)' -- /);
     const destInnerMatch = rawCommand.match(/ _ '([^']*)' '([^']*)'$/);
     let translated = rawCommand;
+    if (this.directExecOptions.sshConfigFile) {
+      const config = "'" + this.directExecOptions.sshConfigFile.replace(/'/g, "'\\''") + "'";
+      translated = translated.replace(/(^|\|\s*)ssh(?=\s)/, `$1ssh -F ${config}`);
+    }
     if (sourceTarMatch) {
       const originalDir = sourceTarMatch[1];
       translated = translated.replace(

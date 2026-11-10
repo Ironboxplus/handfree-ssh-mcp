@@ -18,6 +18,7 @@ export const componentSchema = z.object({
   entry: argv,
   version: argv,
   source: z.object({ kind: z.string(), location: z.string(), package: z.string().optional() }).strict().optional(),
+  discover: z.object({script: word.optional(), posix: argv, powershell: argv.optional()}).strict().optional(),
   install: argv.optional(),
   update: argv.optional(),
   env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), word).default({}),
