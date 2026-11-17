@@ -476,3 +476,60 @@ test('REXP discovery finds an isolated runtime without PATH activation, PyYAML, 
     assert.equal(unresolved.state,'unconfigured');assert.match(unresolved.message,/do not reinstall/);
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
+
+test('REXP user records work across control computers and never substitute another user runtime',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'rexp-user-records-'));
+  const windows=process.platform==='win32';
+  const systemPython=windows?'python':'python3';
+  try {
+    const manifest=manifestSchema.parse(yaml.load(fs.readFileSync('examples/plugins/rexp.yaml','utf8')));
+    const script=manifest.components[0].discover!.script!;
+    const users=['alice','bob'].map(name=>{
+      const home=path.join(dir,name),root=path.join(home,'platform'),venv=path.join(root,'env','platform');
+      fs.mkdirSync(home,{recursive:true});
+      execFileSync(systemPython,['-m','venv','--without-pip',venv]);
+      const python=path.join(venv,windows?'Scripts':'bin',windows?'python.exe':'python');
+      const purelib=execFileSync(python,['-c','import sysconfig;print(sysconfig.get_path("purelib"))'],{encoding:'utf8'}).trim();
+      fs.mkdirSync(path.join(purelib,'rexp'),{recursive:true});
+      fs.writeFileSync(path.join(purelib,'rexp','__init__.py'),'');
+      fs.writeFileSync(path.join(purelib,'rexp','version.py'),'__version__="0.test"\n');
+      const entry=path.join(path.dirname(python),windows?'rexp.exe':'rexp');
+      fs.writeFileSync(entry,'placeholder: discovery verifies the interpreter, not user code');
+      fs.mkdirSync(path.join(root,'configs'),{recursive:true});
+      fs.writeFileSync(path.join(root,'configs','platform.yaml'),'node_id: fixture\n');
+      const config=path.join(home,'.rexp','config.yaml');fs.mkdirSync(path.dirname(config));
+      const writeRecord=(runtime:string)=>fs.writeFileSync(config,yaml.dump({platform_root:root,runtime_python:runtime,
+        command_entry:path.join(home,'.local','bin','rexp')},{lineWidth:-1}));
+      writeRecord(python);
+      return {home,root,python,entry,config,writeRecord};
+    });
+    const discover=(user:typeof users[number],settings:Record<string,string>={})=>JSON.parse(execFileSync(systemPython,['-c',script,JSON.stringify(settings)],{
+      env:{...process.env,HOME:user.home,USERPROFILE:user.home,REXP_HOME:path.dirname(user.config),
+        PYTHONDONTWRITEBYTECODE:'1',PLATFORM_ROOT:users[0].root},encoding:'utf8',
+    }));
+    for(const user of users){
+      const before=fs.readFileSync(user.config,'utf8');
+      // No per-control-computer registration, PATH entry or nodes.yaml is needed.
+      for(let computer=0;computer<2;computer++){
+        const result=discover(user);assert.equal(result.state,'ready',result.message);
+        assert.equal(result.settings.platformRoot,user.root);
+        assert.equal(fs.realpathSync(path.dirname(result.settings.platformPython)),fs.realpathSync(path.dirname(user.python)));
+        assert.equal(result.settings.rexpPath,user.entry);
+      }
+      assert.equal(fs.readFileSync(user.config,'utf8'),before);
+    }
+    users[1].writeRecord(path.join(users[1].home,'removed-runtime','python'));
+    // Even with another working package in the probing interpreter, a broken
+    // registered environment must not be replaced or used to authorize install.
+    const result=JSON.parse(execFileSync(users[0].python,['-c',script,'{}'],{
+      env:{...process.env,HOME:users[1].home,USERPROFILE:users[1].home,
+        REXP_HOME:path.dirname(users[1].config),PYTHONDONTWRITEBYTECODE:'1'},encoding:'utf8',
+    }));
+    assert.equal(result.state,'unconfigured');assert.match(result.message,/do not reinstall/);
+    // An explicit alternate root must not inherit the default root's runtime.
+    const alternate=path.join(users[1].home,'alternate');fs.mkdirSync(path.join(alternate,'configs'),{recursive:true});
+    fs.writeFileSync(path.join(alternate,'configs','platform.yaml'),'node_id: alternate\n');
+    const explicit=discover(users[1],{platformRoot:alternate,platformPython:users[1].python,rexpPath:users[1].entry});
+    assert.equal(explicit.state,'ready');assert.equal(explicit.settings.platformRoot,alternate);
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});

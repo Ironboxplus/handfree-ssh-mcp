@@ -93,6 +93,22 @@ ask for its existing paths and record them per connection; do not reinstall or i
 Explicit settings take precedence over discovery. The resolved root is passed through
 `PLATFORM_ROOT` for each plugin command; no server-wide variable is added.
 Existing roots are not initialized, migrated or deleted by activation.
+New REXP initialization also records `runtime_python` and `command_entry` in that
+remote user's `~/.rexp/config.yaml`. This registration is independent of the
+control computer, so another Web/MCP installation can reuse it without a local
+node registration or shell activation. All POSIX users, including root, register
+`~/.local/bin/rexp`; Windows uses its current-user launcher and PATH. No system
+PATH, `/etc/profile`, or existing `/usr/local/bin` command is modified.
+When an explicitly selected or registered runtime is broken, discovery reports
+the existing installation for repair; it does not substitute another interpreter
+found on PATH. Explicit alternate roots do not inherit the default root's saved
+runtime. Verify installation in a new ordinary SSH login terminal with `rexp
+version`, `rexp status`, and `rexp doctor --json`, without injecting PATH or
+PLATFORM_ROOT. Non-interactive SSH may omit user profiles; plugin calls use
+absolute discovered paths. The setup instructions require private permissions
+for newly created POSIX roots and preserve existing directory permissions.
+Account isolation requires distinct remote OS accounts; a shared SSH account
+and root administration are not separated by PATH or plugin registration.
 The example assumes an existing Python installation. REXP 0.2.0 initialization
 binds an existing uv/Conda manager (uv preferred), or asks the user about installing
 one. Declining uses Python venv. Agent setup passes that choice explicitly;
