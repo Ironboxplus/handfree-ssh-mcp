@@ -9,6 +9,7 @@ components:
       先执行 plugin-activate check 只读发现远端当前 SSH 用户已有的安装；不依赖本机安装记录或 PATH。
       优先复用 ~/.rexp/config.yaml 的默认根目录、节点登记的 runtime_python 和用户级 rexp 启动入口，
       以绝对路径调用原虚拟环境，不需要 activate，不修改全局变量、不扫描其他用户目录。
+      ~/.rexp/config.yaml 是远端当前 SSH 用户的登记信息，不是本机缓存；同一用户换管理电脑仍应先发现并关联。
       check 返回路径未登记/无法确认不等于未安装；先询问已有根目录和平台解释器位置，禁止直接重装。
       install 会先检查已有版本，已安装则复用；升级需明确 update，不重新 init。
       安装前确认目标节点、平台安装环境和数据根目录 platformRoot。已有路径优先保留；
@@ -16,6 +17,9 @@ components:
       未指定的目录和初始化选项应询问用户，只有明确授权“看着办”时才自行选择，
 
       并说明最终位置、磁盘容量与选择理由。不要在源码、临时目录或 cache 下散放安装与实验数据。
+      使用实际使用者的 SSH 账户安装，包括 root 在内均登记用户级命令，不写 /usr/local/bin 或 /etc/profile。
+      Linux 新建数据根目录时以当前用户创建并设置 0700，再创建平台环境；已有目录不擅自改权限。
+      目录权限才限制其他账户访问；多人共用同一个 SSH 账号无法隔离，不能承诺 root 管理员无法访问。
 
       先检测 uv、Conda 与现有解释器；首次配置两者都有时绑定 uv，只有一个则使用该管理器。
 
@@ -56,14 +60,17 @@ components:
 
       若无 default 注册名，实验配置必须显式指定已登记 environment，不能默默使用平台 Python。
 
-      最后检查插件内 rexp doctor --json，并通过普通 SSH 终端调用相同 rexp 路径执行 doctor --json
-
-      （不注入 PLATFORM_ROOT），确认平台根目录和已登记环境一致。未登记实验环境应报告初始化
+      最后检查插件内 rexp doctor --json，并在新的普通 SSH 登录终端直接执行 rexp version、rexp status、
+      rexp doctor --json（不手工添加 PATH、不注入 PLATFORM_ROOT、不使用绝对入口代替命令验收），
+      确认平台根目录和已登记环境一致。非交互 SSH 不保证加载用户 PATH，插件应读取远端用户登记后用绝对路径。
+      若新登录终端入口缺失，先用已确认的运行环境重跑同根目录 init 修复；禁止重装包、创建新环境或重启运行中调度器。
+      未登记实验环境应报告初始化
 
       尚未完成，不自动启动调度器。
 
 
-      隔离安装后必须通过 init 登记全局 rexp，并在普通新终端直接执行 rexp version 和 rexp doctor --json 验收。
+      隔离安装后必须通过 init 登记用户级 rexp；新版在 ~/.rexp/config.yaml 保存 runtime_python 和 command_entry，
+      供另一台管理设备在同一远端 SSH 账户下只读复用。不要靠本机安装历史判断远端是否装好。
 
       uv 引导工具可能位于 .platform/bootstrap，它不是实验环境。
 
@@ -152,14 +159,19 @@ components:
 
         try:
             config_home = path(os.environ.get('REXP_HOME')) or home / '.rexp'
-            root = path(settings.get('platformRoot') or scalar(config_home / 'config.yaml', ['platform_root']))
+            user_config = config_home / 'config.yaml'
+            registered_root = path(scalar(user_config, ['platform_root']))
+            root = path(settings.get('platformRoot')) or registered_root
+            same_root = root is not None and root == registered_root
+            registered_runtime = scalar(user_config, ['runtime_python']) if same_root else None
+            registered_entry = path(scalar(user_config, ['command_entry'])) if same_root else None
             runtime = scalar(root / 'configs/nodes.yaml', ['environment_manager', 'runtime_python']) if root else None
         except (OSError, ValueError, TypeError):
             emit('unconfigured', 'Existing user configuration could not be read. Confirm the existing root/runtime; do not reinstall.')
 
         windows = os.name == 'nt'
         cli_name = 'rexp.exe' if windows else 'rexp'
-        launchers = [path(settings.get('rexpPath')), home / '.local/bin/rexp']
+        launchers = [path(settings.get('rexpPath')), registered_entry, home / '.local/bin/rexp']
         if windows:
             launchers.insert(1, path(os.environ.get('LOCALAPPDATA', str(home / 'AppData/Local'))) / 'rexprun/bin/rexp.cmd')
         which = shutil.which('rexp')
@@ -169,16 +181,19 @@ components:
             launchers.append(root / 'env/platform' / ('Scripts' if windows else 'bin') / cli_name)
 
         candidates = []
-        for python in (settings.get('platformPython'), runtime):
-            if python:
-                bin_dir = path(python).parent / 'Scripts' if windows else path(python).parent
-                candidates.append((path(python), path(settings.get('rexpPath')) or bin_dir / cli_name))
-        for entry in launchers:
-            if entry and entry.is_file():
-                python = launcher_python(entry)
-                if python:
-                    candidates.append((path(python), entry))
-        candidates.append((Path(sys.executable), Path(sys.executable).parent / cli_name))
+        selected_runtime = settings.get('platformPython') or runtime or registered_runtime
+        if selected_runtime:
+            bin_dir = path(selected_runtime).parent
+            if windows and bin_dir.name.lower() != 'scripts':
+                bin_dir = bin_dir / 'Scripts'
+            candidates.append((path(selected_runtime), path(settings.get('rexpPath')) or bin_dir / cli_name))
+        else:
+            for entry in launchers:
+                if entry and entry.is_file():
+                    python = launcher_python(entry)
+                    if python:
+                        candidates.append((path(python), entry))
+            candidates.append((Path(sys.executable), Path(sys.executable).parent / cli_name))
 
         seen = set()
         found_package = False
