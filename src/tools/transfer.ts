@@ -21,7 +21,7 @@ export function registerTransferTool(server: McpServer): void {
 
   rejectUnknownArguments(server.tool(
     "transfer",
-    "Transfer files or directories between the MCP host and remote servers, or between two remotes. Upload/download take connectionName, localPath and remotePath; mode=relay selects remote-to-remote copying and takes sourceServer, sourceRemotePath, destServer and destRemotePath; strategy selects relay/direct/auto. Use recursive for directory upload/download, archive for tar packing, and array localPath for batch upload. See help for mode-specific constraints.",
+    "Transfer files or directories between the MCP host and remote servers, or between two remotes. Upload/download take connectionName, localPath and remotePath; mode=relay selects remote-to-remote copying and takes sourceServer, sourceRemotePath, destServer and destRemotePath; strategy selects relay/direct/auto. Use recursive for directory upload/download, archive for tar packing, array localPath for batch upload and array remotePath for batch download. See help for mode-specific constraints.",
     {
       mode: z.enum(["upload", "download", "relay"]).describe(
         "upload: local to remote; download: remote to local; relay: remote to remote (sourceServer/sourceRemotePath to destServer/destRemotePath), with transport selected by strategy.",
@@ -30,10 +30,13 @@ export function registerTransferTool(server: McpServer): void {
         z.string(),
         z.array(z.string()),
       ]).optional().describe(
-        "Upload/download: local path within the MCP working directory/allowedLocalDirectories unless path policy is disabled. Upload arrays batch up to 1000 files into remotePath/<basename>; duplicate targets are rejected. Batch excludes recursive/archive.",
+        "Upload/download: local path. Any local path is allowed unless allowedLocalDirectories is configured. A single download into a directory (existing, or ending with / or \) keeps the remote name; missing parents are created. Upload arrays batch up to 1000 files into remotePath/<basename>; duplicate targets are rejected. Batch excludes recursive/archive.",
       ),
-      remotePath: z.string().optional().describe(
-        "Upload/download: absolute remote POSIX path, subject to SFTP path policy.",
+      remotePath: z.union([
+        z.string(),
+        z.array(z.string()),
+      ]).optional().describe(
+        "Upload/download: absolute remote path, /home/me/x on Linux/macOS or C:\Users\me\x, C:/Users/me/x on Windows. A download array (up to 1000) fetches each file into the localPath directory as <basename>; duplicate basenames are rejected. Batch excludes recursive/archive/connections.",
       ),
       connectionName: z.string().optional().describe(
         "Upload/download: Server name from list-servers. Required with multiple enabled servers; optional with one.",
@@ -42,13 +45,13 @@ export function registerTransferTool(server: McpServer): void {
         "Remote-to-remote: source server name.",
       ),
       sourceRemotePath: z.string().optional().describe(
-        "Remote-to-remote: absolute source POSIX path, subject to source path policy.",
+        "Remote-to-remote: absolute source path (POSIX or Windows drive path), subject to source path policy.",
       ),
       destServer: z.string().optional().describe(
         "Remote-to-remote: destination server name.",
       ),
       destRemotePath: z.string().optional().describe(
-        "Remote-to-remote: absolute destination POSIX path, subject to destination path policy.",
+        "Remote-to-remote: absolute destination path (POSIX or Windows drive path), subject to destination path policy.",
       ),
       strategy: transferStrategySchema.optional().describe(
         "Remote-to-remote only: relay (default) uses this MCP host via SFTP, except that a same-server copy is done by the server itself when its SFTP advertises copy-data (OpenSSH 9.0+; connections is then ignored); direct runs rsync or tar|ssh on the source; auto tries direct then falls back with a reason. Direct requires source-to-destination reachability and existing key/host-key trust; keys are never copied or auto-accepted.",
@@ -78,7 +81,7 @@ export function registerTransferTool(server: McpServer): void {
         "Upload/download with fast=true: bytes per chunk. Relay: default 32768; total window at most 64 MiB.",
       ),
       fileConcurrency: z.number().int().positive().optional().describe(
-        "Recursive upload/download or batch upload: files in flight at once, default 32, maximum 64. They share at most 4 SFTP channels on one SSH connection.",
+        "Recursive upload/download or batch upload/download: files in flight at once, default 32, maximum 64. They share at most 4 SFTP channels on one SSH connection.",
       ),
       connections: z.number().int().positive().optional().describe(
         "Single file only: 1-8 independent SSH/TCP connections, default 1. Relay opens N per server and requires strategy=relay. Excludes batch/recursive/archive/direct/auto. Above 1 ignores fast/sftpConcurrency/chunkSize; see help for limits.",
@@ -90,7 +93,7 @@ export function registerTransferTool(server: McpServer): void {
         "With archive=true: none (default), gzip, bzip2, xz or zstd. Packing/extracting endpoints need compatible tar/compressor support.",
       ),
       onError: z.enum(["abort", "continue"]).optional().describe(
-        "Batch upload only: abort (default) stops scheduling after failure; continue attempts all files. In-flight files finish and all outcomes are reported.",
+        "Batch upload or download only: abort (default) stops scheduling after failure; continue attempts all files. In-flight files finish and all outcomes are reported.",
       ),
     },
     async (params) => {
@@ -174,9 +177,22 @@ export function registerTransferTool(server: McpServer): void {
           };
         }
 
+        if (Array.isArray(remotePath)) {
+          // Batch download: the counterpart of an array localPath upload.
+          if (mode !== "download") {
+            throw new ToolError("INVALID_CONFIGURATION", `Batch (array) remotePath is only supported for mode="download", not mode="${mode}"`, false);
+          }
+          if (Array.isArray(localPath)) {
+            throw new ToolError("INVALID_CONFIGURATION", "With a remotePath array, localPath must be one local directory", false);
+          }
+          if (recursive || archive || connections !== undefined) {
+            throw new ToolError("INVALID_CONFIGURATION", "A remotePath array excludes recursive, archive and connections", false);
+          }
+        }
+
         if (Array.isArray(localPath)) {
-          // §5.7: batch (array localPath) is upload-only this round; download
-          // and relay array forms are explicitly out of scope.
+          // §5.7: an array localPath is batch upload; batch download takes an
+          // array remotePath instead.
           if (mode !== "upload") {
             throw new ToolError(
               "INVALID_CONFIGURATION",
@@ -205,6 +221,14 @@ export function registerTransferTool(server: McpServer): void {
           ...(connections === undefined ? {} : { connections }),
         };
         const uploadOptions = { skipIfIdentical: skipIfIdentical !== false, ...sftpOptions };
+
+        if (Array.isArray(remotePath)) {
+          const batchResult = await transferService.downloadBatch(remotePath, localPath as string, resolvedName, {
+            ...sftpOptions,
+            onError,
+          });
+          return { content: [{ type: "text", text: JSON.stringify(batchResult) }] };
+        }
 
         if (Array.isArray(localPath)) {
           const batchResult = await transferService.uploadBatch(localPath, remotePath, resolvedName, {

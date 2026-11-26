@@ -124,10 +124,11 @@ Examples:
 
 Parameters:
   localPath       (string | string[], required)  File path on the MCP host,
-                  or an array of paths for batch upload. Restricted to the
-                  MCP working directory/allowedLocalDirectories unless
-                  disableSftpPathPolicy is enabled.
-  remotePath      (string, required)   Destination path on the remote server.
+                  or an array of paths for batch upload. Any local path is
+                  allowed unless allowedLocalDirectories is configured.
+  remotePath      (string, required)   Absolute destination path on the remote
+                  server: /home/me/x on Linux/macOS; C:\\Users\\me\\x,
+                  C:/Users/me/x or /C:/Users/me/x on Windows.
                   Batch mode (array localPath): this must be a directory;
                   each source lands at remotePath/<basename>.
   connectionName  (string, see below)  Target server name from list-servers.
@@ -196,13 +197,23 @@ Example:
   upload { localPath: ["a/config.yaml", "b/settings.json"], remotePath: "/etc/app" }
   upload { localPath: ["1.csv", "2.csv", "3.csv"], remotePath: "/data", onError: "continue" }`,
 
-  "download": `download — Download a single file from a remote server over SFTP.
+  "download": `download — Download a file, or several files, from a remote server over SFTP.
 
 Parameters:
-  remotePath      (string, required)   File path on the remote server.
-  localPath       (string, required)   Destination on the MCP host.
-                  Restricted to the MCP working directory/allowedLocalDirectories
-                  unless disableSftpPathPolicy is enabled.
+  remotePath      (string | string[], required)  Absolute file path on the
+                  remote server: /home/me/x on Linux/macOS; C:\\Users\\me\\x,
+                  C:/Users/me/x or /C:/Users/me/x on Windows. ~ and relative
+                  paths are not expanded by SFTP servers. An array (1-1000)
+                  is a batch download: each file lands at
+                  localPath/<basename>; duplicate basenames are rejected
+                  before any transfer (case-insensitively on Windows/macOS).
+  localPath       (string, required)   Destination on the MCP host: a file
+                  path, or a directory (an existing one, or a path ending
+                  with / or \\) that receives the file under its remote name.
+                  Missing parent directories are created. Any local path is
+                  allowed unless allowedLocalDirectories is configured.
+                  A remote directory is reported as such; download it with
+                  transfer mode="download" recursive=true.
   connectionName  (string, see below)  Target server name from list-servers.
   reuseConnection (boolean, optional)  Default true. Set false after timeout
                   or suspected stale cached SSH connection.
@@ -229,6 +240,13 @@ Parameters:
                   per server (at most 8 per server, idle ones closed after
                   60 s), so a repeated transfer skips the handshakes;
                   reuseConnection=false uses fresh ones, closed afterwards.
+                  Not with a remotePath array.
+  fileConcurrency (number, optional)   remotePath array only: files in flight
+                  at once, default 32, maximum 64.
+  onError         ("abort" | "continue", optional)  remotePath array only.
+                  "abort" (default) stops scheduling after a failure; in-flight
+                  files finish. "continue" attempts every file. Every file's
+                  outcome is reported.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
@@ -236,6 +254,8 @@ connectionName rule:
 
 Example:
   download { remotePath: "/var/log/app.log", localPath: "app.log" }
+  download { remotePath: "C:\\Users\\me\\report.csv", localPath: "out/" }
+  download { remotePath: ["/data/a.json", "/data/b.json"], localPath: "results" }
   download { remotePath: "/tmp/big.bin", localPath: "big.bin", fast: true,
              sftpConcurrency: 32, chunkSize: 131072 }
   download { remotePath: "/tmp/huge.bin", localPath: "huge.bin", connections: 4 }`,
@@ -263,10 +283,18 @@ Modes:
 
 Parameters for upload / download:
   mode            (string, required)   "upload" or "download"
-  localPath       (string | string[], required)  Path on the MCP host. Upload
-                  only: an array batch-uploads multiple independent files to
-                  the same remotePath directory (see "Batch upload" below).
-  remotePath      (string, required)   Path on the remote server.
+  localPath       (string | string[], required)  Path on the MCP host. Any
+                  local path is allowed unless allowedLocalDirectories is
+                  configured. Upload only: an array batch-uploads multiple
+                  independent files to the same remotePath directory (see
+                  "Batch upload" below). A single download into a directory
+                  (existing, or ending with / or \\) keeps the remote file
+                  name; missing parent directories are created.
+  remotePath      (string | string[], required)  Absolute path on the remote
+                  server: /home/me/x on Linux/macOS; C:\\Users\\me\\x,
+                  C:/Users/me/x or /C:/Users/me/x on Windows. Download only:
+                  an array batch-downloads files into the localPath
+                  directory (see "Batch download" below).
   connectionName  (string, see below)  Target server name.
   recursive       (boolean, optional)  True to transfer a whole directory tree.
                   Not combinable with an array localPath.
@@ -313,17 +341,17 @@ Parameters for upload / download:
                   17.5 MiB/s): 2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s.
                   Rejected for relay strategy="direct"/"auto", a batch
                   (array) localPath, recursive=true and archive=true.
-  fileConcurrency (number, optional)   Recursive or batch upload only: independent
+  fileConcurrency (number, optional)   Recursive, or batch upload/download only: independent
                   files in flight at once. Default 32, maximum 64. The
                   files share at most min(fileConcurrency, 4) SFTP channels
                   on the same SSH connection (requests are multiplexed on a
                   channel), so the count stays well under OpenSSH's common
                   default MaxSessions=10 however many files are in flight.
-  onError         (string, optional)   Batch upload only (array localPath).
+  onError         (string, optional)   Batch upload or download only.
                   "abort" (default): stop scheduling new files once one fails,
                   drain in-flight ones. "continue": attempt every file
                   regardless of earlier failures. Both report a per-file
-                  uploaded/skipped/failed status.
+                  status.
 
 Batch upload (mode="upload" with an array localPath):
   • remotePath must be a directory; each source lands at remotePath/<basename>.
@@ -337,7 +365,16 @@ Batch upload (mode="upload" with an array localPath):
     skippedCount, failedCount, crlfFixedCount }. A single string localPath
     keeps the original plain-text response, unchanged.
   • Not combinable with archive=true or recursive=true currently.
-  • download/relay do not support an array localPath currently.
+
+Batch download (mode="download" with an array remotePath):
+  • localPath is one local directory (created if missing); each file lands at
+    localPath/<basename>.
+  • Basename collisions fail the whole call with BATCH_TARGET_COLLISION before
+    any transfer (compared case-insensitively on Windows and macOS hosts).
+  • Empty array → INVALID_CONFIGURATION. Over 1000 entries → BATCH_TOO_LARGE.
+  • Returns JSON: { results: [{ remotePath, localPath, status, reason? }],
+    total, downloadedCount, failedCount, notAttemptedCount }.
+  • Not combinable with archive, recursive or connections.
 
 Parameters for relay:
   mode              (string, required)   "relay" selects remote-to-remote;

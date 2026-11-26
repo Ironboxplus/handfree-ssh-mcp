@@ -19,14 +19,13 @@ export const directoryQuery = {
 };
 const schema=z.object(directoryQuery);
 type Query=z.infer<typeof schema>;
-const windowsAbsolute=(value:string)=>/^[A-Za-z]:\//.test(value)?`/${value}`:value;
 
 export async function readDirectory(input:Query, manager=SSHConnectionManager.getInstance()) {
   const name=manager.resolveServer(input.connectionName);
   const service=manager.getTransferService();
   const config=manager.getConfig(name);
   const requested=input.remotePath || (!config.disableSftpPathPolicy && config.allowedRemoteDirectories?.[0]) || undefined;
-  if(requested) service.validateRemotePath(requested,name);
+  const start=requested?service.validateRemotePath(requested,name):undefined;
   const acquired=await manager.acquireSshClient(name);
   let sftp:SFTPWrapper|undefined;
   const bounded=<T>(work:Promise<T>,label:string)=>manager.withOperationTimeout(work,30_000,`sftp-list ${label}`);
@@ -34,9 +33,9 @@ export async function readDirectory(input:Query, manager=SSHConnectionManager.ge
     sftp=await manager.withOperationTimeout(new Promise<SFTPWrapper>((resolve,reject)=>{
       acquired.client.sftp((e,value)=>e?reject(e):resolve(value));
     }),30_000,'sftp-list channel',late=>late.end());
-    const directory=service.validateRemotePath(windowsAbsolute(await bounded(new Promise<string>((resolve,reject)=>{
-      sftp!.realpath(requested || '.',(e,value)=>e?reject(e):resolve(value));
-    }),'realpath')),name);
+    const directory=service.validateRemotePath(await bounded(new Promise<string>((resolve,reject)=>{
+      sftp!.realpath(start || '.',(e,value)=>e?reject(e):resolve(value));
+    }),'realpath'),name);
     let entries=await bounded(new Promise<FileEntry[]>((resolve,reject)=>{
       sftp!.readdir(directory,(e,value)=>e?reject(e):resolve(value));
     }),'readdir');

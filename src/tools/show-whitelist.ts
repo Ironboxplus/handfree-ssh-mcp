@@ -136,7 +136,7 @@ export function registerShowWhitelistTool(server: McpServer): void {
         // ----- Remote directories -----
         output += `### Allowed remote directories\n\n`;
         if (config.disableSftpPathPolicy || allowedRemoteDirs.length === 0) {
-          output += `The remote directory allowlist is inactive, so **any absolute POSIX path is allowed**. ` +
+          output += `The remote directory allowlist is inactive, so **any absolute remote path is allowed** (POSIX, or a Windows drive path). ` +
             `To restrict SFTP to specific directories, add them under \`allowedRemoteDirectories\` in the server's YAML config.\n\n`;
         } else {
           output += `${allowedRemoteDirs.length} entr${allowedRemoteDirs.length === 1 ? "y" : "ies"} (restricting SFTP to these paths only):\n\n`;
@@ -151,12 +151,11 @@ export function registerShowWhitelistTool(server: McpServer): void {
         if (config.disableSftpPathPolicy) {
           output += `\`disableSftpPathPolicy\` is set, so **any local path is allowed**.\n\n`;
         } else {
-          output += `Always implicitly allowed: \`${mcpCwd}\` _(the MCP working directory)_\n\n`;
           if (allowedLocalDirs.length === 0) {
-            output += `\`allowedLocalDirectories\` is not configured. ` +
-              `Only paths inside the MCP working directory above can be used as the local side of upload/download — any other path will be rejected with \`LOCAL_PATH_NOT_ALLOWED\`. ` +
-              `To allow more locations, add absolute host paths under \`allowedLocalDirectories\`, or set \`disableSftpPathPolicy: true\` to allow any local path.\n\n`;
+            output += `\`allowedLocalDirectories\` is not configured, so **any local path is allowed**. ` +
+              `To restrict the local side of upload/download, add absolute host paths under \`allowedLocalDirectories\`.\n\n`;
           } else {
+            output += `Always allowed with an allowlist: \`${mcpCwd}\` _(the MCP working directory)_\n\n`;
             output += `Additional entries (${allowedLocalDirs.length}):\n\n`;
             for (const dir of allowedLocalDirs) {
               output += `- \`${dir}\`\n`;
@@ -167,10 +166,10 @@ export function registerShowWhitelistTool(server: McpServer): void {
 
         // ----- Matching rules -----
         output += `### Matching rules\n\n`;
-        output += `- Default is open: with no \`allowedRemoteDirectories\` configured, any absolute POSIX remote path is allowed.\n`;
+        output += `- Default is open: with no \`allowedRemoteDirectories\` / \`allowedLocalDirectories\` configured, any absolute remote path and any local path is allowed.\n`;
         output += `- Configuring \`allowedRemoteDirectories\` opts into an allowlist — a path is then allowed iff it equals an entry, or starts with \`<entry> + separator\`.\n`;
         output += `- \`disableSftpPathPolicy: true\` bypasses both the remote allowlist and the local directory check entirely.\n`;
-        output += `- Remote paths must be absolute POSIX (\`/...\`); \`..\` segments and null bytes are rejected up-front regardless of policy.\n`;
+        output += `- Remote paths must be absolute: \`/...\` on Linux/macOS; \`C:\\...\`, \`C:/...\` or \`/C:/...\` on Windows (normalized to \`/C:/...\` and compared case-insensitively). \`~\` and relative paths are not expanded by SFTP servers. \`..\` segments and null bytes are rejected up-front regardless of policy.\n`;
         output += `- Local paths are resolved on the MCP host first, then matched (unless \`disableSftpPathPolicy\` is set).\n`;
         output += `- These path lists do **not** affect \`execute-command\`. They only restrict SFTP file transfers.\n\n`;
 

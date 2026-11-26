@@ -19,8 +19,8 @@ export function registerUploadTool(server: McpServer): void {
       localPath: z.union([
         z.string(),
         z.array(z.string()),
-      ]).describe("Local file or file array, within the MCP working directory/allowedLocalDirectories unless path policy is disabled. Batch: 1-1000 files; duplicate targets are rejected."),
-      remotePath: z.string().describe("Absolute remote POSIX destination, subject to path policy. Batch requires a directory; files land at <basename>."),
+      ]).describe("Local file or file array. Any local path is allowed unless allowedLocalDirectories is configured. Batch: 1-1000 files; duplicate targets are rejected."),
+      remotePath: z.string().describe("Absolute remote destination: /home/me/x on Linux/macOS, C:\\Users\\me\\x or C:/Users/me/x on Windows; subject to path policy. Batch requires a directory; files land at <basename>."),
       connectionName: z.string().optional().describe("Server name from list-servers. Required with multiple enabled servers; optional with one."),
       skipIfIdentical: z.boolean().optional().describe("Default true. Skip when the remote file has the same size and the same MD5 (computed on the server with md5sum, md5 -r or rclone md5sum) as the bytes that would be written, i.e. after the shell-script CRLF to LF fix. No remote hash command means upload. False forces upload."),
       reuseConnection: z.boolean().optional().describe("Default true. Set false to use a fresh SSH connection after a suspected stale connection."),

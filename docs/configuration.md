@@ -63,12 +63,14 @@ servers:
     # SFTP path policy — applies to upload / download / transfer / sftp-list / sftp-manage.
     # execute-command is NOT affected by these lists.
     # Default is OPEN: with `allowedRemoteDirectories` unset/empty, any absolute
-    # POSIX remote path is allowed. Configure it to opt into an allowlist instead.
+    # remote path is allowed (POSIX, or a Windows drive path such as C:\data).
+    # Configure it to opt into an allowlist instead.
     allowedRemoteDirectories:
       - /home/user
       - /tmp
-    # Extra local dirs allowed as SFTP source/target.
-    # The MCP working directory is always permitted implicitly.
+    # Default is OPEN: with `allowedLocalDirectories` unset/empty, any local path
+    # is allowed. Configuring it restricts the local side to these directories
+    # plus the MCP working directory.
     allowedLocalDirectories:
       - /path/to/extra/local/dir
     # Bypasses both the remote allowlist and the local directory check entirely.
@@ -109,9 +111,11 @@ runProfiles:
 
 | Field | Scope | Default behavior |
 |---|---|---|
-| `allowedRemoteDirectories` | `upload` / `download` / `transfer` / `sftp-list` / `sftp-manage` | **Unset/empty = open.** Any absolute POSIX path is allowed. Configuring this list opts into restricting SFTP to those directories. |
-| `allowedLocalDirectories` | `upload` / `download` only | Unset = only the MCP working directory is allowed. |
+| `allowedRemoteDirectories` | `upload` / `download` / `transfer` / `sftp-list` / `sftp-manage` | **Unset/empty = open.** Any absolute remote path is allowed. Configuring this list opts into restricting SFTP to those directories. |
+| `allowedLocalDirectories` | `upload` / `download` only | **Unset/empty = open.** Any local path is allowed. Configuring this list restricts the local side to those directories plus the MCP working directory. |
 | `disableSftpPathPolicy` | all SFTP tools | When `true`, bypasses both checks above entirely — any remote path, any local path. |
+
+Remote paths are absolute: `/home/me/x` on Linux and macOS servers; `C:\Users\me\x`, `C:/Users/me/x` or `/C:/Users/me/x` on Windows servers, all normalized to `/C:/Users/me/x` (the form Win32-OpenSSH reports) and compared case-insensitively. SFTP servers do not expand `~` or resolve relative paths for the policy check, so those are rejected with an explanation.
 
 Path matching (when an allowlist is configured) is exact-equal or `dir + separator` prefix. `..` segments and null bytes are always rejected regardless of policy. Use `show-whitelist` to inspect a server's current SFTP policy.
 

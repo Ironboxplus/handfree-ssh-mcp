@@ -16,7 +16,6 @@ export const fileMutationQuery={
 };
 const schema=z.object(fileMutationQuery);
 type Mutation=z.infer<typeof schema>;
-const windowsAbsolute=(value:string)=>/^[A-Za-z]:\//.test(value)?`/${value}`:value;
 
 export async function manageRemoteEntry(input:Mutation,manager=SSHConnectionManager.getInstance()) {
   const name=manager.resolveServer(input.connectionName),service=manager.getTransferService();
@@ -28,7 +27,7 @@ export async function manageRemoteEntry(input:Mutation,manager=SSHConnectionMana
   let sftp:SFTPWrapper|undefined;
   const bounded=<T>(promise:Promise<T>)=>manager.withOperationTimeout(promise,30_000,'sftp-manage');
   const stat=(file:string)=>bounded(new Promise<Stats>((resolve,reject)=>sftp!.lstat(file,(error,value)=>error?reject(error):resolve(value))));
-  const real=(file:string)=>bounded(new Promise<string>((resolve,reject)=>sftp!.realpath(file,(error,value)=>error?reject(error):resolve(windowsAbsolute(value)))));
+  const real=(file:string)=>bounded(new Promise<string>((resolve,reject)=>sftp!.realpath(file,(error,value)=>error?reject(error):resolve(value))));
   const operation=(call:(callback:(error?:Error|null)=>void)=>void)=>bounded(new Promise<void>((resolve,reject)=>call(error=>error?reject(error):resolve())));
   const check=(file:string)=>service.validateRemotePath(file,name);
   try{

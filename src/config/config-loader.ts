@@ -4,6 +4,7 @@ import os from "os";
 import yaml from "js-yaml";
 import { SSHConfig, SshConnectionConfigMap, ParsedArgs } from "../models/types.js";
 import { Logger } from "../utils/logger.js";
+import { normalizeRemotePath } from "../utils/remote-path.js";
 import {
   getDefaultUserSshConfigPath,
   loadSshConfigFiles,
@@ -473,34 +474,26 @@ function validateJumpHosts(configMap: SshConnectionConfigMap): void {
 }
 
 /**
- * Normalize and validate allowedRemoteDirectories.
- * Each entry must be an absolute POSIX path. Trailing slashes are stripped
- * (except for the root "/"). ".." segments are rejected after normalization.
+ * Normalize and validate allowedRemoteDirectories with the same rules as a
+ * remote transfer path (normalizeRemotePath: POSIX or Windows drive paths,
+ * no '..'). Trailing slashes are stripped except for a root ("/", "/C:/").
  */
 function normalizeAllowedRemoteDirectories(serverName: string, raw: unknown): string[] {
   if (!Array.isArray(raw)) {
-    throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' must be a list of absolute POSIX paths`);
+    throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' must be a list of absolute remote paths`);
   }
   const out: string[] = [];
   for (const entry of raw) {
     if (typeof entry !== "string" || entry.length === 0) {
       throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' entries must be non-empty strings`);
     }
-    if (entry.includes("\0")) {
-      throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' entry contains a null byte: ${entry}`);
+    const result = normalizeRemotePath(entry);
+    if (!result.ok) {
+      throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' entry is invalid. ${result.reason}`);
     }
-    if (!path.posix.isAbsolute(entry)) {
-      throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' entry must be an absolute POSIX path, got: ${entry}`);
-    }
-    // Reject '..' BEFORE normalization, otherwise '/a/../b' would silently collapse to '/b'.
-    if (entry.split("/").includes("..")) {
-      throw new Error(`Server '${serverName}': 'allowedRemoteDirectories' entry must not contain '..' segments: ${entry}`);
-    }
-    const normalized = path.posix.normalize(entry);
-    const trimmed = normalized.length > 1 && normalized.endsWith("/")
-      ? normalized.slice(0, -1)
-      : normalized;
-    out.push(trimmed);
+    const normalized = result.path;
+    const isRoot = normalized === "/" || /^\/[A-Z]:\/$/.test(normalized);
+    out.push(!isRoot && normalized.endsWith("/") ? normalized.slice(0, -1) : normalized);
   }
   return out;
 }

@@ -28,6 +28,7 @@ import { MAX_FILE_CONCURRENCY } from "../contracts/transfer-contract.js";
 import { Logger } from "../utils/logger.js";
 import { ToolError } from "../utils/tool-error.js";
 import { OutputCollector } from "../utils/output-collector.js";
+import { normalizeRemotePath, remotePathWithin } from "../utils/remote-path.js";
 import {
   createDebugCollector,
   appendDebugOutput,
@@ -146,6 +147,14 @@ export interface DownloadFileResult {
   reason?: string;
 }
 
+export interface BatchDownloadResult {
+  results: DownloadFileResult[];
+  total: number;
+  downloadedCount: number;
+  failedCount: number;
+  notAttemptedCount: number;
+}
+
 export const MAX_BATCH_UPLOAD_SIZE = 1000;
 
 /**
@@ -165,54 +174,68 @@ export function batchUploadBasename(localPath: string): string {
  * (a basename colliding with itself), so it needs no separate check. Returns
  * one entry per colliding basename, listing every contributing source path.
  */
-export function findBatchTargetCollisions(localPaths: readonly string[]): BatchTargetCollision[] {
-  const bySourceBasename = new Map<string, string[]>();
-  for (const localPath of localPaths) {
-    const basename = batchUploadBasename(localPath);
-    const sources = bySourceBasename.get(basename);
-    if (sources) {
-      sources.push(localPath);
+export function findBatchTargetCollisions(paths: readonly string[], foldCase = false): BatchTargetCollision[] {
+  const byBasename = new Map<string, BatchTargetCollision>();
+  for (const sourcePath of paths) {
+    const basename = batchUploadBasename(sourcePath);
+    const key = foldCase ? basename.toLowerCase() : basename;
+    const entry = byBasename.get(key);
+    if (entry) {
+      entry.sources.push(sourcePath);
     } else {
-      bySourceBasename.set(basename, [localPath]);
+      byBasename.set(key, { basename, sources: [sourcePath] });
     }
   }
-  const collisions: BatchTargetCollision[] = [];
-  for (const [basename, sources] of bySourceBasename) {
-    if (sources.length > 1) {
-      collisions.push({ basename, sources });
-    }
-  }
-  return collisions;
+  return [...byBasename.values()].filter((entry) => entry.sources.length > 1);
 }
 
 /**
  * Pure. §5.7's pre-transfer validation, checked in this order: empty ->
  * too-large -> basename collisions. This must run to completion, and reject
  * on failure, before any SFTP call is made -- proven by a real SFTP call
- * count of 0 in P1-09-A3.
+ * count of 0 in P1-09-A3. Shared by batch upload (a localPath array into a
+ * remote directory) and batch download (a remotePath array into a local one).
  */
-export function validateBatchUploadTargets(localPaths: readonly string[]): BatchUploadValidation {
-  if (localPaths.length === 0) {
-    return { ok: false, code: "INVALID_CONFIGURATION", message: "localPath array must not be empty" };
+function validateBatchTargets(
+  paths: readonly string[],
+  sourceField: "localPath" | "remotePath",
+  destinationField: "localPath" | "remotePath",
+  foldCase: boolean,
+): BatchUploadValidation {
+  if (paths.length === 0) {
+    return { ok: false, code: "INVALID_CONFIGURATION", message: `${sourceField} array must not be empty` };
   }
-  if (localPaths.length > MAX_BATCH_UPLOAD_SIZE) {
+  if (paths.length > MAX_BATCH_UPLOAD_SIZE) {
     return {
       ok: false,
       code: "BATCH_TOO_LARGE",
-      message: `localPath array has ${localPaths.length} entries, exceeding the limit of ${MAX_BATCH_UPLOAD_SIZE}`,
+      message: `${sourceField} array has ${paths.length} entries, exceeding the limit of ${MAX_BATCH_UPLOAD_SIZE}`,
     };
   }
-  const collisions = findBatchTargetCollisions(localPaths);
+  const collisions = findBatchTargetCollisions(paths, foldCase);
   if (collisions.length > 0) {
     return {
       ok: false,
       code: "BATCH_TARGET_COLLISION",
-      message: `${collisions.length} basename collision(s) would overwrite each other under remotePath: ` +
+      message: `${collisions.length} basename collision(s) would overwrite each other under ${destinationField}: ` +
         collisions.map((collision) => `"${collision.basename}" <- [${collision.sources.join(", ")}]`).join("; "),
       collisions,
     };
   }
   return { ok: true };
+}
+
+export function validateBatchUploadTargets(localPaths: readonly string[]): BatchUploadValidation {
+  return validateBatchTargets(localPaths, "localPath", "remotePath", false);
+}
+
+/**
+ * Batch download writes into one directory on the MCP host. Windows and
+ * macOS file systems are case-insensitive by default, so there names that
+ * differ only in case collide too.
+ */
+export function validateBatchDownloadTargets(remotePaths: readonly string[]): BatchUploadValidation {
+  return validateBatchTargets(remotePaths, "remotePath", "localPath", process.platform === "win32" || process.platform === "darwin");
 }
 
 /**
@@ -891,6 +914,85 @@ export class TransferService {
     );
   }
 
+  /**
+   * ssh2's fastGet/fastPut report local filesystem failures through the same
+   * callback as SFTP ones; a Node fs error is the one that carries `syscall`.
+   */
+  private static isLocalFsError(error: unknown): boolean {
+    return typeof (error as { syscall?: unknown } | null)?.syscall === "string";
+  }
+
+  private localWriteError(localPath: string, error: Error): ToolError {
+    return new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to save file '${localPath}': ${error.message}`, false);
+  }
+
+  private remoteDirectoryError(remotePath: string): ToolError {
+    return new ToolError(
+      "INVALID_CONFIGURATION",
+      `Remote path is a directory, not a file: ${remotePath}. Download a directory with transfer mode="download" ` +
+        `and recursive=true, or pass the files as a remotePath array.`,
+      false,
+    );
+  }
+
+  /** Create the local file's parent directories. */
+  private ensureLocalParent(localPath: string): void {
+    try {
+      fs.mkdirSync(path.dirname(localPath), { recursive: true });
+    } catch (error) {
+      throw this.localWriteError(localPath, error as Error);
+    }
+  }
+
+  /**
+   * The local file a single download writes. Like scp and sftp's get, a
+   * localPath naming a directory (ending with a separator, or an existing
+   * directory) receives the file under the remote file's name. Parent
+   * directories are created.
+   */
+  private resolveDownloadTarget(localPath: string, remotePath: string, name: string): string {
+    const resolved = this.validateLocalPath(localPath, name);
+    let target = resolved;
+    const namesDirectory = /[\\/]$/.test(localPath) || (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory());
+    if (namesDirectory) {
+      const base = path.posix.basename(remotePath);
+      // path.basename is platform-aware: on Windows a remote name containing
+      // a backslash would otherwise become a subdirectory.
+      if (base === "" || base === "." || base === ".." || path.basename(base) !== base) {
+        throw new ToolError(
+          "INVALID_CONFIGURATION",
+          `localPath '${localPath}' is a directory and the remote name '${base}' is not a usable local file name; give the full local file path.`,
+          false,
+        );
+      }
+      target = this.validateLocalPath(path.join(resolved, base), name);
+    }
+    this.ensureLocalParent(target);
+    return target;
+  }
+
+  /**
+   * An SFTP status error from a download says little ("Failure" is what
+   * OpenSSH returns when the path is a directory: OPEN succeeds and the
+   * first READ fails). Stat the path once to say what is actually wrong.
+   */
+  private async explainDownloadFailure(sftp: SFTPWrapper, remotePath: string, error: Error): Promise<Error> {
+    if (!(error instanceof ToolError) || error.code !== "SFTP_ERROR") return error;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const stat = await Promise.race([
+        this.sftpStat(sftp, remotePath, "source"),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("stat timed out")), 10_000); }),
+      ]);
+      if (stat.isDirectory) return this.remoteDirectoryError(remotePath);
+    } catch {
+      // Keep the original error.
+    } finally {
+      clearTimeout(timer);
+    }
+    return error;
+  }
+
   private createSftpTransferOptions(options?: SftpOptions): TransferOptions {
     const transferOptions: TransferOptions = {};
     const concurrency = this.optionalPositiveInteger(
@@ -1078,9 +1180,9 @@ export class TransferService {
   /**
    * Validate a local filesystem path for SFTP transfer.
    *
-   * The path must be inside the MCP working directory OR inside one of the
-   * server's `allowedLocalDirectories` entries. The working directory is
-   * always allowed implicitly for backward compatibility.
+   * Default is OPEN, like the remote side: with no `allowedLocalDirectories`
+   * configured any local path is allowed. Configuring the list opts into an
+   * allowlist of those directories plus the MCP working directory.
    */
   public validateLocalPath(localPath: string, name?: string): string {
     const resolvedPath = path.resolve(localPath);
@@ -1099,19 +1201,12 @@ export class TransferService {
 
     const config = name ? this.pool.getServerConfig(name) : undefined;
 
-    // disableSftpPathPolicy fully opens the local side too (any path allowed).
-    if (config?.disableSftpPathPolicy) {
+    const configuredRoots = config?.allowedLocalDirectories ?? [];
+    if (config?.disableSftpPathPolicy || configuredRoots.length === 0) {
       return resolvedPath;
     }
 
-    const allowedRoots = new Set<string>([process.cwd()]);
-
-    // Add per-server allowedLocalDirectories if a server is targeted
-    if (config?.allowedLocalDirectories) {
-      for (const dir of config.allowedLocalDirectories) {
-        allowedRoots.add(dir);
-      }
-    }
+    const allowedRoots = new Set<string>([process.cwd(), ...configuredRoots]);
 
     const isAllowed = Array.from(allowedRoots).some((root) =>
       resolvedPath === root || resolvedPath.startsWith(root + path.sep),
@@ -1130,62 +1225,30 @@ export class TransferService {
   }
 
   /**
-   * Validate a remote (POSIX) path for SFTP transfer.
+   * Validate a remote path for SFTP transfer and return its normalized form.
    *
-   * The path must be an absolute POSIX path inside one of the server's
-   * `allowedRemoteDirectories` entries. If that list is unset or empty,
-   * SFTP is rejected: configure the list explicitly before using
-   * upload/download/transfer.
+   * Linux/macOS POSIX paths and Windows drive paths (`C:\x`, `C:/x`, `/C:/x`)
+   * are accepted; see normalizeRemotePath. With `allowedRemoteDirectories`
+   * configured the path must lie inside one of its entries.
    */
   public validateRemotePath(remotePath: string, name: string): string {
-    if (typeof remotePath !== "string" || remotePath.length === 0) {
-      throw new ToolError(
-        "REMOTE_PATH_NOT_ALLOWED",
-        "Remote path must be a non-empty string.",
-        false,
-      );
+    const result = normalizeRemotePath(remotePath);
+    if (!result.ok) {
+      throw new ToolError("REMOTE_PATH_NOT_ALLOWED", result.reason, false);
     }
-    if (remotePath.includes("\0")) {
-      throw new ToolError(
-        "REMOTE_PATH_NOT_ALLOWED",
-        "Remote path must not contain null bytes.",
-        false,
-      );
-    }
-    if (!path.posix.isAbsolute(remotePath)) {
-      throw new ToolError(
-        "REMOTE_PATH_NOT_ALLOWED",
-        `Remote path must be an absolute POSIX path, got: ${remotePath}`,
-        false,
-      );
-    }
-
-    // Reject '..' BEFORE normalization so an escape like /allowed/../etc/passwd
-    // is rejected outright instead of collapsing to /etc/passwd and then
-    // being checked against the (now-bypassed) allowlist.
-    if (remotePath.split("/").includes("..")) {
-      throw new ToolError(
-        "REMOTE_PATH_NOT_ALLOWED",
-        `Remote path must not contain '..' segments: ${remotePath}`,
-        false,
-      );
-    }
-
-    const normalized = path.posix.normalize(remotePath);
+    const normalized = result.path;
 
     const config = this.pool.getConfig(name);
     const allowedRoots = config.allowedRemoteDirectories ?? [];
 
     // Default is OPEN: with no 'allowedRemoteDirectories' configured (or
-    // disableSftpPathPolicy set), any absolute POSIX path is allowed. Configure
-    // 'allowedRemoteDirectories' to opt into an allowlist for this server.
+    // disableSftpPathPolicy set), any absolute remote path is allowed.
+    // Configure 'allowedRemoteDirectories' to opt into an allowlist.
     if (config.disableSftpPathPolicy || allowedRoots.length === 0) {
       return normalized;
     }
 
-    const isAllowed = allowedRoots.some((root) =>
-      normalized === root || normalized.startsWith(root === "/" ? "/" : root + "/"),
-    );
+    const isAllowed = allowedRoots.some((root) => remotePathWithin(normalized, root));
 
     if (!isAllowed) {
       throw new ToolError(
@@ -1691,7 +1754,9 @@ export class TransferService {
             { ...transferOptions, step: () => onProgress() },
             (err?: Error | null) => {
               if (err) {
-                reject(this.makeSftpError("Fast download failed", err));
+                reject(TransferService.isLocalFsError(err)
+                  ? this.localWriteError(localPath, err)
+                  : this.makeSftpError("Fast download failed", err));
                 return;
               }
               resolve();
@@ -1716,11 +1781,12 @@ export class TransferService {
   ): Promise<string> {
     const resolvedName = name || this.pool.defaultName;
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
-    const validatedLocalPath = this.validateLocalPath(localPath, resolvedName);
     const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
     // Validated BEFORE anything else opens a connection, so a request for an
     // invalid connection count never opens even one extra handshake.
     const connections = this.resolveTransferConnections(options);
+    const validatedLocalPath = this.resolveDownloadTarget(localPath, validatedRemotePath, resolvedName);
+    const savedAs = validatedLocalPath === path.resolve(localPath) ? "" : ` (saved as ${validatedLocalPath})`;
 
     if (connections > 1) {
       debug?.(`[mcp] sftp multi-connection download on [${resolvedName}], connections=${connections}`);
@@ -1734,7 +1800,7 @@ export class TransferService {
           debug,
           options?.reuseConnection === false,
         );
-        return appendDebugOutput(message, debugCollector);
+        return appendDebugOutput(message + savedAs, debugCollector);
       } catch (error) {
         // This path runs on transfer lanes, never on the cached command
         // client, and a failed transfer closes its lanes instead of pooling
@@ -1749,7 +1815,7 @@ export class TransferService {
     try {
       const message = await scope.run(0, (_client, sftp) =>
         this.downloadFileOn(sftp, validatedRemotePath, validatedLocalPath, options, debug));
-      return appendDebugOutput(message, debugCollector);
+      return appendDebugOutput(message + savedAs, debugCollector);
     } catch (error) {
       throw appendDebugToError(error as Error, debugCollector);
     } finally {
@@ -1765,20 +1831,31 @@ export class TransferService {
     options: SftpOptions | undefined,
     debug: SshDebugSink | undefined,
   ): Promise<string> {
-    if (options?.fast !== false) {
-      await this.sftpFastGet(sftp, remotePath, localPath, options, options?.timeout, debug);
-      return "File downloaded successfully via fast SFTP";
+    const createdHere = !fs.existsSync(localPath);
+    this.ensureLocalParent(localPath);
+    try {
+      if (options?.fast !== false) {
+        await this.sftpFastGet(sftp, remotePath, localPath, options, options?.timeout, debug);
+        return "File downloaded successfully via fast SFTP";
+      }
+      await this.pipeWithInactivityTimeout(
+        sftp.createReadStream(remotePath),
+        fs.createWriteStream(localPath),
+        this.transferStallTimeout(options?.timeout),
+        `download ${remotePath} -> ${localPath}`,
+        debug,
+        (err) => this.makeSftpError("File download failed", err),
+        (err) => this.localWriteError(localPath, err),
+      );
+      return "File downloaded successfully";
+    } catch (error) {
+      // A failed download leaves no file it created. A file it was
+      // overwriting has already been truncated and is left as it is.
+      if (createdHere) {
+        try { fs.rmSync(localPath, { force: true }); } catch { /* best-effort cleanup */ }
+      }
+      throw await this.explainDownloadFailure(sftp, remotePath, error as Error);
     }
-    await this.pipeWithInactivityTimeout(
-      sftp.createReadStream(remotePath),
-      fs.createWriteStream(localPath),
-      this.transferStallTimeout(options?.timeout),
-      `download ${remotePath} -> ${localPath}`,
-      debug,
-      (err) => this.makeSftpError("File download failed", err),
-      (err) => new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to save file: ${err.message}`, false),
-    );
-    return "File downloaded successfully";
   }
 
   /**
@@ -2236,7 +2313,9 @@ export class TransferService {
     try {
       await this.openLaneSessions(reservation, "multi-download", lanes, sftpSessions, timeout, debug, fresh);
 
-      const fileSize = (await this.sftpStat(sftpSessions[0], remotePath, "source")).size;
+      const sourceStat = await this.sftpStat(sftpSessions[0], remotePath, "source");
+      if (sourceStat.isDirectory) throw this.remoteDirectoryError(remotePath);
+      const fileSize = sourceStat.size;
       const ranges = computeDownloadByteRanges(fileSize, connections);
       debug?.(
         `[mcp] multi-connection download: fileSize=${fileSize}, ${connections} connection(s) opened, ${ranges.length} range(s)`,
@@ -2309,7 +2388,7 @@ export class TransferService {
     return new Promise((resolve, reject) => {
       fs.write(fd, chunk, 0, chunk.length, offset, (error) => {
         if (error) {
-          reject(this.makeSftpError(`Failed to write downloaded data at offset ${offset}`, error));
+          reject(new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to write downloaded data at offset ${offset}: ${error.message}`, false));
           return;
         }
         resolve();
@@ -3472,7 +3551,7 @@ export class TransferService {
     sftp: SFTPWrapper,
     remotePath: string,
     label: string,
-  ): Promise<{ size: number }> {
+  ): Promise<{ size: number; isDirectory: boolean }> {
     return new Promise((resolve, reject) => {
       sftp.stat(remotePath, (err, stats) => {
         if (err) {
@@ -3480,7 +3559,7 @@ export class TransferService {
             this.makeSftpError(`Failed to stat ${label} file`, err),
           );
         }
-        resolve({ size: stats.size });
+        resolve({ size: stats.size, isDirectory: stats.isDirectory() });
       });
     });
   }
@@ -4260,7 +4339,7 @@ export class TransferService {
    * on its own reused SFTP session. onError="abort": once a file fails no
    * unstarted file is scheduled, files already in flight finish, and every
    * file gets a recorded outcome -- so a caller can report exactly what was
-   * pulled.
+   * pulled. onError="continue" attempts every file.
    */
   private downloadPairs(
     scope: TransferScope,
@@ -4268,8 +4347,9 @@ export class TransferService {
     pairs: ReadonlyArray<{ remotePath: string; localPath: string }>,
     concurrency: number,
     options: SftpOptions | undefined,
+    onError: BatchUploadOnError = "abort",
   ): Promise<Array<BatchTransferOutcome<string>>> {
-    return this.runBoundedTransfersWithResults(pairs, concurrency, "abort", async ({ remotePath, localPath }, worker) => {
+    return this.runBoundedTransfersWithResults(pairs, concurrency, onError, async ({ remotePath, localPath }, worker) => {
       // One bounded debug sink per file, as a standalone download() has.
       const { collector, debug } = createDebugCollector(options?.vvv === true);
       try {
@@ -4294,13 +4374,13 @@ export class TransferService {
   public async downloadFiles(
     pairs: ReadonlyArray<{ remotePath: string; localPath: string }>,
     server: string,
-    options?: SftpOptions,
+    options?: SftpOptions & { onError?: BatchUploadOnError },
   ): Promise<{ results: DownloadFileResult[] }> {
     const resolvedName = server || this.pool.defaultName;
     const fileConcurrency = this.resolveRecursiveFileConcurrency(options);
     const scope = this.openTransferScope(resolvedName, options, undefined, this.sftpSessionsFor(fileConcurrency));
     try {
-      const outcomes = await this.downloadPairs(scope, resolvedName, pairs, fileConcurrency, options);
+      const outcomes = await this.downloadPairs(scope, resolvedName, pairs, fileConcurrency, options, options?.onError);
       return {
         results: pairs.map(({ remotePath, localPath }, index): DownloadFileResult => {
           const outcome = outcomes[index];
@@ -4315,6 +4395,51 @@ export class TransferService {
     } finally {
       await scope.close();
     }
+  }
+
+  /**
+   * Download several remote files into one local directory, each landing at
+   * `localDir/<basename>` -- the counterpart of uploadBatch. Every path is
+   * validated, and basename collisions are rejected, before any remote I/O.
+   */
+  public async downloadBatch(
+    remotePaths: string[],
+    localDir: string,
+    name?: string,
+    options?: SftpOptions & { onError?: BatchUploadOnError },
+  ): Promise<BatchDownloadResult> {
+    const validation = validateBatchDownloadTargets(remotePaths);
+    if (!validation.ok) {
+      throw new ToolError(validation.code, validation.message, false);
+    }
+    const resolvedName = name || this.pool.defaultName;
+    const validatedRemotePaths = remotePaths.map((remotePath) => this.validateRemotePath(remotePath, resolvedName));
+    const resolvedDir = this.validateLocalPath(localDir, resolvedName);
+    if (fs.existsSync(resolvedDir) && !fs.statSync(resolvedDir).isDirectory()) {
+      throw new ToolError("INVALID_CONFIGURATION", `localPath must be a directory for a remotePath array: ${resolvedDir}`, false);
+    }
+    const pairs = validatedRemotePaths.map((remotePath) => ({
+      remotePath,
+      localPath: this.validateLocalPath(path.join(resolvedDir, batchUploadBasename(remotePath)), resolvedName),
+    }));
+    try {
+      fs.mkdirSync(resolvedDir, { recursive: true });
+    } catch (error) {
+      throw new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to create '${resolvedDir}': ${(error as Error).message}`, false);
+    }
+
+    const { results } = await this.downloadFiles(pairs, resolvedName, {
+      ...options,
+      onError: options?.onError === "continue" ? "continue" : "abort",
+    });
+    const count = (status: DownloadFileResult["status"]) => results.filter((result) => result.status === status).length;
+    return {
+      results,
+      total: results.length,
+      downloadedCount: count("downloaded"),
+      failedCount: count("failed"),
+      notAttemptedCount: count("not-attempted"),
+    };
   }
 
   /**
