@@ -1,30 +1,74 @@
 name: CI
 
-# Build and the full node --test suite on every push and pull request.
-# Builds and tests run here, not on a developer machine.
+# Build and test on every push and pull request. Builds and tests run here,
+# not on a developer machine.
+#
+# One concurrency group per commit: a fix pushed while an earlier run is
+# still going runs beside it instead of cancelling it; only a re-run of the
+# same commit replaces its run.
+#
+# Manual runs (workflow_dispatch) can select the operating systems and a
+# subset of test files, so a fix run carries only the jobs that failed:
+#   gh workflow run ci.yml -f os=windows -f tests="build/tests/transfer-real.test.js"
 on:
   push:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      os:
+        description: "Operating systems: all, ubuntu, windows, macos, or a comma-separated list"
+        default: all
+      tests:
+        description: "Space-separated build/tests/*.test.js files; empty runs the full suite (npm test)"
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
 
 jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.pick.outputs.os }}
+    steps:
+      - id: pick
+        env:
+          REQUESTED: ${{ github.event.inputs.os || 'all' }}
+        run: |
+          all='["ubuntu-latest","windows-latest","macos-latest"]'
+          if [ "$REQUESTED" = "all" ]; then echo "os=$all" >> "$GITHUB_OUTPUT"; exit 0; fi
+          list=$(echo "$REQUESTED" | tr ',' '\n' | sed 's/ //g' | grep -E '^(ubuntu|windows|macos)$' | sed 's/.*/"&-latest"/' | paste -sd, -)
+          test -n "$list" || { echo "unknown os input: $REQUESTED"; exit 1; }
+          echo "os=[$list]" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: matrix
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: ${{ fromJSON(needs.matrix.outputs.os) }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
 
+      # Node 24: scripts/preflight.mjs requires >= 24.15.0 (node:sqlite target).
+      # cache: npm restores ~/.npm keyed by package-lock.json, so npm ci
+      # downloads nothing when the lockfile is unchanged.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
+          cache: npm
 
-      - run: npm install
+      - run: npm ci
 
-      # Runs the build then the full node --test suite (see package.json "test").
-      - run: npm test
+      # The full suite (npm test builds first), or only the selected files.
+      - name: Test
+        shell: bash
+        env:
+          TESTS: ${{ github.event.inputs.tests }}
+        run: |
+          if [ -z "$TESTS" ]; then npm test; else npm run build && node --test $TESTS; fi
