@@ -715,23 +715,37 @@ describe("P1-06c transfer correctness against a real ssh2 server", { concurrency
   });
 
   describe("a default fast upload does not preload the local file", () => {
-    test("memory stays flat for a large non-script file; a shell script (read for the CRLF fix) holds it", async () => {
+    test("live buffer memory stays flat for a large non-script file; a shell script (read for the CRLF fix) holds it", async () => {
       const size = 32 * 1024 * 1024;
       const peakGrowth = async (localName: string, remote: string): Promise<number> => {
         const localPath = writeLocal(localName, Buffer.alloc(size, 7));
+        // Leave the allocation's stack frame before collecting the fixture
+        // buffer; otherwise it can remain a conservative stack root here.
+        await new Promise<void>((resolve) => setImmediate(resolve));
         // Collect first: garbage left by earlier tests (and the buffer just
         // written) would otherwise sit in the baseline and could be freed
         // mid-measurement, hiding real growth.
         gc();
         const baseline = process.memoryUsage().arrayBuffers;
         let peak = 0;
-        const sampler = setInterval(() => { peak = Math.max(peak, process.memoryUsage().arrayBuffers - baseline); }, 2);
+        const sample = (): void => {
+          // Measure retained buffers, not dead SSH/network packets waiting
+          // for a GC cycle. Their collection timing varies with runner load.
+          // Sample the synchronous source preparation below as well, so even
+          // a buffer released before the first timer tick is detected.
+          gc();
+          peak = Math.max(peak, process.memoryUsage().arrayBuffers - baseline);
+        };
+        const sampler = setInterval(sample, 10);
         try {
-          await service.upload(localPath, remote, "instant", { skipIfIdentical: false });
+          const upload = service.upload(localPath, remote, "instant", { skipIfIdentical: false });
+          sample();
+          await upload;
         } finally {
           clearInterval(sampler);
         }
-        return Math.max(peak, process.memoryUsage().arrayBuffers - baseline);
+        sample();
+        return peak;
       };
 
       // Both go through fastPut; only the shell script is also read into memory.

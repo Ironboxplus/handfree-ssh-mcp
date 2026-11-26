@@ -215,3 +215,13 @@ the ready-to-use dashboard. Discover `rexp-web` with `plugin-list`, install/upda
 with `plugin-activate`, then call `plugin-run` with `args: ["open"]`.
 Use the URL returned by `open` or `status` (default `http://127.0.0.1:5173/`).
 No source checkout or frontend build is required; ask about login autostart during setup.
+Web updates verify the latest official release, stop a running Web before replacing
+files, and restore its previous port and preferences. Registry failures are reported
+without treating a cached old version as an update.
+
+The bundled REXP manifest can discover the remote SSH user's existing root and virtual
+environment. A new control computer does not need to reinstall the remote platform;
+unknown paths require association with the existing installation.
+
+For installation from this source repository, run `npm install` followed by `npm run build`.
+The repository does not include a package lockfile, so `npm ci` is not a source-install command.

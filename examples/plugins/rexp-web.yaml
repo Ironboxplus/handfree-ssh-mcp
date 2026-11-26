@@ -21,6 +21,9 @@ components:
       查看状态用 [status,--json]；修改自启动用 [autostart,on] 或 [autostart,off]；
       启停用 [start] / [stop]。Agent 退出不关闭 Web。升级前明确告知需要重启 Web 才能加载新版，
       保留用户的自启动偏好和个人配置，不为升级重新初始化远端平台。
+      update 绕过旧 npm 缓存向官方源确认最新版本，下载并校验确切版本；无法确认时明确失败，不将旧版本称为更新成功。
+      更新正在运行的 Web 时会先 stop，再安装、校验和 start；失败时恢复旧安装和原运行状态。
+      已安装时 install 只复用，不执行升级。npm 缓存不可写时使用当前用户的私有缓存，错误保留源地址与缓存路径。
     source:
       kind: npm
       location: https://registry.npmjs.org/
@@ -31,24 +34,8 @@ components:
       HANDFREE_MCP_DIR: '${sshMcpDir}'
       HANDFREE_MCP_CONFIG: '${sshMcpConfig}'
       HANDFREE_PLUGINS_CONFIG: '${pluginRegistry}'
-    install: &install
-      - '${nodeExecutable}'
-      - '-e'
-      - |
-        const fs = require('node:fs'), path = require('node:path'), cp = require('node:child_process');
-        const roots = [path.dirname(process.execPath), ...(process.env.PATH || '').split(path.delimiter)];
-        const candidates = [process.env.npm_execpath];
-        for (const root of roots) {
-          candidates.push(path.join(root, 'node_modules/npm/bin/npm-cli.js'), path.resolve(root, '../lib/node_modules/npm/bin/npm-cli.js'));
-          try { candidates.push(fs.realpathSync(path.join(root, 'npm'))); } catch {}
-        }
-        const cli = candidates.find(file => file && file.endsWith('npm-cli.js') && fs.existsSync(file));
-        if (!cli) throw new Error('npm CLI not found beside Node or on PATH. Install Node.js with npm first.');
-        const result = cp.spawnSync(process.execPath, [cli, 'install', '--prefix', process.argv[1], '--omit=dev', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org/', 'rexp-web@latest'], {stdio:'inherit'});
-        if (result.error) throw result.error;
-        process.exit(result.status ?? 1);
-      - '${pluginInstallDir}'
-    update: *install
+    install: ['${nodeExecutable}', '${sshMcpDir}/examples/plugins/rexp-web-install.cjs', '${pluginInstallDir}', install]
+    update: ['${nodeExecutable}', '${sshMcpDir}/examples/plugins/rexp-web-install.cjs', '${pluginInstallDir}', update]
     skills:
       list: ['${nodeExecutable}', '${pluginRoot}/scripts/web.mjs', skills, list, '--json']
       show: ['${nodeExecutable}', '${pluginRoot}/scripts/web.mjs', skills, show, '${skill}', '--json']

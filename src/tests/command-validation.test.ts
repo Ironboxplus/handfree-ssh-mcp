@@ -2739,6 +2739,7 @@ describe("SSHConnectionManager regressions", () => {
           host: "127.0.0.1",
           port: 22,
           username: "root",
+          agent: false, // Do not inherit the developer/CI SSH_AUTH_SOCK.
           safeDirectory: "/root",
         },
       },

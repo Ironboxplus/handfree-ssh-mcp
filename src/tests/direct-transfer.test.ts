@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as net from "node:net";
 import { generateKeyPairSync } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import ssh2 from "ssh2";
 import { after, before, describe, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -278,12 +278,16 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
   // host-key check (BatchMode=yes blocks the interactive prompt).
   const sourceUntrustedServer = new RealSshTestServer(sourceUntrustedRoot, 8, 0, 0, {
     execEnv: { ...process.env, HOME: untrustedHome, USERPROFILE: untrustedHome },
+    sshConfigFile: path.join(untrustedHome, ".ssh", "config"),
   });
   // HOME has a real id_rsa (the keypair above) and a real known_hosts entry
   // for destinationServer's own real generated host key -- both pinned
   // ahead of time, never auto-accepted mid-connection.
   const sourceTrustedServer = new RealSshTestServer(sourceTrustedRoot, 8, 0, 0, {
-    execEnv: { ...process.env, HOME: trustedHome, USERPROFILE: trustedHome },
+    execEnv: { ...process.env, HOME: trustedHome, USERPROFILE: trustedHome,
+      ...(process.platform !== "win32" ? { PATH: path.join(suiteRoot, "tar-only-bin") } : {}),
+    },
+    sshConfigFile: path.join(trustedHome, ".ssh", "config"),
   });
 
   const mcpServer = new McpServer({ name: "direct-transfer-test", version: "1.0.0" });
@@ -294,6 +298,25 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
     fs.mkdirSync(path.join(trustedHome, ".ssh"), { recursive: true });
     fs.writeFileSync(path.join(trustedHome, ".ssh", "id_rsa"), clientPrivateKeyPem, { mode: 0o600 });
     fs.chmodSync(path.join(trustedHome, ".ssh", "id_rsa"), 0o600);
+    for (const home of [trustedHome, untrustedHome]) {
+      const sshPath = (name: string) => path.join(home, ".ssh", name).replace(/\\/g, "/");
+      fs.writeFileSync(path.join(home, ".ssh", "config"), [
+        "Host *", "  IdentitiesOnly yes", "  IdentityAgent none", "  StrictHostKeyChecking yes",
+        `  IdentityFile "${sshPath("id_rsa")}"`,
+        `  UserKnownHostsFile "${sshPath("known_hosts")}"`,
+        "  GlobalKnownHostsFile none", "",
+      ].join("\n"), { mode: 0o600 });
+    }
+    if (process.platform !== "win32") {
+      // This acceptance case exercises tar|ssh even on Linux hosts with rsync.
+      // Use real binaries with a restricted PATH; do not fake availability.
+      const bin = path.join(suiteRoot, "tar-only-bin");
+      fs.mkdirSync(bin);
+      for (const name of ["sh", "tar", "ssh"]) {
+        const target = execFileSync("sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).trim();
+        fs.symlinkSync(target, path.join(bin, name));
+      }
+    }
 
     await Promise.all([
       sourceServer.start(),

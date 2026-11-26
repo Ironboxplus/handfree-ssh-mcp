@@ -199,6 +199,13 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     }
   });
 
+  test("Windows system bsdtar receives normalized paths without GNU-only flags", () => {
+    assert.deepEqual(buildLocalTarArgv(["-xf", "C:\\work\\a.tar", "-C", "D:\\out"], "win32", false),
+      ["-xf", "C:/work/a.tar", "-C", "D:/out"]);
+    assert.deepEqual(buildLocalTarArgv(["-xf", "\\\\server\\share\\a.tar"], "win32", false),
+      ["-xf", "//server/share/a.tar"]);
+  });
+
   test("white-box: local archive workspace is created under os.tmpdir(), not process.cwd()", () => {
     const privateManager = manager as any;
     const tmpRoot = fs.realpathSync(os.tmpdir());

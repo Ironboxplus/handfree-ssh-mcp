@@ -6,6 +6,11 @@ components:
     target: ssh
     description: Run rexp on the selected SSH server. File transfer uses SSH MCP SFTP tools.
     setup: >
+      先执行 plugin-activate check 只读发现远端当前 SSH 用户已有的安装；不依赖本机安装记录或 PATH。
+      优先复用 ~/.rexp/config.yaml 的默认根目录、节点登记的 runtime_python 和用户级 rexp 启动入口，
+      以绝对路径调用原虚拟环境，不需要 activate，不修改全局变量、不扫描其他用户目录。
+      check 返回路径未登记/无法确认不等于未安装；先询问已有根目录和平台解释器位置，禁止直接重装。
+      install 会先检查已有版本，已安装则复用；升级需明确 update，不重新 init。
       安装前确认目标节点、平台安装环境和数据根目录 platformRoot。已有路径优先保留；
 
       未指定的目录和初始化选项应询问用户，只有明确授权“看着办”时才自行选择，
@@ -81,6 +86,170 @@ components:
       UV_FIND_LINKS=<wheelhouse>，pip 使用 PIP_NO_INDEX=1 PIP_FIND_LINKS=<wheelhouse>。uv venv --seed 也会获取
       pip/setuptools/wheel，离线集合须包含所选 Python 对应的这些种子包与 default 所需的 NumPy/PyYAML/pydantic/packaging
       等依赖。UV_NO_INDEX=1 不能代替 UV_OFFLINE=true，避免先离线准备又重新联网。
+    discover:
+      script: |
+        """Read the current SSH user's installation; never install, initialize or probe GPUs."""
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import shlex
+        import shutil
+        import subprocess
+        import sys
+
+        settings = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
+        home = Path.home()
+
+        def emit(state, message, values=None):
+            # ASCII JSON survives Windows console encodings and preserves Unicode paths.
+            print(json.dumps({'state': state, 'message': message, 'settings': values or {}}, ensure_ascii=True))
+            raise SystemExit(0)
+
+        def scalar(file, key):
+            if not file.is_file():
+                return None
+            text = file.read_text(encoding='utf-8')
+            try:
+                import yaml
+                data = yaml.safe_load(text) or {}
+                for part in key:
+                    data = data.get(part) if isinstance(data, dict) else None
+                return data if isinstance(data, str) else None
+            except ImportError:
+                # Platform-generated YAML uses single-line path scalars. If system Python
+                # has no PyYAML, accept only that subset; never evaluate YAML or guess.
+                values = re.findall(r'^\s*' + re.escape(key[-1]) + r':\s*(.*?)\s*$', text, re.M)
+                if len(values) != 1:
+                    return None
+                value = values[0]
+                if value.startswith("'") and value.endswith("'"):
+                    return value[1:-1].replace("''", "'")
+                if value.startswith('"'):
+                    return json.loads(value)
+                value = value.split(' #', 1)[0].strip()
+                if value and value[0] not in '!&*[{>|' and value not in ('null', '~'):
+                    return value
+                return None
+
+        def path(value):
+            return Path(value).expanduser().absolute() if value else None
+
+        def launcher_python(entry):
+            try:
+                text = entry.read_bytes()[:262144].decode('utf-8', errors='replace')
+                if text.startswith('#!') and not text.startswith(('#!/bin/sh', '#!/usr/bin/env')):
+                    return text.splitlines()[0][2:].strip().strip('"')
+                for line in text.splitlines():
+                    if line.startswith('exec ') and ' -m rexp ' in line:
+                        return shlex.split(line)[1]
+                    match = re.match(r'^"([^"]+)" -m rexp %\*$', line.strip())
+                    if match:
+                        return match.group(1)
+            except (OSError, ValueError):
+                pass
+            return None
+
+        try:
+            config_home = path(os.environ.get('REXP_HOME')) or home / '.rexp'
+            root = path(settings.get('platformRoot') or scalar(config_home / 'config.yaml', ['platform_root']))
+            runtime = scalar(root / 'configs/nodes.yaml', ['environment_manager', 'runtime_python']) if root else None
+        except (OSError, ValueError, TypeError):
+            emit('unconfigured', 'Existing user configuration could not be read. Confirm the existing root/runtime; do not reinstall.')
+
+        windows = os.name == 'nt'
+        cli_name = 'rexp.exe' if windows else 'rexp'
+        launchers = [path(settings.get('rexpPath')), home / '.local/bin/rexp']
+        if windows:
+            launchers.insert(1, path(os.environ.get('LOCALAPPDATA', str(home / 'AppData/Local'))) / 'rexprun/bin/rexp.cmd')
+        which = shutil.which('rexp')
+        if which:
+            launchers.append(path(which))
+        if root:
+            launchers.append(root / 'env/platform' / ('Scripts' if windows else 'bin') / cli_name)
+
+        candidates = []
+        for python in (settings.get('platformPython'), runtime):
+            if python:
+                bin_dir = path(python).parent / 'Scripts' if windows else path(python).parent
+                candidates.append((path(python), path(settings.get('rexpPath')) or bin_dir / cli_name))
+        for entry in launchers:
+            if entry and entry.is_file():
+                python = launcher_python(entry)
+                if python:
+                    candidates.append((path(python), entry))
+        candidates.append((Path(sys.executable), Path(sys.executable).parent / cli_name))
+
+        seen = set()
+        found_package = False
+        for python, entry in candidates:
+            identity = (str(python), str(entry))
+            if identity in seen or not python.is_file():
+                continue
+            seen.add(identity)
+            env = os.environ.copy()
+            env.pop('PLATFORM_ROOT', None)
+            env['PYTHONDONTWRITEBYTECODE'] = '1'
+            try:
+                result = subprocess.run([str(python), '-c', 'import json,sys;from rexp.version import __version__;print(json.dumps({"python":sys.executable,"version":__version__}))'],
+                                        text=True, capture_output=True, timeout=4, env=env)
+                if result.returncode:
+                    continue
+                info = json.loads(result.stdout)
+                found_package = True
+                if not root:
+                    emit('not_initialized', 'REXP is installed, but this SSH user has no saved platform root. Select the existing root; do not reinstall.')
+                if not (root / 'configs/platform.yaml').is_file():
+                    emit('not_initialized', 'The saved platform root is not initialized. Confirm the existing root before making changes.')
+                if not entry.is_file():
+                    continue
+                emit('ready', 'Reusing this SSH user\'s existing installation.', {
+                    'platformRoot': str(root), 'platformPython': info['python'], 'rexpPath': str(entry),
+                    'commandShell': 'powershell' if windows else 'posix',
+                })
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                continue
+
+        if root or found_package:
+            emit('unconfigured', 'Existing platform configuration was found, but its runtime entry could not be verified. Provide the existing environment path; do not reinstall.')
+        emit('unconfigured', 'No registered runtime was found for this SSH user. It may be in an unregistered virtual environment. Ask for the existing installation/root before proposing installation.')
+      posix:
+        - sh
+        - -c
+        - |
+          for p in python3 python; do
+            if command -v "$p" >/dev/null 2>&1; then exec "$p" -c "$1" "$2"; fi
+          done
+          printf '%s\n' '{"state":"unconfigured","settings":{},"message":"No bootstrap Python on PATH. Provide the existing platform interpreter; do not reinstall."}'
+        - rexp-discovery
+        - ${discoveryScript}
+        - ${pluginSettings}
+      powershell:
+        - powershell.exe
+        - -NoProfile
+        - -NonInteractive
+        - -Command
+        - |
+          $ErrorActionPreference = 'Stop'
+          $py = $null
+          $launcher = Join-Path $env:LOCALAPPDATA 'rexprun/bin/rexp.cmd'
+          if (Test-Path -LiteralPath $launcher) {
+            $text = Get-Content -Raw -LiteralPath $launcher
+            if ($text -match '(?m)^\x22([^\x22]+)\x22 -m rexp %\*') { $py = $Matches[1] }
+          }
+          if (-not $py) {
+            $command = Get-Command python.exe -ErrorAction SilentlyContinue
+            if ($command -and $command.Source -notlike '*WindowsApps*') { $py = $command.Source }
+          }
+          if (-not $py) {
+            [pscustomobject]@{state='unconfigured';settings=@{};message='Provide the existing platform interpreter; do not reinstall.'} | ConvertTo-Json -Compress
+            exit 0
+          }
+          # Keep the native -c argument free of embedded double quotes: Windows
+          # PowerShell 5.1 strips those when forwarding to Python.
+          $code = 'import base64,sys;sys.argv=[str(),base64.b64decode(''${pluginSettingsBase64}'').decode(''utf-8'')];exec(base64.b64decode(''${discoveryScriptBase64}''))'
+          & $py -c $code
+          exit $LASTEXITCODE
     source:
       kind: pip
       location: https://pypi.org/simple/

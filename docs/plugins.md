@@ -31,7 +31,9 @@ can contain several components; select one explicitly when there is more than on
 2. `plugin-list`: discover plugin ids, components, targets and sources.
 3. `plugin-activate {plugin:"rexp", connectionName:"my-server"}`: check the installed
    version and fetch its skill catalog. Default mode is `check` and makes no installation.
-4. If missing, explicitly select `mode:"install"`. To request the package manager's
+4. If confirmed missing, explicitly select `mode:"install"`. An unknown path or a
+   failed SSH probe does not mean the package is absent. Discovery-enabled components
+   reuse an existing installation rather than reinstalling it. To request the package manager's
    latest available version select `mode:"update"`. These use the configured commands,
    then query the actual installed version and skill catalog again. Repeated checks do
    not reinstall packages. Review running workloads before updating a worker.
@@ -58,6 +60,15 @@ A component declares `id`, `target` (`local` or `ssh`), `description`, `entry` a
   initialization choices before installation; ask unless already supplied or explicitly
   delegated. A successful package install does not imply the plugin is ready for use.
 - `install` / `update`: package manager argv arrays. Missing actions fail clearly.
+- `discover`: optional read-only discovery with `posix` and optional `powershell`
+  argv, plus an optional embedded `script`. When required settings are missing,
+  the host runs this before the requested command, without the component's `env`.
+  It returns JSON `{state:"ready",settings:{key:"value"},message:"..."}`;
+  states `unconfigured`, `not_initialized` and `not_installed` return an actionable
+  error and never authorize installation. Only nonempty string settings can fill
+  gaps; explicit registry settings win. Successful results are shared for 30 seconds
+  per SSH identity, manifest and explicit settings. A changed registration is read
+  immediately. Discovery does not persist settings or initialize anything.
 - `env`: environment variables for every command, including install and version.
 - `skills.list` / `skills.show`: commands returning the current catalog and one skill;
   `${skill}` is the requested name. These may return JSON or Markdown; Handfree
@@ -71,9 +82,17 @@ Activation checks the selected maintenance command plus its subsequent version/s
 queries before making changes. Substitution is single-pass. Runtime `args` are passed
 literally, without interpolation. No arbitrary JavaScript modules are loaded.
 
-For REXP, keep `platformRoot`, `rexpPath` and `platformPython` per server. The root is
-passed through `PLATFORM_ROOT`; omitting a required root fails instead of selecting an
-arbitrary directory. Existing roots are not initialized, migrated or deleted by activation.
+For REXP, `platformRoot`, `rexpPath` and `platformPython` belong to the selected remote
+SSH user. The bundled manifest first reads that user's `~/.rexp/config.yaml`, the saved
+root's `configs/nodes.yaml` runtime and user-level launcher. It verifies the installed
+version through the absolute virtual-environment interpreter, without `activate`,
+GPU probes, global environment changes or searching other users' directories.
+A missing control-computer registration or a missing `rexp` on `PATH` is not an
+uninstalled remote platform. If an older installation has no saved root/runtime,
+ask for its existing paths and record them per connection; do not reinstall or init.
+Explicit settings take precedence over discovery. The resolved root is passed through
+`PLATFORM_ROOT` for each plugin command; no server-wide variable is added.
+Existing roots are not initialized, migrated or deleted by activation.
 The example assumes an existing Python installation. REXP 0.2.0 initialization
 binds an existing uv/Conda manager (uv preferred), or asks the user about installing
 one. Declining uses Python venv. Agent setup passes that choice explicitly;
@@ -128,6 +147,18 @@ Its prebuilt dashboard requires no source checkout or build step. The package pa
 is separate from the local console: use the URL returned by `open` or `status`
 (default `http://127.0.0.1:5173/`). Upgrade through `plugin-activate update`.
 
+The bundled Web updater fetches the official registry's latest metadata without npm's
+version cache and verifies the exact tarball's SHA-512 before stopping anything.
+`already_current` means the installed version matches that verified release; a network
+failure cannot claim success. A running Web is stopped before npm modifies its directory
+(required on Windows), verified and restarted on its previous port. An installation or
+restart failure attempts to restore the previous package and running state; failed
+recovery is reported explicitly. A stopped Web remains stopped. Personal configuration
+and login-autostart preferences are preserved. An unwritable npm cache falls back to a
+private per-user cache. Dependencies retain the user's npm registry configuration;
+the application archive always comes from the official registry. Installer diagnostics include the registry and cache path;
+activation retains `installerOutput` and the updater's structured `maintenance` result.
+
 ## Development verification
 
 `npm run test:plugins` covers local execution, literal argv, SSH alias and root selection,
@@ -181,3 +212,7 @@ merely by discovery. The Web manifest uses these values to retain the host's run
 configuration paths without hardcoding a source checkout. Keep the default `pluginRoot`
 when using the npm package so installation, updates and commands address the same files.
 Other plugins can use the same variables.
+
+Discovery additionally receives `pluginSettings` / `pluginSettingsBase64` (explicit
+component/registry settings as JSON) and `discoveryScript` / `discoveryScriptBase64`.
+These are substituted once and passed as literal arguments, including on PowerShell.
