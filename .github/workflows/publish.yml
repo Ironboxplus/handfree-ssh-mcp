@@ -1,6 +1,12 @@
 name: Publish to npm
 
 # Auto-publish when a version tag is pushed, e.g. `git tag v1.0.14 && git push --tags`.
+#
+# Publishing uses npm trusted publishing (OIDC): npmjs.com trusts this
+# repository's publish.yml, so no npm token is stored here and no one-time
+# password is needed. One-time setup on npmjs.com: package settings ->
+# Trusted Publisher -> GitHub Actions, owner Ironboxplus, repository
+# handfree-ssh-mcp, workflow publish.yml. Requires npm >= 11.5.1.
 on:
   push:
     tags:
@@ -11,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -19,6 +26,8 @@ jobs:
           node-version: 24
           cache: npm
           registry-url: https://registry.npmjs.org
+
+      - run: npm install -g npm@^11.5.1
 
       - run: npm ci
 
@@ -34,5 +43,3 @@ jobs:
           test "$PKG" = "$TAG"
 
       - run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
