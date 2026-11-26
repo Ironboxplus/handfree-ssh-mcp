@@ -29,7 +29,7 @@ export function registerExecuteCommandTool(server: McpServer): void {
         .positive()
         .optional()
         .describe(
-          "Milliseconds per attempt: SSH setup and command execution use this cap; channel opening also respects channelOpenTimeout. Default 300000 for stream=true, 30000 otherwise."
+          "Milliseconds to wait. SSH setup fails at this cap; channel opening also respects channelOpenTimeout. A command still running at the cap is NOT stopped: stream=false returns COMMAND_TIMEOUT naming the log that keeps receiving its output; stream=true keeps tracking it in command-status until it exits. Default 300000 for stream=true, 30000 otherwise."
         ),
       stream: z
         .boolean()

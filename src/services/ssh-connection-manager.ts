@@ -811,6 +811,9 @@ export class SSHConnectionManager {
       // stale client and retry with a fresh one instead of waiting the full
       // command timeout.
       channelOpenTimeout?: number;
+      // Called when the command timeout passes with the command still
+      // running: the promise settles with its exit code once it ends.
+      onDetached?: (exited: Promise<number | null>) => void;
     }
   ): Promise<number | null> {
     return new Promise<number | null>((resolve, reject) => {
@@ -909,24 +912,23 @@ export class SSHConnectionManager {
         }, execOpenTimeout);
       };
 
+      // The timeout ends the wait, never the command (user decision
+      // 2026-11-27: the commands that outlive it are mostly long tasks that
+      // must keep running). Nothing is signalled and the channel stays open:
+      // closing it would break the process's pipes on its next write, and
+      // not reading would stall it once the channel window fills. Its output
+      // keeps draining into the sinks, and onDetached receives the exit.
       const armCommandTimeout = (stream: ClientChannel) => {
         timeoutId = setTimeout(() => {
-          sinks.debug?.(`[mcp] remote command timed out after ${timeout}ms; closing command channel`);
+          sinks.debug?.(`[mcp] remote command still running after ${timeout}ms; no longer waiting, not stopped`);
+          sinks.onDetached?.(new Promise<number | null>((resolveExit) => {
+            stream.once("close", (code: number | null) => resolveExit(code ?? null));
+          }));
           settle(new ToolError(
             "COMMAND_TIMEOUT",
-            `Command timeout: execution exceeded ${timeout}ms limit. Remote process killed.`,
+            `Command still running after ${timeout}ms; it was not stopped and continues on the remote.`,
             false,
           ));
-          try {
-            stream.signal("KILL");
-          } catch {
-            // Ignore errors when sending signal.
-          }
-          try {
-            stream.close();
-          } catch {
-            // Ignore errors when closing streams during timeout.
-          }
         }, timeout);
       };
 
@@ -961,13 +963,15 @@ export class SSHConnectionManager {
           stream.on("data", (chunk: Buffer) => {
             sinks.stdoutCollector?.push(chunk);
             sinks.logWriter?.appendStdout(chunk);
-            if (sinks.onProgress) sinks.onProgress(chunk.toString());
+            // Progress notifications belong to the request; a detached
+            // command's later output goes only to the log.
+            if (sinks.onProgress && !settled) sinks.onProgress(chunk.toString());
           });
 
           stream.stderr.on("data", (chunk: Buffer) => {
             sinks.stderrCollector?.push(chunk);
             sinks.logWriter?.appendStderr(chunk);
-            if (sinks.onProgress) sinks.onProgress(`[STDERR] ${chunk.toString()}`);
+            if (sinks.onProgress && !settled) sinks.onProgress(`[STDERR] ${chunk.toString()}`);
           });
 
           stream.on("close", (code: number) => {
@@ -992,6 +996,50 @@ export class SSHConnectionManager {
         settle(new ToolError(code, `Command execution error: ${error.message}`, isConnectionFailure));
       }
     });
+  }
+
+  /**
+   * One foreground command attempt with its log. When the command outlives
+   * the timeout it is detached, not stopped (see runCommandStream): the log
+   * and the connection stay open until the remote process exits, and the
+   * COMMAND_TIMEOUT error names the log that keeps receiving its output.
+   */
+  private async runLoggedCommandAttempt(
+    cmdString: string,
+    commandConnection: AcquiredSshClient,
+    timeout: number,
+    logWriter: OutputLogWriter | null,
+    sinks: {
+      stdoutCollector: OutputCollector;
+      stderrCollector: OutputCollector;
+      onProgress?: (chunk: string) => void;
+      debug?: SshDebugSink;
+      channelOpenTimeout?: number;
+    },
+  ): Promise<number | null> {
+    const startedMs = Date.now();
+    const detach: { exited?: Promise<number | null> } = {};
+    const finish = (exitCode: number | null) => {
+      logWriter?.close({ exitCode, durationMs: Date.now() - startedMs });
+      commandConnection.close();
+    };
+    try {
+      const exitCode = await this.runCommandStream(cmdString, commandConnection.client, timeout, {
+        ...sinks,
+        logWriter: logWriter ?? undefined,
+        onDetached: (exited) => { detach.exited = exited; },
+      });
+      finish(exitCode);
+      return exitCode;
+    } catch (error) {
+      if (!detach.exited) {
+        finish(null);
+        throw error;
+      }
+      detach.exited.then(finish, () => finish(null));
+      const where = logWriter ? ` Its full output keeps going to ${logWriter.getPath()}.` : "";
+      throw new ToolError("COMMAND_TIMEOUT", `${(error as Error).message}${where}`, false);
+    }
   }
 
   /**
@@ -1114,20 +1162,12 @@ export class SSHConnectionManager {
         const stdoutCollector = new OutputCollector(maxOutputBytes);
         const stderrCollector = new OutputCollector(maxOutputBytes);
         const logWriter = this.createLogWriter(key, cmdString);
-        const startedMs = Date.now();
-        let exitCode: number | null = null;
-        try {
-          exitCode = await this.runCommandStream(cmdString, client, timeout, {
-            stdoutCollector,
-            stderrCollector,
-            logWriter: logWriter ?? undefined,
-            debug,
-            channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
-          });
-        } finally {
-          logWriter?.close({ exitCode, durationMs: Date.now() - startedMs });
-          commandConnection.close();
-        }
+        const exitCode = await this.runLoggedCommandAttempt(cmdString, commandConnection, timeout, logWriter, {
+          stdoutCollector,
+          stderrCollector,
+          debug,
+          channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
+        });
         const result = this.buildExecuteResult({
           stdoutCollector,
           stderrCollector,
@@ -1252,21 +1292,13 @@ export class SSHConnectionManager {
         const stdoutCollector = new OutputCollector(maxOutputBytes);
         const stderrCollector = new OutputCollector(maxOutputBytes);
         const logWriter = this.createLogWriter(key, cmdString);
-        const startedMs = Date.now();
-        let exitCode: number | null = null;
-        try {
-          exitCode = await this.runCommandStream(cmdString, client, timeout, {
-            stdoutCollector,
-            stderrCollector,
-            logWriter: logWriter ?? undefined,
-            onProgress: options.onProgress,
-            debug,
-            channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
-          });
-        } finally {
-          logWriter?.close({ exitCode, durationMs: Date.now() - startedMs });
-          commandConnection.close();
-        }
+        const exitCode = await this.runLoggedCommandAttempt(cmdString, commandConnection, timeout, logWriter, {
+          stdoutCollector,
+          stderrCollector,
+          onProgress: options.onProgress,
+          debug,
+          channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
+        });
         const result = this.buildExecuteResult({
           stdoutCollector,
           stderrCollector,
@@ -1487,6 +1519,7 @@ export class SSHConnectionManager {
       let closeCommandConnection: (() => void) | null = null;
       let acquiredClient: Client | null = null;
       let timedOut = false;
+      const detach: { exited?: Promise<number | null> } = {};
       try {
         debug?.(`[mcp] background command attempt ${attempt + 1}/${maxRetries + 1} on [${key}], reuseConnection=${reuseConnection}`);
         const runAttempt = (async () => {
@@ -1509,6 +1542,7 @@ export class SSHConnectionManager {
             logWriter: writer,
             debug,
             channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
+            onDetached: (exited) => { detach.exited = exited; },
           });
         })();
 
@@ -1532,6 +1566,13 @@ export class SSHConnectionManager {
         return;
       } catch (error) {
         lastError = error as Error;
+        if (detach.exited) {
+          // Past the timeout the command keeps running and stays tracked as
+          // running; its connection is released in finally once it exits.
+          writer.appendStdout(`\n[mcp] ${lastError.message} Still tracked: the status follows the process until it exits.\n`);
+          await detach.exited;
+          return;
+        }
         const connectionError = this.isConnectionError(lastError);
 
         if (connectionError && this.canRetryCommandConnectionError(lastError) && attempt < maxRetries) {

@@ -978,19 +978,23 @@ export class TransferService {
    */
   private async explainDownloadFailure(sftp: SFTPWrapper, remotePath: string, error: Error): Promise<Error> {
     if (!(error instanceof ToolError) || error.code !== "SFTP_ERROR") return error;
+    return (await this.remoteIsDirectory(sftp, remotePath)) ? this.remoteDirectoryError(remotePath) : error;
+  }
+
+  /** One bounded STAT; false when it fails or times out. */
+  private async remoteIsDirectory(sftp: SFTPWrapper, remotePath: string): Promise<boolean> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const stat = await Promise.race([
         this.sftpStat(sftp, remotePath, "source"),
         new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("stat timed out")), 10_000); }),
       ]);
-      if (stat.isDirectory) return this.remoteDirectoryError(remotePath);
+      return stat.isDirectory;
     } catch {
-      // Keep the original error.
+      return false;
     } finally {
       clearTimeout(timer);
     }
-    return error;
   }
 
   private createSftpTransferOptions(options?: SftpOptions): TransferOptions {
@@ -1834,20 +1838,28 @@ export class TransferService {
     const createdHere = !fs.existsSync(localPath);
     this.ensureLocalParent(localPath);
     try {
+      let message: string;
       if (options?.fast !== false) {
         await this.sftpFastGet(sftp, remotePath, localPath, options, options?.timeout, debug);
-        return "File downloaded successfully via fast SFTP";
+        message = "File downloaded successfully via fast SFTP";
+      } else {
+        await this.pipeWithInactivityTimeout(
+          sftp.createReadStream(remotePath),
+          fs.createWriteStream(localPath),
+          this.transferStallTimeout(options?.timeout),
+          `download ${remotePath} -> ${localPath}`,
+          debug,
+          (err) => this.makeSftpError("File download failed", err),
+          (err) => this.localWriteError(localPath, err),
+        );
+        message = "File downloaded successfully";
       }
-      await this.pipeWithInactivityTimeout(
-        sftp.createReadStream(remotePath),
-        fs.createWriteStream(localPath),
-        this.transferStallTimeout(options?.timeout),
-        `download ${remotePath} -> ${localPath}`,
-        debug,
-        (err) => this.makeSftpError("File download failed", err),
-        (err) => this.localWriteError(localPath, err),
-      );
-      return "File downloaded successfully";
+      // A directory whose reported size is 0 is "downloaded" without a single
+      // READ, as an empty file. Only an empty result costs the extra STAT.
+      if (fs.statSync(localPath).size === 0 && await this.remoteIsDirectory(sftp, remotePath)) {
+        throw this.remoteDirectoryError(remotePath);
+      }
+      return message;
     } catch (error) {
       // A failed download leaves no file it created. A file it was
       // overwriting has already been truncated and is left as it is.

@@ -43,11 +43,17 @@ Parameters:
   vvv             (boolean, optional)  Default false. Append bounded
                   SSH/channel debug output. Use with reuseConnection=false
                   when you need fresh handshake logs.
-  timeout         (number, optional)   Per-attempt phase timeout in ms:
-                                      SSH setup, exec-channel open, and
-                                      remote command execution use this cap.
-                                      Channel opening is also bounded by
-                                      configured channelOpenTimeout.
+  timeout         (number, optional)   How long to wait, in ms. SSH setup
+                                      and exec-channel open fail at this
+                                      cap (channel opening is also bounded
+                                      by configured channelOpenTimeout).
+                                      A command still running at the cap
+                                      is NOT stopped or signalled:
+                                      stream=false returns COMMAND_TIMEOUT
+                                      naming the local log that keeps
+                                      receiving its output; stream=true
+                                      keeps tracking it in command-status
+                                      until it exits.
                   Defaults: 300000 (stream) / 30000 (non-stream).
   maxOutputBytes  (number, optional)   Returned tail limit per stdout/stderr,
                   default 65536 bytes. Full output is saved locally.

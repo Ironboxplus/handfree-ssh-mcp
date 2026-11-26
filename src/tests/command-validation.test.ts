@@ -1709,7 +1709,7 @@ describe("SSHConnectionManager regressions", () => {
     }
   });
 
-  it("should not reconnect cached clients when an opened remote command times out", async () => {
+  it("should neither signal, close nor reconnect when an opened remote command times out", async () => {
     manager.setConfig(
       {
         dev: baseConfig({
@@ -1756,9 +1756,11 @@ describe("SSHConnectionManager regressions", () => {
         (error: unknown) => error instanceof ToolError && error.code === "COMMAND_TIMEOUT",
       );
       assert.strictEqual(execCalls, 1);
-      assert.strictEqual(signalCalls, 1);
-      assert.strictEqual(closeCalls, 1);
+      // The timeout ends the wait, not the command (see runCommandStream).
+      assert.strictEqual(signalCalls, 0);
+      assert.strictEqual(closeCalls, 0);
       assert.strictEqual(reconnectCalls, 0);
+      stream.emit("close", 0);
     } finally {
       manager.pool.ensureConnected = originalEnsureConnected;
       manager.pool.reconnect = originalReconnect;
