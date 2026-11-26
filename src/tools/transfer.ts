@@ -30,13 +30,13 @@ export function registerTransferTool(server: McpServer): void {
         z.string(),
         z.array(z.string()),
       ]).optional().describe(
-        "Upload/download: local path. Any local path is allowed unless allowedLocalDirectories is configured. A single download into a directory (existing, or ending with / or \) keeps the remote name; missing parents are created. Upload arrays batch up to 1000 files into remotePath/<basename>; duplicate targets are rejected. Batch excludes recursive/archive.",
+        "Upload/download: local path. Any local path is allowed unless allowedLocalDirectories is configured. A single download into a directory (existing, or ending with / or \\) keeps the remote name; missing parents are created. Upload arrays batch up to 1000 files into remotePath/<basename>; duplicate targets are rejected. Batch excludes recursive/archive.",
       ),
       remotePath: z.union([
         z.string(),
         z.array(z.string()),
       ]).optional().describe(
-        "Upload/download: absolute remote path, /home/me/x on Linux/macOS or C:\Users\me\x, C:/Users/me/x on Windows. A download array (up to 1000) fetches each file into the localPath directory as <basename>; duplicate basenames are rejected. Batch excludes recursive/archive/connections.",
+        "Upload/download: absolute remote path, /home/me/x on Linux/macOS or C:\\Users\\me\\x, C:/Users/me/x on Windows. A download array (up to 1000) fetches each file into the localPath directory as <basename>; duplicate basenames are rejected. Batch excludes recursive/archive/connections.",
       ),
       connectionName: z.string().optional().describe(
         "Upload/download: Server name from list-servers. Required with multiple enabled servers; optional with one.",
