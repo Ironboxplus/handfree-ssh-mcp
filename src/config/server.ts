@@ -1,6 +1,6 @@
 export const SERVER_CONFIG = {
   name: "ssh-mcp-server",
-  version: "2.5.1",
+  version: "2.6.0",
 };
 
 export const SERVER_INSTRUCTIONS = `SSH access using ~/.ssh/config and optional YAML settings.
