@@ -2715,9 +2715,11 @@ describe("SSHConnectionManager regressions", () => {
   });
 
   it("should throw a structured local-path error before upload starts", async () => {
+    // Local paths are open by default; an allowlist (the working directory
+    // plus its entries) is what rejects a path outside it.
     manager.setConfig(
       {
-        dev: baseConfig(),
+        dev: baseConfig({ allowedLocalDirectories: [path.join(process.cwd(), "only-here")] }),
       },
       ["dev"],
     );
@@ -2868,7 +2870,7 @@ describe("SFTP path validators", () => {
       (e: unknown) =>
         e instanceof ToolError &&
         e.code === "REMOTE_PATH_NOT_ALLOWED" &&
-        /absolute POSIX path/.test(e.message),
+        /must be absolute/.test(e.message),
     );
   });
 
@@ -2929,10 +2931,16 @@ describe("SFTP path validators", () => {
     assert.strictEqual(manager.validateLocalPath(file, "dev"), file);
   });
 
-  it("should reject a local path outside cwd and outside allowedLocalDirectories", () => {
+  it("should allow any local path when allowedLocalDirectories is unset", () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+    const file = path.join(path.resolve(os.tmpdir()), "handfree-test-anywhere.txt");
+    assert.strictEqual(manager.validateLocalPath(file, "dev"), file);
+  });
+
+  it("should reject a local path outside cwd and outside a configured allowedLocalDirectories", () => {
     const tmp = path.resolve(os.tmpdir());
 
-    manager.setConfig({ dev: baseConfig() }, ["dev"]); // no allowedLocalDirectories
+    manager.setConfig({ dev: baseConfig({ allowedLocalDirectories: [path.join(process.cwd(), "only-here")] }) }, ["dev"]);
     const file = path.join(tmp, "handfree-test-rejected.txt");
 
     // Skip the case where tmpdir is somehow inside cwd (rare on Windows)

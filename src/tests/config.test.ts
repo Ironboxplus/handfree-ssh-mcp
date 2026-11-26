@@ -689,7 +689,7 @@ servers:
 
     assert.throws(
       () => loadConfigFromYaml(p),
-      /absolute POSIX path/i,
+      /must be absolute/i,
     );
   });
 
