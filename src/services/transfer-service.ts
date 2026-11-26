@@ -1856,7 +1856,7 @@ export class TransferService {
       }
       // A directory whose reported size is 0 is "downloaded" without a single
       // READ, as an empty file. Only an empty result costs the extra STAT.
-      if (fs.statSync(localPath).size === 0 && await this.remoteIsDirectory(sftp, remotePath)) {
+      if (fs.statSync(localPath, { throwIfNoEntry: false })?.size === 0 && await this.remoteIsDirectory(sftp, remotePath)) {
         throw this.remoteDirectoryError(remotePath);
       }
       return message;

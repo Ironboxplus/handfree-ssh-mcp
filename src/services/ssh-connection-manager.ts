@@ -814,6 +814,8 @@ export class SSHConnectionManager {
       // Called when the command timeout passes with the command still
       // running: the promise settles with its exit code once it ends.
       onDetached?: (exited: Promise<number | null>) => void;
+      // Called once the exec channel is open and the command is running.
+      onChannelOpened?: () => void;
     }
   ): Promise<number | null> {
     return new Promise<number | null>((resolve, reject) => {
@@ -959,6 +961,7 @@ export class SSHConnectionManager {
           channelOpened = true;
           activeStream = stream;
           sinks.debug?.("[mcp] exec channel opened");
+          sinks.onChannelOpened?.();
 
           stream.on("data", (chunk: Buffer) => {
             sinks.stdoutCollector?.push(chunk);
@@ -1520,6 +1523,7 @@ export class SSHConnectionManager {
       let acquiredClient: Client | null = null;
       let timedOut = false;
       const detach: { exited?: Promise<number | null> } = {};
+      const watchdog: { disarm?: () => void } = {};
       try {
         debug?.(`[mcp] background command attempt ${attempt + 1}/${maxRetries + 1} on [${key}], reuseConnection=${reuseConnection}`);
         const runAttempt = (async () => {
@@ -1543,6 +1547,7 @@ export class SSHConnectionManager {
             debug,
             channelOpenTimeout: this.resolveChannelOpenTimeout(this.getConfig(key)),
             onDetached: (exited) => { detach.exited = exited; },
+            onChannelOpened: () => watchdog.disarm?.(),
           });
         })();
 
@@ -1558,6 +1563,7 @@ export class SSHConnectionManager {
               }
             }
           },
+          watchdog,
         );
 
         if (attempt > 0) {
@@ -1626,14 +1632,22 @@ export class SSHConnectionManager {
     return timeoutMs + graceMs;
   }
 
+  /**
+   * Bound an attempt that could otherwise never settle. `control.disarm`
+   * stops the watchdog once the command is running: from then on
+   * runCommandStream's own timeout settles the attempt, and a command that
+   * outlives it is detached, never stopped.
+   */
   private withBackgroundCommandTimeout<T>(
     promise: Promise<T>,
     timeoutMs: number,
     onTimeout?: () => void,
+    control?: { disarm?: () => void },
   ): Promise<T> {
     const watchdogMs = this.resolveBackgroundWatchdogTimeout(timeoutMs);
     return new Promise<T>((resolve, reject) => {
       let settled = false;
+      if (control) control.disarm = () => clearTimeout(timer);
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
