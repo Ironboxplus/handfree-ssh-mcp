@@ -929,10 +929,34 @@ export class TransferService {
   private remoteDirectoryError(remotePath: string): ToolError {
     return new ToolError(
       "INVALID_CONFIGURATION",
-      `Remote path is a directory, not a file: ${remotePath}. Download a directory with transfer mode="download" ` +
-        `and recursive=true, or pass the files as a remotePath array.`,
+      `Remote path is a directory, not a file: ${remotePath}. pull detects a directory and copies all of it ` +
+        `(connections applies to single files only), or pass the files as a remotePath array.`,
       false,
     );
+  }
+
+  /**
+   * Whether a remote path is a directory, by one bounded STAT on a transfer
+   * session. False when it is a file, is missing or cannot be read: the
+   * transfer that follows reports that error with its own context.
+   */
+  public async remoteIsDirectoryPath(remotePath: string, name?: string, options?: SftpOptions): Promise<boolean> {
+    const resolvedName = name || this.pool.defaultName;
+    const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
+    const scope = this.openTransferScope(resolvedName, options, undefined);
+    try {
+      return await scope.run(0, (_client, sftp) => this.remoteIsDirectory(sftp, validatedRemotePath));
+    } finally {
+      await scope.close();
+    }
+  }
+
+  /**
+   * Like adb push and scp: a file pushed to a remote directory (an existing
+   * one, or a path ending with /) keeps its local name there.
+   */
+  private uploadTargetInDirectory(remoteDir: string, localPath: string, name: string): string {
+    return this.validateRemotePath(path.posix.join(remoteDir, path.basename(localPath)), name);
   }
 
   /** Create the local file's parent directories. */
@@ -1388,8 +1412,12 @@ export class TransferService {
     debug?.(`[mcp] sftp upload on [${resolvedName}], reuseConnection=${options?.reuseConnection !== false}`);
     const scope = this.openTransferScope(resolvedName, options, debug);
     try {
-      const message = await scope.run(0, (client, sftp) =>
-        this.uploadFileOn(client, sftp, resolvedName, validatedRemotePath, source, options, debug));
+      const message = await scope.run(0, async (client, sftp) => {
+        const target = /\/$/.test(validatedRemotePath) || await this.remoteIsDirectory(sftp, validatedRemotePath)
+          ? this.uploadTargetInDirectory(validatedRemotePath, validatedLocalPath, resolvedName)
+          : validatedRemotePath;
+        return this.uploadFileOn(client, sftp, resolvedName, target, source, options, debug);
+      });
       return appendDebugOutput(message, debugCollector);
     } catch (error) {
       throw appendDebugToError(error as Error, debugCollector);
@@ -1448,7 +1476,7 @@ export class TransferService {
       throw new ToolError(
         "LOCAL_FILE_READ_FAILED",
         `Local path '${localPath}' is not a regular file (size=${stat.size}). ` +
-          `Use uploadDirectory / recursive=true for directories.`,
+          `push detects a directory and copies all of it (connections applies to single files only).`,
         false,
       );
     }
@@ -2070,6 +2098,9 @@ export class TransferService {
     const reservation = await this.pool.reserveTransferLanes(resolvedName, connections);
     try {
       await this.openLaneSessions(reservation, "multi-upload", lanes, sftpSessions, timeout, debug, fresh);
+      if (/\/$/.test(remotePath) || await this.remoteIsDirectory(sftpSessions[0], remotePath)) {
+        remotePath = this.uploadTargetInDirectory(remotePath, localPath, resolvedName);
+      }
 
       if (skipIfIdentical) {
         const decision = await this.decideUploadSkip(

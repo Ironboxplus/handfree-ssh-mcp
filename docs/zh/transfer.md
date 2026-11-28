@@ -2,17 +2,21 @@
 
 # 文件传输
 
+三个工具，命名参照 `adb`：`push`（本地 → 远程）、`pull`（远程 → 本地）、`copy`（远程 → 远程，`from: { server, path }` / `to: { server, path }`）。每个都接受单个文件、目录（自动识别，整棵目录树落到目标路径，没有 `recursive` 参数）或文件数组。文件发送到目录时保留原名。
+
+从 2.x 迁移：`upload` → `push`，`download` → `pull`，`transfer mode=upload|download` → 去掉 `mode` 和 `recursive` 的 `push` / `pull`，`transfer mode=relay` 的 `sourceServer`/`sourceRemotePath`/`destServer`/`destRemotePath` → `copy` 的 `from` / `to`。
+
 ## relay 分块预取
 
-`transfer` 的 `mode: "relay"` 会以带偏移量的 SFTP 分块读写替代单路流式 pipe：目标端等待写入确认时，源端可提前下载后续分块。默认窗口是 `sftpConcurrency: 64`、`chunkSize: 32768`，应用层分块缓存至多约 2 MiB；可通过这两个参数调节，最大窗口为 64 MiB。文件仍只经过 MCP 进程内存，不写入本机临时文件，结束后继续做大小与可用时的 MD5 校验。
+`copy`（strategy relay）会以带偏移量的 SFTP 分块读写替代单路流式 pipe：目标端等待写入确认时，源端可提前下载后续分块。默认窗口是 `sftpConcurrency: 64`、`chunkSize: 32768`，应用层分块缓存至多约 2 MiB；可通过这两个参数调节，最大窗口为 64 MiB。文件仍只经过 MCP 进程内存，不写入本机临时文件，结束后继续做大小与可用时的 MD5 校验。
 
 ## relay 的 `strategy`（两端直传）
 
-`transfer mode=relay` 支持 `strategy: "relay" | "direct" | "auto"`。`"relay"`（默认）就是上面的分块预取行为，未做任何改动。`"direct"` 会**在源服务器上**执行拷贝（优先 `rsync`，否则 `tar` 通过 `ssh` 管道传输；不支持 `rclone`），使本机 MCP 进程完全不经手文件字节；当源服务器无法直连目标、目标主机指纹尚未在源服务器上被信任、非交互式 `existing-remote-key` 认证不可用，或源服务器上两种 backend 都不可用时，会给出明确失败原因。认证完全依赖源服务器自身已有的信任关系（其默认 SSH 身份 / `known_hosts`）——本工具不会读取、拼装或传输任何私钥，也绝不会传递 `StrictHostKeyChecking=no` 之类的自动信任参数。直传无法穿透 NAT：请确保源到目标可直连，或改用跳板机/overlay 网络，或退回 `strategy: "relay"`。`"auto"` 会带真实超时地探测上述条件（路由、主机指纹、backend 可用性、认证、目标路径策略），可行时使用直传，否则回退到 relay 并报告准确原因。
+`copy` 支持 `strategy: "relay" | "direct" | "auto"`。`"relay"`（默认）就是上面的分块预取行为，未做任何改动。`"direct"` 会**在源服务器上**执行拷贝（优先 `rsync`，否则 `tar` 通过 `ssh` 管道传输；不支持 `rclone`），使本机 MCP 进程完全不经手文件字节；当源服务器无法直连目标、目标主机指纹尚未在源服务器上被信任、非交互式 `existing-remote-key` 认证不可用，或源服务器上两种 backend 都不可用时，会给出明确失败原因。认证完全依赖源服务器自身已有的信任关系（其默认 SSH 身份 / `known_hosts`）——本工具不会读取、拼装或传输任何私钥，也绝不会传递 `StrictHostKeyChecking=no` 之类的自动信任参数。直传无法穿透 NAT：请确保源到目标可直连，或改用跳板机/overlay 网络，或退回 `strategy: "relay"`。`"auto"` 会带真实超时地探测上述条件（路由、主机指纹、backend 可用性、认证、目标路径策略），可行时使用直传，否则回退到 relay 并报告准确原因。
 
 ## tar-before-transfer 与碎文件并发
 
-- `upload`、`download` 以及 `transfer` 的上传/下载模式默认启用 `fast`，即使用 ssh2 `fastPut` / `fastGet`，对所有调用方一致（包括 `workspace-run` 的 push 与 collect）。`fast: false` 是串行兼容模式：同一时刻只有一个请求在途，在有延迟的链路上会慢很多，除非服务器无法处理流水线请求，否则不要设置。
+- `push` 与 `pull` 默认启用 `fast`，即使用 ssh2 `fastPut` / `fastGet`，对所有调用方一致（包括 `workspace-run` 的 push 与 collect）。`fast: false` 是串行兼容模式：同一时刻只有一个请求在途，在有延迟的链路上会慢很多，除非服务器无法处理流水线请求，否则不要设置。
 - **上传的 skip-if-identical（默认开启）**：先 stat 远端文件（不存在或大小不同就上传）；大小相同时并行计算两端 MD5——远端由**服务器上的命令**计算（文件内容不经网络），本地用 Node `crypto`。远端命令按 rclone 的做法每台服务器探测一次：依次尝试 `md5sum`、`md5 -r`、`rclone md5sum`，输出等于空输入 MD5（`d41d8cd98f00b204e9800998ecf8427e`）的第一个被采用，结果（含「没有可用命令」）按服务器缓存。**远端没有可用的哈希命令时直接上传**，绝不为了比较而把远端文件读回本机。`skipIfIdentical: false` 强制上传。递归与批量上传逐文件使用同一判定。
 - **换行与 skip**：「相同」指远端字节等于将要写入的字节（即 CRLF 修正之后）。本地 `.sh` 含 CRLF、远端已是 LF：跳过；远端是 CRLF、本地是 LF：重新上传，远端随之变成 LF。非 shell 脚本不会被改写，CRLF 差异就是真实差异。
 - **同服务器 relay 走服务器自带的复制（`copy-data`）**：源与目标是同一台服务器、`strategy` 为 `relay`（默认）或 `auto`、且该服务器的 SFTP 声明了 `copy-data` 扩展（OpenSSH 9.0 及以上）时，由服务器自己复制，字节不再经本机往返。复制写入目标旁边的新临时文件，按 64 MiB 分块（每块都向 inactivity timeout 报告进度），校验大小与 MD5 后才替换目标；任何失败都会删除临时文件，目标保持原样。这条路径忽略 `connections`。服务器不支持 `copy-data` 时走原有 relay，`vvv: true` 时响应会说明原因。`strategy: "direct"` 不受影响。
@@ -22,7 +26,7 @@
 
 ## 批量上传（`localPath` 传数组）
 
-`upload` 与 `transfer mode=upload` 的 `localPath` 除了单个字符串外，也接受字符串数组，用于一次调用批量上传多个独立文件：
+`push` 的 `localPath` 除了单个字符串外，也接受字符串数组，用于一次调用批量上传多个独立文件：
 
 - 传字符串时行为与之前完全一致（纯文本响应），无任何可观察差异。
 - 传数组时，`remotePath` 必须是目录，每个源文件落到 `remotePath/<basename>`。
@@ -32,11 +36,11 @@
 - `onError` 控制失败处理：默认 `"abort"`——一旦某个文件失败就停止调度新文件，等待已在传输中的文件完成；`"continue"` 则无视之前的失败继续尝试每个文件。两种模式都会返回每个文件的 `uploaded` / `skipped` / `failed` 状态及失败原因。
 - 每个文件仍然复用现有单文件上传逻辑：skip-if-identical、`.sh`/`.bash`/`.zsh` 的 CRLF 修正、`fast`、路径策略校验全部自动继承，不重新实现。
 - 数组入参返回结构化 JSON（`{ results, total, uploadedCount, skippedCount, failedCount, crlfFixedCount }`），而不是单文件时的纯文本结果。
-- 本轮 `archive: true` 不支持与数组 `localPath` 同时使用；`download`/`relay` 暂不支持数组形式的 `localPath`。
+- 本轮 `archive: true` 不支持与数组 `localPath` 同时使用；批量下载用 `pull` 的数组 `remotePath`。
 
 ## 多连接下载（`connections`）
 
-`download` 与 `transfer mode=download` 支持 `connections`（默认 `1`，上限 `8`）。为 `1` 时行为与之前完全一致。大于 `1` 时，文件被切分为相应数量的不重叠字节区间，**每个区间走一条独立的 SSH/TCP 连接**拉取，通过定位写直接写入本地预分配的 temp 文件，校验大小后原子 rename 到目标路径。任一连接失败都会取消其余连接、删除 temp 文件，且从不触碰最终目标路径。
+`pull` 支持 `connections`（默认 `1`，上限 `8`）。为 `1` 时行为与之前完全一致。大于 `1` 时，文件被切分为相应数量的不重叠字节区间，**每个区间走一条独立的 SSH/TCP 连接**拉取，通过定位写直接写入本地预分配的 temp 文件，校验大小后原子 rename 到目标路径。任一连接失败都会取消其余连接、删除 temp 文件，且从不触碰最终目标路径。
 
 关键在于是独立的**连接**，而不是更多的 SFTP channel：同一条 SSH 连接上的所有 channel 共享该连接的流控窗口（ssh2 把它写死为 2 MiB），所以多开 channel 换不来任何东西；多一条连接才多一个窗口。
 
@@ -59,7 +63,7 @@
 
 ## 多连接上传
 
-`upload` 与 `transfer mode=upload` 也接受同样的 `connections`（默认 `1`，上限 `8`）。大于 `1` 时，每个字节区间经各自独立的 SSH/TCP 连接写入目标旁边的**同一个远端临时文件**：只有第 0 条连接负责创建/截断，其余连接打开时不截断。所有区间成功、临时文件大小校验通过后，才替换 `remotePath`——对端声明 `posix-rename@openssh.com` 时（OpenSSH 均支持，已在真实 OpenSSH 上验证）是一次原子改名；否则先删除旧文件再改名，期间 `remotePath` 会短暂不存在。任一连接失败时，临时文件被删除，`remotePath` 保持原内容不变。跳过相同文件与 shell 脚本 CRLF→LF 修正照常生效。
+`push` 也接受同样的 `connections`（默认 `1`，上限 `8`）。大于 `1` 时，每个字节区间经各自独立的 SSH/TCP 连接写入目标旁边的**同一个远端临时文件**：只有第 0 条连接负责创建/截断，其余连接打开时不截断。所有区间成功、临时文件大小校验通过后，才替换 `remotePath`——对端声明 `posix-rename@openssh.com` 时（OpenSSH 均支持，已在真实 OpenSSH 上验证）是一次原子改名；否则先删除旧文件再改名，期间 `remotePath` 会短暂不存在。任一连接失败时，临时文件被删除，`remotePath` 保持原内容不变。跳过相同文件与 shell 脚本 CRLF→LF 修正照常生效。
 
 在 50 ms RTT 下上传 128 MiB 文件的实测结果（每次都在容器内校验 SHA-256，且每次覆盖同一个远端路径）：
 
@@ -74,7 +78,7 @@
 
 ## 多连接中转（relay）
 
-`transfer mode=relay` 在默认的 `strategy: "relay"` 下也接受 `connections`。与 `"direct"`/`"auto"` 组合时会被拒绝，因为那两种是在源服务器上直接拷贝，没有字节区间可分。大于 `1` 时，文件被切成对应数量的字节区间，每个区间走各自的一**对**独立连接：一条连源服务器，一条连目标服务器，两段各自拥有自己的窗口。因此每台服务器上各有 `N` 条连接；源和目标是同一台服务器（self-relay）时总共只开 `N` 条，每条连接上同时开一个读通道和一个写通道。与单连接 relay「原地写入目标文件」不同：多连接时先写到目标旁边的临时文件，校验大小和 md5 通过后，才改名覆盖目标（与多连接上传的替换步骤相同）。任何一步失败，临时文件会被删除，目标保持原内容。
+`copy` 在默认的 `strategy: "relay"` 下也接受 `connections`。与 `"direct"`/`"auto"` 组合时会被拒绝，因为那两种是在源服务器上直接拷贝，没有字节区间可分。大于 `1` 时，文件被切成对应数量的字节区间，每个区间走各自的一**对**独立连接：一条连源服务器，一条连目标服务器，两段各自拥有自己的窗口。因此每台服务器上各有 `N` 条连接；源和目标是同一台服务器（self-relay）时总共只开 `N` 条，每条连接上同时开一个读通道和一个写通道。与单连接 relay「原地写入目标文件」不同：多连接时先写到目标旁边的临时文件，校验大小和 md5 通过后，才改名覆盖目标（与多连接上传的替换步骤相同）。任何一步失败，临时文件会被删除，目标保持原内容。
 
 在两个实验容器之间中转 128 MiB 文件的实测结果（源 → MCP 主机这一段整形为 50 ms / 1 Gbps，每次都在目标容器内校验 SHA-256）：
 

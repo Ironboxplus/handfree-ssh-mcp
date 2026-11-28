@@ -112,7 +112,7 @@ values remain literal. Existing command policies apply to the complete command, 
 `env` on POSIX hosts or `powershell.exe` on Windows. Handfree never relaxes that policy.
 Policies inspect the submitted shell command, not the decoded contents of PowerShell's
 encoded script. They are not an argv-level sandbox for the plugin program.
-SFTP continues to use existing upload/download/transfer tools and path policies.
+SFTP continues to use existing push/pull/copy tools and path policies.
 
 CLI outputs are returned as `{plugin,component,target,connectionName,output}`. Errors
 use existing MCP `isError` / code / message / retriable conventions. Output is limited

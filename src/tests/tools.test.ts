@@ -15,10 +15,10 @@ import {
 } from "../services/ssh-connection-manager.js";
 import { registerCloseConnectionTool } from "../tools/close-connection.js";
 import { registerCommandStatusTool } from "../tools/command-status.js";
-import { registerDownloadTool } from "../tools/download.js";
+import { registerPullTool } from "../tools/pull.js";
 import { registerExecuteCommandTool } from "../tools/execute-command.js";
-import { registerTransferTool } from "../tools/transfer.js";
-import { registerUploadTool } from "../tools/upload.js";
+import { registerCopyTool } from "../tools/copy.js";
+import { registerPushTool } from "../tools/push.js";
 import { formatCommandPolicy } from "../tools/show-whitelist.js";
 import { ToolError } from "../utils/tool-error.js";
 
@@ -557,7 +557,7 @@ describe("MCP tool handlers", () => {
 
     const shape = z.object(schema as z.ZodRawShape);
     // A negative timeout must be rejected at the schema boundary, matching
-    // upload/download/transfer which already use z.number().positive().
+    // push/pull/copy which already use z.number().positive().
     assert.strictEqual(
       shape.safeParse({ cmdString: "pwd", timeout: -1 }).success,
       false,
@@ -576,7 +576,7 @@ describe("MCP tool handlers", () => {
     );
   });
 
-  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on upload", async () => {
+  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on push", async () => {
     const originalResolveServer = manager.resolveServer;
     const originalUpload = manager.transferService.upload;
     const { server, handlers } = captureRegisteredTools();
@@ -589,9 +589,9 @@ describe("MCP tool handlers", () => {
     };
 
     try {
-      registerUploadTool(server as any);
-      const handler = handlers.get("upload");
-      assert.ok(handler, "upload handler should be registered");
+      registerPushTool(server as any);
+      const handler = handlers.get("push");
+      assert.ok(handler, "push handler should be registered");
 
       const result = await handler({
         localPath: "local.txt",
@@ -625,9 +625,10 @@ describe("MCP tool handlers", () => {
     }
   });
 
-  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on download", async () => {
+  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on pull", async () => {
     const originalResolveServer = manager.resolveServer;
     const originalDownload = manager.transferService.download;
+    const originalIsDirectory = manager.transferService.remoteIsDirectoryPath;
     const { server, handlers } = captureRegisteredTools();
     let captured: any;
 
@@ -636,11 +637,12 @@ describe("MCP tool handlers", () => {
       captured = { remotePath, localPath, connectionName, options };
       return "downloaded";
     };
+    manager.transferService.remoteIsDirectoryPath = async () => false;
 
     try {
-      registerDownloadTool(server as any);
-      const handler = handlers.get("download");
-      assert.ok(handler, "download handler should be registered");
+      registerPullTool(server as any);
+      const handler = handlers.get("pull");
+      assert.ok(handler, "pull handler should be registered");
 
       const result = await handler({
         remotePath: "/tmp/remote.txt",
@@ -671,96 +673,11 @@ describe("MCP tool handlers", () => {
     } finally {
       manager.resolveServer = originalResolveServer;
       manager.transferService.download = originalDownload;
+      manager.transferService.remoteIsDirectoryPath = originalIsDirectory;
     }
   });
 
-  it("should forward SFTP reuseConnection, timeout, vvv, and fast options on transfer upload/download modes", async () => {
-    const originalResolveServer = manager.resolveServer;
-    const originalUpload = manager.transferService.upload;
-    const originalDownload = manager.transferService.download;
-    const { server, handlers } = captureRegisteredTools();
-    const captured: any[] = [];
-
-    manager.resolveServer = (name?: string) => name ?? "dev";
-    manager.transferService.upload = async (localPath: string, remotePath: string, connectionName: string, options: any) => {
-      captured.push({ kind: "upload", localPath, remotePath, connectionName, options });
-      return "uploaded";
-    };
-    manager.transferService.download = async (remotePath: string, localPath: string, connectionName: string, options: any) => {
-      captured.push({ kind: "download", remotePath, localPath, connectionName, options });
-      return "downloaded";
-    };
-
-    try {
-      registerTransferTool(server as any);
-      const handler = handlers.get("transfer");
-      assert.ok(handler, "transfer handler should be registered");
-
-      await handler({
-        mode: "upload",
-        localPath: "local.txt",
-        remotePath: "/tmp/local.txt",
-        connectionName: "dev",
-        skipIfIdentical: false,
-        reuseConnection: false,
-        timeout: 123,
-        vvv: true,
-        fast: true,
-        sftpConcurrency: 8,
-        chunkSize: 65536,
-      });
-      await handler({
-        mode: "download",
-        localPath: "remote.txt",
-        remotePath: "/tmp/remote.txt",
-        connectionName: "dev",
-        reuseConnection: false,
-        timeout: 456,
-        vvv: true,
-        fast: true,
-        sftpConcurrency: 4,
-        chunkSize: 131072,
-      });
-
-      assert.deepStrictEqual(captured, [
-        {
-          kind: "upload",
-          localPath: "local.txt",
-          remotePath: "/tmp/local.txt",
-          connectionName: "dev",
-          options: {
-            skipIfIdentical: false,
-            reuseConnection: false,
-            timeout: 123,
-            vvv: true,
-            fast: true,
-            sftpConcurrency: 8,
-            chunkSize: 65536,
-          },
-        },
-        {
-          kind: "download",
-          remotePath: "/tmp/remote.txt",
-          localPath: "remote.txt",
-          connectionName: "dev",
-          options: {
-            reuseConnection: false,
-            timeout: 456,
-            vvv: true,
-            fast: true,
-            sftpConcurrency: 4,
-            chunkSize: 131072,
-          },
-        },
-      ]);
-    } finally {
-      manager.resolveServer = originalResolveServer;
-      manager.transferService.upload = originalUpload;
-      manager.transferService.download = originalDownload;
-    }
-  });
-
-  it("should forward relay prefetch-window options on transfer relay mode", async () => {
+  it("should forward relay prefetch-window options on copy", async () => {
     const originalTransferBetweenServers = manager.transferService.transferBetweenServers;
     const { server, handlers } = captureRegisteredTools();
     let captured: any;
@@ -777,21 +694,17 @@ describe("MCP tool handlers", () => {
     };
 
     try {
-      registerTransferTool(server as any);
-      const handler = handlers.get("transfer");
-      assert.ok(handler, "transfer handler should be registered");
+      registerCopyTool(server as any);
+      const handler = handlers.get("copy");
+      assert.ok(handler, "copy handler should be registered");
 
       const result = await handler({
-        mode: "relay",
-        sourceServer: "src",
-        sourceRemotePath: "/tmp/source.txt",
-        destServer: "dst",
-        destRemotePath: "/tmp/dest.txt",
+        from: { server: "src", path: "/tmp/source.txt" },
+        to: { server: "dst", path: "/tmp/dest.txt" },
         skipIfIdentical: false,
         reuseConnection: false,
         timeout: 123,
         vvv: true,
-        fast: true,
         sftpConcurrency: 2,
         chunkSize: 32768,
       });

@@ -9,8 +9,9 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { computeDownloadByteRanges } from "../services/transfer-service.js";
-import { registerDownloadTool } from "../tools/download.js";
-import { registerTransferTool } from "../tools/transfer.js";
+import { registerPushTool } from "../tools/push.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
 import { RealSshTestServer } from "./helpers/real-ssh-server.js";
 
 /**
@@ -103,8 +104,9 @@ describe("multi-connection download real execution", { concurrency: false }, () 
         keepaliveInterval: 0,
       },
     }, ["multiconn"]);
-    registerDownloadTool(mcpServer);
-    registerTransferTool(mcpServer);
+    registerPushTool(mcpServer);
+    registerPullTool(mcpServer);
+    registerCopyTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
     await mcpClient.connect(clientTransport);
@@ -176,7 +178,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     const localPath = path.join(localRoot, "big-non-round.bin");
 
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
@@ -194,8 +196,8 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     const localPath = path.join(localRoot, "via-transfer-tool.bin");
 
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: { mode: "download", connectionName: "multiconn", remotePath, localPath, connections: 3, timeout: 10000 },
+      name: "pull",
+      arguments: { connectionName: "multiconn", remotePath, localPath, connections: 3, timeout: 10000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     assert.match(responseText(result), /via 3 independent connection\(s\)/);
@@ -214,7 +216,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     server.resetConnectionCount();
     server.resetReadLog();
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { remotePath, localPath, connectionName: "multiconn", connections: 8, timeout: 10000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
@@ -246,7 +248,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     server.resetConnectionCount();
     server.resetReadLog();
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
@@ -276,7 +278,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     manager.disconnect();
     server.resetConnectionCount();
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
@@ -305,7 +307,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
       server.resetConnectionCount();
       const startedAt = Date.now();
       const result = await mcpClient.callTool({
-        name: "download",
+        name: "pull",
         arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
       });
       const elapsed = Date.now() - startedAt;
@@ -353,7 +355,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     try {
       server.resetConnectionCount();
       const result = await mcpClient.callTool({
-        name: "download",
+        name: "pull",
         arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
       });
       assert.equal(result.isError, true, "a failed handshake must fail the download");
@@ -377,7 +379,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
 
     server.resetConnectionCount();
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       // reuseConnection:false so a connection possibly cached by an earlier
       // test in this file cannot make this assertion pass by accident (0
       // NEW connections opened because one was already cached).
@@ -397,7 +399,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
 
     server.resetReadLog();
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
@@ -424,7 +426,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     server.setConnectionReadDelaysMs([40, 0]);
     try {
       const result = await mcpClient.callTool({
-        name: "download",
+        name: "pull",
         arguments: { remotePath, localPath, connectionName: "multiconn", connections: 2, timeout: 10000 },
       });
       assert.equal(result.isError, undefined, responseText(result));
@@ -455,7 +457,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     server.injectReadFailureAfter(4);
     try {
       const result = await mcpClient.callTool({
-        name: "download",
+        name: "pull",
         arguments: { remotePath, localPath, connectionName: "multiconn", connections: 4, timeout: 10000 },
       });
       assert.equal(result.isError, true, "expected the injected READ failure to fail the download");
@@ -479,7 +481,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     fs.writeFileSync(recoverySourcePath, randomBytes(4096));
     const recoveryLocalPath = path.join(destDir, "after-failure-recovery.bin");
     const recoveryResult = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { remotePath: recoveryRemotePath, localPath: recoveryLocalPath, connectionName: "multiconn", timeout: 10000 },
     });
     assert.equal(recoveryResult.isError, undefined, responseText(recoveryResult));
@@ -515,7 +517,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     server.injectReadFailureForConnectionIndex([0]);
     try {
       const result = await mcpClient.callTool({
-        name: "download",
+        name: "pull",
         arguments: { remotePath, localPath, connectionName: "multiconn", connections: 2, timeout: 10000 },
       });
       assert.equal(result.isError, true, "expected the injected per-connection failure to fail the download");
@@ -551,7 +553,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
 
     server.resetConnectionCount();
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { remotePath, localPath, connectionName: "multiconn", connections: 9, timeout: 5000 },
     });
     assert.equal(result.isError, true);
@@ -582,7 +584,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
       await assert.rejects(
         () =>
           mcpClient.callTool({
-            name: "download",
+            name: "pull",
             arguments: { remotePath, localPath, connectionName: "multiconn", connections: invalid, timeout: 5000 },
           }),
         `connections=${invalid} should be rejected`,
@@ -592,38 +594,31 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     assert.equal(server.stats.connectionCount, 0, "an invalid connections value must not open any connection");
   });
 
-  test("black-box: the transfer tool rejects connections for relay strategy=direct, recursive=true, and archive=true", async () => {
-    // mode=upload (P1-04f) and mode=relay with the default strategy (P1-06)
-    // accept connections; a direct relay runs on the source server and has
-    // no byte ranges to split, so it still rejects it.
+  test("black-box: connections is rejected for copy strategy=direct, a remote directory, and archive=true", async () => {
+    // push (P1-04f) and copy with the default strategy (P1-06) accept
+    // connections; a direct copy runs on the source server and has no byte
+    // ranges to split, so it still rejects it.
     const relayResult = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay",
-        sourceServer: "multiconn",
-        sourceRemotePath: "/relay-source.bin",
-        destServer: "multiconn",
-        destRemotePath: "/relay-dest.bin",
-        strategy: "direct",
-        connections: 4,
-      },
+      name: "copy",
+      arguments: { from: { server: "multiconn", path: "/relay-source.bin" }, to: { server: "multiconn", path: "/relay-dest.bin" }, strategy: "direct", connections: 4 },
     });
     assert.equal(relayResult.isError, true);
     assert.match(responseText(relayResult), /connections is only supported with strategy=/);
 
     const remoteDir = "/reject-recursive-dir";
+    fs.mkdirSync(server.toLocalPath(remoteDir), { recursive: true });
     const recursiveResult = await mcpClient.callTool({
-      name: "transfer",
-      arguments: { mode: "download", connectionName: "multiconn", localPath: path.join(localRoot, "reject-recursive"), remotePath: remoteDir, recursive: true, connections: 4 },
+      name: "pull",
+      arguments: { connectionName: "multiconn", localPath: path.join(localRoot, "reject-recursive"), remotePath: remoteDir, connections: 4 },
     });
     assert.equal(recursiveResult.isError, true);
-    assert.match(responseText(recursiveResult), /connections is not supported with recursive=true/);
+    assert.match(responseText(recursiveResult), /connections applies to a single file; this path is a directory/);
 
     const remotePath = "/reject-archive.bin";
     fs.writeFileSync(server.toLocalPath(remotePath), Buffer.from("irrelevant"));
     const archiveResult = await mcpClient.callTool({
-      name: "transfer",
-      arguments: { mode: "download", connectionName: "multiconn", localPath: path.join(localRoot, "reject-archive.bin"), remotePath, archive: true, connections: 4 },
+      name: "pull",
+      arguments: { connectionName: "multiconn", localPath: path.join(localRoot, "reject-archive.bin"), remotePath, archive: true, connections: 4 },
     });
     assert.equal(archiveResult.isError, true);
     assert.match(responseText(archiveResult), /connections is not supported with archive=true/);
@@ -636,7 +631,7 @@ describe("multi-connection download real execution", { concurrency: false }, () 
     const localPath = path.join(localRoot, "default-path-unchanged.bin");
 
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { remotePath, localPath, connectionName: "multiconn", timeout: 5000 },
     });
     assert.equal(result.isError, undefined, responseText(result));

@@ -132,7 +132,7 @@ servers:
 |---|---|
 | 发现 | `list-servers`、`show-whitelist`、`help` |
 | 执行 | `execute-command`（后台流式执行，用 `command-status` 轮询）、`close-connection` |
-| 传输 | `upload`、`download`、`transfer`（上传 / 下载 / 中转，递归、批量、打包） |
+| 传输 | `push`、`pull`、`copy`（本地→远程、远程→本地、远程→远程；自动识别目录，批量、打包） |
 | 运行 | `workspace-run`、`run-status`、`run-logs`、`run-list`、`run-cancel`、`run-retry` |
 
 全部参数见 [docs/tools.md](docs/tools.md)（英文）。
@@ -179,7 +179,7 @@ servers:
 
 - [配置](docs/configuration.md)（英文）：YAML 参考、命令与 SFTP 策略、跳板机、连接生命周期、命令行参数
 - [工具](docs/tools.md)（英文）：全部工具与参数
-- [文件传输](docs/zh/transfer.md)：分块预取、直传、打包、批量上传、多连接
+- [文件传输](docs/zh/transfer.md)：push / pull / copy、分块预取、直传、打包、批量、多连接
 - [workspace-run](docs/zh/workspace-run.md)：远程运行流水线、状态、取消与重试
 
 ## 贡献者

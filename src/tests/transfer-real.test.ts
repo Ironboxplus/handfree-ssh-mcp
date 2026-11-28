@@ -8,7 +8,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSHConnectionManager, buildLocalTarArgv, type ArchiveCompression } from "../services/ssh-connection-manager.js";
-import { registerTransferTool } from "../tools/transfer.js";
+import { registerPushTool } from "../tools/push.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
 import { RealSshTestServer } from "./helpers/real-ssh-server.js";
 
 type TreeSnapshot = Record<string, { kind: "directory" } | { kind: "file"; size: number; sha256: string }>;
@@ -118,7 +120,9 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
         keepaliveInterval: 0,
       },
     }, ["source", "destination"]);
-    registerTransferTool(mcpServer);
+    registerPushTool(mcpServer);
+    registerPullTool(mcpServer);
+    registerCopyTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
     await mcpClient.connect(clientTransport);
@@ -297,16 +301,8 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     const input = path.join(localRoot, "upload ' source");
     writeFixtureTree(input, 8);
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "upload",
-        connectionName: "destination",
-        localPath: input,
-        remotePath: "/archive-upload",
-        archive: true,
-        archiveCompression: "gzip",
-        timeout: 5000,
-      },
+      name: "push",
+      arguments: { connectionName: "destination", localPath: input, remotePath: "/archive-upload", archive: true, archiveCompression: "gzip", timeout: 5000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     assert.match(responseText(result), /Archive upload complete \(gzip\)/);
@@ -319,16 +315,8 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     writeFixtureTree(remoteInput, 7);
     const output = path.join(localRoot, "archive-download-output");
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "download",
-        connectionName: "source",
-        remotePath: "/archive-download/source-tree",
-        localPath: output,
-        archive: true,
-        archiveCompression: "xz",
-        timeout: 5000,
-      },
+      name: "pull",
+      arguments: { connectionName: "source", remotePath: "/archive-download/source-tree", localPath: output, archive: true, archiveCompression: "xz", timeout: 5000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     assert.match(responseText(result), /Archive download complete \(xz\)/);
@@ -340,19 +328,8 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     const remoteInput = sourceServer.toLocalPath("/relay-input/relay-tree");
     writeFixtureTree(remoteInput, 9);
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay",
-        sourceServer: "source",
-        sourceRemotePath: "/relay-input/relay-tree",
-        destServer: "destination",
-        destRemotePath: "/relay-output",
-        archive: true,
-        archiveCompression: "none",
-        sftpConcurrency: 8,
-        chunkSize: 8192,
-        timeout: 5000,
-      },
+      name: "copy",
+      arguments: { from: { server: "source", path: "/relay-input/relay-tree" }, to: { server: "destination", path: "/relay-output" }, archive: true, archiveCompression: "none", sftpConcurrency: 8, chunkSize: 8192, timeout: 5000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     assert.match(responseText(result), /Archive relay complete \(none\)/);
@@ -366,35 +343,18 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     writeFixtureTree(input, 32);
     fs.mkdirSync(destinationServer.toLocalPath("/many-small"), { recursive: true });
     const uploadResult = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "upload",
-        connectionName: "destination",
-        localPath: input,
-        remotePath: "/many-small/uploaded",
-        recursive: true,
-        fileConcurrency: 6,
-        skipIfIdentical: false,
-        timeout: 5000,
-      },
+      name: "push",
+      arguments: { connectionName: "destination", localPath: input, remotePath: "/many-small/uploaded", fileConcurrency: 6, skipIfIdentical: false, timeout: 5000 },
     });
     assert.equal(uploadResult.isError, undefined, responseText(uploadResult));
-    assert.match(responseText(uploadResult), /Recursive upload complete/);
+    assert.match(responseText(uploadResult), /Directory push complete/);
     assert.ok(destinationServer.stats.maxActiveWrites >= 2, `observed max active writes: ${destinationServer.stats.maxActiveWrites}`);
     assertTreeEqual(destinationServer.toLocalPath("/many-small/uploaded"), input);
 
     const output = path.join(localRoot, "many-small-downloaded");
     const downloadResult = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "download",
-        connectionName: "destination",
-        remotePath: "/many-small/uploaded",
-        localPath: output,
-        recursive: true,
-        fileConcurrency: 5,
-        timeout: 5000,
-      },
+      name: "pull",
+      arguments: { connectionName: "destination", remotePath: "/many-small/uploaded", localPath: output, fileConcurrency: 5, timeout: 5000 },
     });
     assert.equal(downloadResult.isError, undefined, responseText(downloadResult));
     assertTreeEqual(output, input);
@@ -405,15 +365,8 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     fs.writeFileSync(input, Buffer.alloc(512 * 1024, 0x5a));
     fs.mkdirSync(destinationServer.toLocalPath("/single"), { recursive: true });
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "upload",
-        connectionName: "destination",
-        localPath: input,
-        remotePath: "/single/fast-default.bin",
-        skipIfIdentical: false,
-        timeout: 5000,
-      },
+      name: "push",
+      arguments: { connectionName: "destination", localPath: input, remotePath: "/single/fast-default.bin", skipIfIdentical: false, timeout: 5000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     assert.match(responseText(result), /via fast SFTP/);
@@ -427,15 +380,8 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     const input = path.join(localRoot, "invalid-concurrency-input");
     writeFixtureTree(input, 2);
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "upload",
-        connectionName: "destination",
-        localPath: input,
-        remotePath: "/must-not-be-created",
-        recursive: true,
-        fileConcurrency: 65,
-      },
+      name: "push",
+      arguments: { connectionName: "destination", localPath: input, remotePath: "/must-not-be-created", fileConcurrency: 65 },
     });
     assert.equal(result.isError, true);
     assert.match(responseText(result), /fileConcurrency.*(?:maximum|exceed).*64/i);
@@ -455,17 +401,8 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     // one left over from before). See G2.
     destinationServer.resetChannelPeak();
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "upload",
-        connectionName: "destination",
-        localPath: input,
-        remotePath: "/cap-concurrency",
-        recursive: true,
-        fileConcurrency: 8,
-        skipIfIdentical: false,
-        timeout: 5000,
-      },
+      name: "push",
+      arguments: { connectionName: "destination", localPath: input, remotePath: "/cap-concurrency", fileConcurrency: 8, skipIfIdentical: false, timeout: 5000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     assertTreeEqual(destinationServer.toLocalPath("/cap-concurrency"), input);
@@ -483,14 +420,8 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
 
   test("black-box MCP: archiveCompression without archive is rejected before transfer", async () => {
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "upload",
-        connectionName: "destination",
-        localPath: path.join(localRoot, "does-not-matter"),
-        remotePath: "/does-not-matter",
-        archiveCompression: "gzip",
-      },
+      name: "push",
+      arguments: { connectionName: "destination", localPath: path.join(localRoot, "does-not-matter"), remotePath: "/does-not-matter", archiveCompression: "gzip" },
     });
     assert.equal(result.isError, true);
     assert.match(responseText(result), /archiveCompression requires archive=true/);
@@ -511,16 +442,8 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     writeFixtureTree(input, 3);
     const before = newTmpWorkspaces();
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "upload",
-        connectionName: "destination",
-        localPath: input,
-        remotePath: "/archive-upload-fail-target",
-        archive: true,
-        archiveCompression: "none",
-        timeout: 5000,
-      },
+      name: "push",
+      arguments: { connectionName: "destination", localPath: input, remotePath: "/archive-upload-fail-target", archive: true, archiveCompression: "none", timeout: 5000 },
     });
     assert.equal(result.isError, true, "expected the conflicting remote path to fail mkdir");
     const after = newTmpWorkspaces();

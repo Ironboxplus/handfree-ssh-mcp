@@ -8,7 +8,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
-import { registerTransferTool } from "../tools/transfer.js";
+import { registerPushTool } from "../tools/push.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
 import { RealSshTestServer } from "./helpers/real-ssh-server.js";
 
 /**
@@ -62,10 +64,12 @@ describe("multi-connection relay real execution", { concurrency: false }, () => 
   const mcpServer = new McpServer({ name: "multiconn-relay-test", version: "1.0.0" });
   const mcpClient = new Client({ name: "multiconn-relay-client", version: "1.0.0" });
 
-  const relay = (args: Record<string, unknown>) =>
+  // Old call sites pass sourceRemotePath/destRemotePath (and sourceServer/
+  // destServer overrides); they are mapped onto copy's from/to here.
+  const relay = ({ sourceServer = "src", sourceRemotePath, destServer = "dst", destRemotePath, ...args }: Record<string, unknown>) =>
     mcpClient.callTool({
-      name: "transfer",
-      arguments: { mode: "relay", sourceServer: "src", destServer: "dst", timeout: 10000, ...args },
+      name: "copy",
+      arguments: { from: { server: sourceServer, path: sourceRemotePath }, to: { server: destServer, path: destRemotePath }, timeout: 10000, ...args },
     });
   const seedSource = (remotePath: string, data: Buffer): void => {
     fs.writeFileSync(source.toLocalPath(remotePath), data);
@@ -92,7 +96,9 @@ describe("multi-connection relay real execution", { concurrency: false }, () => 
       src: { ...common, port: source.port },
       dst: { ...common, port: dest.port },
     }, ["src", "dst"]);
-    registerTransferTool(mcpServer);
+    registerPushTool(mcpServer);
+    registerPullTool(mcpServer);
+    registerCopyTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
     await mcpClient.connect(clientTransport);
@@ -247,11 +253,8 @@ describe("multi-connection relay real execution", { concurrency: false }, () => 
     manager.disconnect();
     source.resetConnectionCount();
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay", sourceServer: "src", destServer: "src",
-        sourceRemotePath: "/self-in.bin", destRemotePath: "/self-out.bin", connections: 3, timeout: 10000,
-      },
+      name: "copy",
+      arguments: { from: { server: "src", path: "/self-in.bin" }, to: { server: "src", path: "/self-out.bin" }, connections: 3, timeout: 10000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     assert.equal(sha256(fs.readFileSync(source.toLocalPath("/self-out.bin"))), sha256(data));

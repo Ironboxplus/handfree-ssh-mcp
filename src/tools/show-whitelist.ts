@@ -121,16 +121,16 @@ export function registerShowWhitelistTool(server: McpServer): void {
         output += `Host: ${config.username}@${config.host}:${config.port}\n\n`;
         output += formatCommandPolicy(config);
 
-        // SFTP path policy (upload / download / transfer tools only)
+        // SFTP path policy (push / pull / copy tools only)
         const allowedRemoteDirs = config.allowedRemoteDirectories ?? [];
         const allowedLocalDirs = config.allowedLocalDirectories ?? [];
         const mcpCwd = process.cwd();
 
-        output += `## 📂 SFTP Path Policy (upload / download / transfer)\n\n`;
+        output += `## 📂 SFTP Path Policy (push / pull / copy)\n\n`;
 
         if (config.disableSftpPathPolicy) {
           output += `**\`disableSftpPathPolicy\` is set — all path containment checks below are bypassed.** ` +
-            `Any absolute remote path and any local path is allowed for upload/download/transfer.\n\n`;
+            `Any absolute remote path and any local path is allowed for push/pull/copy.\n\n`;
         }
 
         // ----- Remote directories -----
@@ -153,7 +153,7 @@ export function registerShowWhitelistTool(server: McpServer): void {
         } else {
           if (allowedLocalDirs.length === 0) {
             output += `\`allowedLocalDirectories\` is not configured, so **any local path is allowed**. ` +
-              `To restrict the local side of upload/download, add absolute host paths under \`allowedLocalDirectories\`.\n\n`;
+              `To restrict the local side of push/pull, add absolute host paths under \`allowedLocalDirectories\`.\n\n`;
           } else {
             output += `Always allowed with an allowlist: \`${mcpCwd}\` _(the MCP working directory)_\n\n`;
             output += `Additional entries (${allowedLocalDirs.length}):\n\n`;

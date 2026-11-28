@@ -8,8 +8,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
-import { registerUploadTool } from "../tools/upload.js";
-import { registerTransferTool } from "../tools/transfer.js";
+import { registerPushTool } from "../tools/push.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
 import { RealSshTestServer } from "./helpers/real-ssh-server.js";
 
 /**
@@ -80,7 +81,7 @@ describe("multi-connection upload real execution", { concurrency: false }, () =>
     return localPath;
   };
   const upload = (args: Record<string, unknown>) =>
-    mcpClient.callTool({ name: "upload", arguments: { connectionName: "multiconn", timeout: 10000, ...args } });
+    mcpClient.callTool({ name: "push", arguments: { connectionName: "multiconn", timeout: 10000, ...args } });
   const waitForNoLiveConnections = async () => {
     const deadline = Date.now() + 3000;
     while (server.liveConnectionCount > 0 && Date.now() < deadline) {
@@ -100,8 +101,9 @@ describe("multi-connection upload real execution", { concurrency: false }, () =>
         keepaliveInterval: 0,
       },
     }, ["multiconn"]);
-    registerUploadTool(mcpServer);
-    registerTransferTool(mcpServer);
+    registerPushTool(mcpServer);
+    registerPullTool(mcpServer);
+    registerCopyTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
     await mcpClient.connect(clientTransport);
@@ -125,19 +127,6 @@ describe("multi-connection upload real execution", { concurrency: false }, () =>
     assert.match(responseText(result), /via 4 independent connection\(s\)/);
     assert.equal(sha256(fs.readFileSync(server.toLocalPath("/big-non-round.bin"))), sha256(data));
     assert.deepEqual(remoteTempLeftovers(serverRoot), []);
-  });
-
-  test("black-box: transfer mode=upload accepts connections too", async () => {
-    const data = randomBytes(500_003);
-    const localPath = writeLocal("via-transfer.bin", data);
-
-    const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: { mode: "upload", connectionName: "multiconn", localPath, remotePath: "/via-transfer.bin", connections: 3, timeout: 10000 },
-    });
-    assert.equal(result.isError, undefined, responseText(result));
-    assert.match(responseText(result), /via 3 independent connection\(s\)/);
-    assert.equal(sha256(fs.readFileSync(server.toLocalPath("/via-transfer.bin"))), sha256(data));
   });
 
   test("black-box: an existing different target is replaced, and no temp file is left behind", async () => {
@@ -287,17 +276,17 @@ describe("multi-connection upload real execution", { concurrency: false }, () =>
     assert.equal(fs.existsSync(server.toLocalPath("/invalid.bin")), false);
   });
 
-  test("black-box: connections is rejected for batch, recursive and archive uploads", async () => {
+  test("black-box: connections is rejected for batch, directory and archive uploads", async () => {
     const localPath = writeLocal("shape.bin", randomBytes(1000));
     const batch = await upload({ localPath: [localPath], remotePath: "/shape-dir", connections: 2 });
     assert.equal(batch.isError, true);
     assert.match(responseText(batch), /connections/);
 
-    for (const extra of [{ recursive: true }, { archive: true }]) {
-      const result = await mcpClient.callTool({
-        name: "transfer",
-        arguments: { mode: "upload", connectionName: "multiconn", localPath, remotePath: "/shape.bin", connections: 2, ...extra },
-      });
+    const directory = path.join(localRoot, "shape-tree");
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "inside.bin"), randomBytes(100));
+    for (const extra of [{ localPath: directory }, { localPath, archive: true }]) {
+      const result = await upload({ remotePath: "/shape.bin", connections: 2, ...extra });
       assert.equal(result.isError, true, `connections with ${JSON.stringify(extra)} must be rejected`);
       assert.match(responseText(result), /connections/);
     }

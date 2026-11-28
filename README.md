@@ -39,7 +39,7 @@ Per-server blacklist or whitelist policy, background streaming with polling, ful
 <td width="33%" valign="top">
 <img src="images/icons/transfer.svg" width="32" alt=""><br>
 <b>Transfer</b><br>
-Multi-connection upload / download / relay, direct A→B copy, batch and recursive transfers, atomic replace.
+adb-style `push` / `pull` / `copy`: directories detected, multi-connection transfers, direct A→B copy, batch transfers, atomic replace.
 </td>
 </tr>
 <tr>
@@ -132,7 +132,7 @@ That's it — ask your agent to check the logs on `dev`, deploy to `prod`, or tr
 |---|---|
 | Discover | `list-servers`, `show-whitelist`, `help` |
 | Execute | `execute-command` (streams in the background; poll with `command-status`), `close-connection` |
-| Transfer | `sftp-list` (directory browsing with pagination, filtering and sorting), `sftp-manage` (rename and confirmed deletion), `upload`, `download`, `transfer` (upload / download / relay, recursive, batch, archive) |
+| Transfer | `sftp-list` (directory browsing with pagination, filtering and sorting), `sftp-manage` (rename and confirmed deletion), `push`, `pull`, `copy` (local → remote, remote → local, remote → remote; directories detected, batch, archive) |
 | Run | `workspace-run`, `run-status`, `run-logs`, `run-list`, `run-cancel`, `run-retry` |
 
 Every parameter is documented in [docs/tools.md](docs/tools.md).
@@ -179,7 +179,7 @@ Details: [docs/configuration.md](docs/configuration.md#security-note-command-pol
 
 - [Configuration](docs/configuration.md) — YAML reference, command & SFTP policy, jump hosts, connection lifecycle, CLI options
 - [Tools](docs/tools.md) — every tool and parameter
-- [Transfers](docs/transfer.md) — skip-if-identical, archive mode, batch upload, multi-connection, direct copy
+- [Transfers](docs/transfer.md) — push / pull / copy, skip-if-identical, archive mode, batch, multi-connection, direct copy
 - [workspace-run](docs/workspace-run.md) — remote runner pipeline, state, cancel and retry
 
 ## Contributors

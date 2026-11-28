@@ -151,7 +151,7 @@ export function checkMarkdownSections(text: string, requiredHeadings: string[]):
 export const SHOW_WHITELIST_REQUIRED_HEADINGS = [
   "## Command Policy",
   "## Allowed Commands (Whitelist)",
-  "## 📂 SFTP Path Policy (upload / download / transfer)",
+  "## 📂 SFTP Path Policy (push / pull / copy)",
   "### Allowed remote directories",
   "### Allowed local directories",
   "### Matching rules",
@@ -166,9 +166,9 @@ export const HELP_OVERVIEW_REQUIRED_LINES = [
   "show-whitelist",
   "close-connection",
   "command-status",
-  "upload",
-  "download",
-  "transfer",
+  "push",
+  "pull",
+  "copy",
   "help",
   "Quick start:",
 ];

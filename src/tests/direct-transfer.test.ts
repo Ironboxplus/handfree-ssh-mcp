@@ -11,7 +11,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
-import { registerTransferTool } from "../tools/transfer.js";
+import { registerPushTool } from "../tools/push.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
 import {
   shellQuotePosix,
   buildDirectRsyncCommand,
@@ -345,7 +347,9 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
       },
       ["source", "source-untrusted", "source-trusted", "destination", "destination-restricted", "destination-unreachable"],
     );
-    registerTransferTool(mcpServer);
+    registerPushTool(mcpServer);
+    registerPullTool(mcpServer);
+    registerCopyTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
     await mcpClient.connect(clientTransport);
@@ -370,12 +374,8 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
     fs.writeFileSync(remoteInput, "unchanged relay behavior\n", "utf8");
     fs.mkdirSync(destinationServer.toLocalPath("/unchanged"), { recursive: true });
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay", sourceServer: "source", sourceRemotePath: "/unchanged/input.txt",
-        destServer: "destination", destRemotePath: "/unchanged/output.txt",
-        skipIfIdentical: false, timeout: 5000,
-      },
+      name: "copy",
+      arguments: { from: { server: "source", path: "/unchanged/input.txt" }, to: { server: "destination", path: "/unchanged/output.txt" }, skipIfIdentical: false, timeout: 5000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     assert.match(responseText(result), /^Transfer complete \(windowed via SFTP, verified: size=\d+ bytes/);
@@ -392,12 +392,8 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
     const sourceExecBefore = sourceServer.stats.execCommandCount;
     const destExecBefore = destinationServer.stats.execCommandCount;
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay", sourceServer: "source", sourceRemotePath: "/whatever/file.txt",
-        destServer: "destination-restricted", destRemotePath: "/not-allowed/file.txt",
-        strategy: "direct", timeout: 5000,
-      },
+      name: "copy",
+      arguments: { from: { server: "source", path: "/whatever/file.txt" }, to: { server: "destination-restricted", path: "/not-allowed/file.txt" }, strategy: "direct", timeout: 5000 },
     });
     assert.equal(result.isError, true);
     assert.match(responseText(result), /not inside any allowedRemoteDirectories|allowedRemoteDirectories/i);
@@ -407,12 +403,8 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
 
   test("black-box MCP: strategy=direct fails explicitly (not silently) when the destination host key is not pinned on the source, and never claims to auto-accept it", async () => {
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay", sourceServer: "source-untrusted", sourceRemotePath: "/anything/in.txt",
-        destServer: "destination", destRemotePath: "/anything/out.txt",
-        strategy: "direct", timeout: 8000,
-      },
+      name: "copy",
+      arguments: { from: { server: "source-untrusted", path: "/anything/in.txt" }, to: { server: "destination", path: "/anything/out.txt" }, strategy: "direct", timeout: 8000 },
     });
     assert.equal(result.isError, true);
     const text = responseText(result);
@@ -423,12 +415,8 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
 
   test("black-box MCP: strategy=direct fails explicitly, without claiming NAT traversal, when the destination is genuinely unreachable from the source", async () => {
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay", sourceServer: "source-trusted", sourceRemotePath: "/anything/in.txt",
-        destServer: "destination-unreachable", destRemotePath: "/anything/out.txt",
-        strategy: "direct", timeout: 8000,
-      },
+      name: "copy",
+      arguments: { from: { server: "source-trusted", path: "/anything/in.txt" }, to: { server: "destination-unreachable", path: "/anything/out.txt" }, strategy: "direct", timeout: 8000 },
     });
     assert.equal(result.isError, true);
     const text = responseText(result);
@@ -443,12 +431,8 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
     fs.mkdirSync(destinationServer.toLocalPath("/auto-fallback"), { recursive: true });
 
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay", sourceServer: "source-untrusted", sourceRemotePath: "/auto-fallback/input.txt",
-        destServer: "destination", destRemotePath: "/auto-fallback/output.txt",
-        strategy: "auto", skipIfIdentical: false, timeout: 8000,
-      },
+      name: "copy",
+      arguments: { from: { server: "source-untrusted", path: "/auto-fallback/input.txt" }, to: { server: "destination", path: "/auto-fallback/output.txt" }, strategy: "auto", skipIfIdentical: false, timeout: 8000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     const text = responseText(result);
@@ -475,12 +459,8 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
     const destReadsBefore = destinationServer.stats.readRequests.length;
 
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay", sourceServer: "source-trusted", sourceRemotePath: "/direct-copy/input.bin",
-        destServer: "destination", destRemotePath: "/direct-copy/output.bin",
-        strategy: "direct", timeout: 15000,
-      },
+      name: "copy",
+      arguments: { from: { server: "source-trusted", path: "/direct-copy/input.bin" }, to: { server: "destination", path: "/direct-copy/output.bin" }, strategy: "direct", timeout: 15000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     assert.match(responseText(result), /Direct transfer complete \(tar-ssh/);
@@ -504,12 +484,8 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
     // a real SFTP file on the destination.
     const destOpenedBeforeRelay = destinationServer.stats.openedFiles;
     const relayResult = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay", sourceServer: "source-trusted", sourceRemotePath: "/direct-copy/input.bin",
-        destServer: "destination", destRemotePath: "/direct-copy/output-via-relay.bin",
-        timeout: 15000,
-      },
+      name: "copy",
+      arguments: { from: { server: "source-trusted", path: "/direct-copy/input.bin" }, to: { server: "destination", path: "/direct-copy/output-via-relay.bin" }, timeout: 15000 },
     });
     assert.equal(relayResult.isError, undefined, responseText(relayResult));
     assert.match(responseText(relayResult), /Transfer complete \(windowed via SFTP/);
@@ -528,12 +504,8 @@ describe("direct-transfer: real fixture acceptance (relay vs. direct, strategy=a
 
     const destOpenedBefore = destinationServer.stats.openedFiles;
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "relay", sourceServer: "source-trusted", sourceRemotePath: "/auto-direct/input.txt",
-        destServer: "destination", destRemotePath: "/auto-direct/output.txt",
-        strategy: "auto", timeout: 15000,
-      },
+      name: "copy",
+      arguments: { from: { server: "source-trusted", path: "/auto-direct/input.txt" }, to: { server: "destination", path: "/auto-direct/output.txt" }, strategy: "auto", timeout: 15000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     const text = responseText(result);

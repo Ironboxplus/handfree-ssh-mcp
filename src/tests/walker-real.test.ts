@@ -9,7 +9,9 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { flattenRemoteDirTree, type RemoteDirNode } from "../services/transfer-service.js";
-import { registerTransferTool } from "../tools/transfer.js";
+import { registerPushTool } from "../tools/push.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
 import { RealSshTestServer } from "./helpers/real-ssh-server.js";
 
 function sleep(ms: number): Promise<void> {
@@ -130,7 +132,9 @@ describe("P1-03 walker slice (§2.3 F5): bounded-concurrent remote directory dis
         keepaliveInterval: 0,
       },
     }, ["fast", "slow"]);
-    registerTransferTool(mcpServer);
+    registerPushTool(mcpServer);
+    registerPullTool(mcpServer);
+    registerCopyTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
     await mcpClient.connect(clientTransport);
@@ -246,16 +250,8 @@ describe("P1-03 walker slice (§2.3 F5): bounded-concurrent remote directory dis
 
     const output = path.join(localRoot, "black-box-output");
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "download",
-        connectionName: "fast",
-        remotePath: "/walker-tree",
-        localPath: output,
-        recursive: true,
-        fileConcurrency: 4,
-        timeout: 5000,
-      },
+      name: "pull",
+      arguments: { connectionName: "fast", remotePath: "/walker-tree", localPath: output, fileConcurrency: 4, timeout: 5000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     const parsed = JSON.parse(responseText(result)) as { summary: string; files: string[] };
@@ -270,7 +266,7 @@ describe("P1-03 walker slice (§2.3 F5): bounded-concurrent remote directory dis
     // `readdir` happened to finish first.
     const actualOrder = parsed.files.map((absolute) => path.relative(output, absolute).split(path.sep).join("/"));
     assert.deepEqual(actualOrder, expectedOrder);
-    assert.equal(parsed.summary, `Recursive download complete. ${expectedOrder.length} file(s) transferred.`);
+    assert.equal(parsed.summary, `Directory pull complete. ${expectedOrder.length} file(s) transferred.`);
 
     // Every discovered directory got a real local mkdir, including the empty
     // one and the directory that itself contains only directories.

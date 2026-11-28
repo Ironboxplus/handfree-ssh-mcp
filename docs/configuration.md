@@ -60,7 +60,7 @@ servers:
     # Safe directory for destructive commands (rm, etc.)
     safeDirectory: /home/user   # rm allowed only within this path
 
-    # SFTP path policy — applies to upload / download / transfer / sftp-list / sftp-manage.
+    # SFTP path policy — applies to push / pull / copy / sftp-list / sftp-manage.
     # execute-command is NOT affected by these lists.
     # Default is OPEN: with `allowedRemoteDirectories` unset/empty, any absolute
     # remote path is allowed (POSIX, or a Windows drive path such as C:\data).
@@ -111,8 +111,8 @@ runProfiles:
 
 | Field | Scope | Default behavior |
 |---|---|---|
-| `allowedRemoteDirectories` | `upload` / `download` / `transfer` / `sftp-list` / `sftp-manage` | **Unset/empty = open.** Any absolute remote path is allowed. Configuring this list opts into restricting SFTP to those directories. |
-| `allowedLocalDirectories` | `upload` / `download` only | **Unset/empty = open.** Any local path is allowed. Configuring this list restricts the local side to those directories plus the MCP working directory. |
+| `allowedRemoteDirectories` | `push` / `pull` / `copy` / `sftp-list` / `sftp-manage` | **Unset/empty = open.** Any absolute remote path is allowed. Configuring this list opts into restricting SFTP to those directories. |
+| `allowedLocalDirectories` | `push` / `pull` only | **Unset/empty = open.** Any local path is allowed. Configuring this list restricts the local side to those directories plus the MCP working directory. |
 | `disableSftpPathPolicy` | all SFTP tools | When `true`, bypasses both checks above entirely — any remote path, any local path. |
 
 Remote paths are absolute: `/home/me/x` on Linux and macOS servers; `C:\Users\me\x`, `C:/Users/me/x` or `/C:/Users/me/x` on Windows servers, all normalized to `/C:/Users/me/x` (the form Win32-OpenSSH reports) and compared case-insensitively. SFTP servers do not expand `~` or resolve relative paths for the policy check, so those are rejected with an explanation.
@@ -156,10 +156,10 @@ Rules (enforced at config load — bad configs fail fast):
 - **Cached clients stay open while reused.** With the default `reuseConnection: true`, `execute-command` does not close the SSH client after each command. If a cached client must be opened first, SSH setup, jump, SOCKS, and channel-open waits are bounded by the call's `timeout`. The cached client is closed on explicit disconnect/server shutdown, config hot-reload for changed connection fields, underlying SSH close/error cleanup, or reconnect after a connection-shaped command failure.
 - **Manual cached-client close.** Use `close-connection { connectionName: "name" }` to drop a cached SSH client on demand. If the named server is a jump host, cached targets that jump through it are closed too.
 - **Auto-reconnect on `execute-command`.** Every command runs inside a retry loop (default 3 attempts: 1 initial + 2 retries) with exponential backoff. If the underlying error matches a connection-shaped pattern (`econnreset`, `epipe`, `socket`, `closed`, `channel`, `end of stream`, or a `SSH_CONNECTION_FAILED` ToolError), the manager closes the dead client, reconnects, and retries the command. Non-connection errors (permission denied, validation, command-not-found) are returned immediately without retry.
-- **Optional fresh command/SFTP connections.** `execute-command`, `upload`, `download`, `transfer`, and the whole `workspace-run`/`run-status`/`run-logs`/`run-list`/`run-cancel`/`run-retry` family reuse cached SSH clients by default (`reuseConnection: true`). If a call times out or you suspect the cached `ssh2.Client` is stale while native `ssh` works, retry with `reuseConnection: false`; that one operation opens a fresh SSH connection and closes it afterwards. SFTP still opens a new SFTP channel/session per operation.
+- **Optional fresh command/SFTP connections.** `execute-command`, `push`, `pull`, `copy`, and the whole `workspace-run`/`run-status`/`run-logs`/`run-list`/`run-cancel`/`run-retry` family reuse cached SSH clients by default (`reuseConnection: true`). If a call times out or you suspect the cached `ssh2.Client` is stale while native `ssh` works, retry with `reuseConnection: false`; that one operation opens a fresh SSH connection and closes it afterwards. SFTP still opens a new SFTP channel/session per operation.
 - **Optional SSH debug output.** Set `vvv: true` on `execute-command` to append bounded SSH/channel debug output to the result or error. For full ssh2 handshake logs, combine it with `reuseConnection: false`; an already-open cached client cannot retroactively emit handshake debug.
-- **Optional SFTP debug output.** Set `vvv: true` on `upload`, `download`, or `transfer` to append bounded SSH/SFTP debug where the result is textual. Recursive `transfer` success keeps its structured `{ summary, files }` JSON response, so recursive debug is surfaced on errors rather than appended to successful summaries.
-- **SFTP transfers do NOT auto-retry.** `upload` / `download` / `transfer` lazy-connect via the same acquisition path and close stale cached clients on connection-shaped SFTP/channel errors, but a mid-transfer disconnect surfaces as a single failure — re-issue the call manually, preferably with `reuseConnection: false` if you suspect the cached SSH client.
+- **Optional SFTP debug output.** Set `vvv: true` on `push`, `pull`, or `copy` to append bounded SSH/SFTP debug where the result is textual. Directory `push`/`pull` success keeps its structured `{ summary, files }` JSON response, so recursive debug is surfaced on errors rather than appended to successful summaries.
+- **SFTP transfers do NOT auto-retry.** `push` / `pull` / `copy` lazy-connect via the same acquisition path and close stale cached clients on connection-shaped SFTP/channel errors, but a mid-transfer disconnect surfaces as a single failure — re-issue the call manually, preferably with `reuseConnection: false` if you suspect the cached SSH client.
 - **No background keepalive or health probe.** Dead connections are only discovered on the next tool call. If you idle for hours through a NATed network, expect the first call after the gap to fail-then-reconnect on its own (you'll see one retry in the logs).
 
 ## `execute-command` output capping & full logs

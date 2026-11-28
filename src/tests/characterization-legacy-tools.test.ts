@@ -135,12 +135,8 @@ describe("characterization: 1.x foreground tool responses (real SSH, no mocks)",
 
   test("black-box: upload/download round-trip returns non-empty plain-text success messages", async () => {
     const uploadResult = await mcpClient.callTool({
-      name: "upload",
-      arguments: {
-        localPath: path.join(localRoot, "upload-me.txt"),
-        remotePath: "/upload-me.txt",
-        connectionName: "remote",
-      },
+      name: "push",
+      arguments: { localPath: path.join(localRoot, "upload-me.txt"), remotePath: "/upload-me.txt", connectionName: "remote" },
     });
     assert.equal(uploadResult.isError, undefined);
     const uploadText = responseText(uploadResult);
@@ -150,12 +146,8 @@ describe("characterization: 1.x foreground tool responses (real SSH, no mocks)",
     assert.throws(() => JSON.parse(uploadText), "upload success text is plain text, not JSON");
 
     const downloadResult = await mcpClient.callTool({
-      name: "download",
-      arguments: {
-        remotePath: "/upload-me.txt",
-        localPath: path.join(localRoot, "downloaded.txt"),
-        connectionName: "remote",
-      },
+      name: "pull",
+      arguments: { remotePath: "/upload-me.txt", localPath: path.join(localRoot, "downloaded.txt"), connectionName: "remote" },
     });
     assert.equal(downloadResult.isError, undefined);
     assert.ok(responseText(downloadResult).length > 0);
@@ -164,27 +156,13 @@ describe("characterization: 1.x foreground tool responses (real SSH, no mocks)",
 
   test("black-box: upload against a rejected local path returns the legacy error shape", async () => {
     const result = await mcpClient.callTool({
-      name: "upload",
+      name: "push",
       arguments: { localPath: "/definitely/not/allowed.txt", remotePath: "/x.txt", connectionName: "remote" },
     });
     assert.equal(result.isError, true);
     const error = legacyErrorSchema.parse(JSON.parse(responseText(result)));
     assert.equal(typeof error.code, "string");
     assert.equal(error.retriable, false);
-  });
-
-  test("black-box: transfer mode=upload (single file) behaves like upload and returns plain text", async () => {
-    const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: {
-        mode: "upload",
-        localPath: path.join(localRoot, "upload-me.txt"),
-        remotePath: "/via-transfer.txt",
-        connectionName: "remote",
-      },
-    });
-    assert.equal(result.isError, undefined);
-    assert.ok(responseText(result).length > 0);
   });
 
   test("black-box + white-box: show-whitelist real markdown contains every required section header", async () => {

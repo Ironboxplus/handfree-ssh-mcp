@@ -9,9 +9,9 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
 import { registerCloseConnectionTool } from "../tools/close-connection.js";
-import { registerDownloadTool } from "../tools/download.js";
-import { registerTransferTool } from "../tools/transfer.js";
-import { registerUploadTool } from "../tools/upload.js";
+import { registerPushTool } from "../tools/push.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
 import { RealSshTestServer } from "./helpers/real-ssh-server.js";
 
 /**
@@ -60,7 +60,7 @@ describe("transfer-lane pool real execution", { concurrency: false }, () => {
   };
   const download = (remotePath: string, localName: string, args: Record<string, unknown> = {}) =>
     mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { remotePath, localPath: path.join(localRoot, localName), connectionName: "lanes", timeout: 10000, ...args },
     });
   const assertDownloaded = (result: Awaited<ReturnType<Client["callTool"]>>, remotePath: string, localName: string) => {
@@ -87,9 +87,9 @@ describe("transfer-lane pool real execution", { concurrency: false }, () => {
       lanes: { ...common, port: server.port },
       peer: { ...common, port: peer.port },
     }, ["lanes", "peer"]);
-    registerDownloadTool(mcpServer);
-    registerUploadTool(mcpServer);
-    registerTransferTool(mcpServer);
+    registerPushTool(mcpServer);
+    registerPullTool(mcpServer);
+    registerCopyTool(mcpServer);
     registerCloseConnectionTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
@@ -128,7 +128,7 @@ describe("transfer-lane pool real execution", { concurrency: false }, () => {
     const localPath = path.join(localRoot, "up.bin");
     fs.writeFileSync(localPath, data);
     const result = await mcpClient.callTool({
-      name: "upload",
+      name: "push",
       arguments: { localPath, remotePath: "/up.bin", connectionName: "lanes", connections: 4, timeout: 10000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
@@ -252,11 +252,8 @@ describe("transfer-lane pool real execution", { concurrency: false }, () => {
     await coldStart();
     const relay = (sourceServer: string, destServer: string, remotePath: string) =>
       mcpClient.callTool({
-        name: "transfer",
-        arguments: {
-          mode: "relay", sourceServer, destServer, sourceRemotePath: remotePath, destRemotePath: remotePath,
-          connections: 8, timeout: 10000,
-        },
+        name: "copy",
+        arguments: { from: { server: sourceServer, path: remotePath }, to: { server: destServer, path: remotePath }, connections: 8, timeout: 10000 },
       });
     let timer: NodeJS.Timeout | undefined;
     const deadlock = new Promise<never>((_, reject) => {

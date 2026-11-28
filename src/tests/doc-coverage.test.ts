@@ -3,9 +3,9 @@ import { describe, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { registerDownloadTool } from "../tools/download.js";
-import { registerTransferTool } from "../tools/transfer.js";
-import { registerUploadTool } from "../tools/upload.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
+import { registerPushTool } from "../tools/push.js";
 import { registerHelpTool, TOOL_HELP_FOR_TEST, TOOL_OVERVIEW_FOR_TEST } from "../tools/help.js";
 import { registerWorkspaceRunTool } from "../tools/workspace-run.js";
 import { registerRunStatusTool } from "../tools/run-status.js";
@@ -34,17 +34,13 @@ import { SERVER_INSTRUCTIONS } from "../config/server.js";
  * the prose, which no amount of behavioral testing catches.
  */
 
-const PARAMETERS_EXEMPT_FROM_HELP: Record<string, ReadonlySet<string>> = {
-  // `mode` is not a row in transfer's parameter list because the help text
-  // documents the three modes as its own top-level section instead.
-  transfer: new Set(["mode"]),
-};
+const PARAMETERS_EXEMPT_FROM_HELP: Record<string, ReadonlySet<string>> = {};
 
 async function listRegisteredTools(): Promise<Map<string, string[]>> {
   const server = new McpServer({ name: "doc-coverage", version: "0.0.0" });
-  registerDownloadTool(server);
-  registerTransferTool(server);
-  registerUploadTool(server);
+  registerPullTool(server);
+  registerCopyTool(server);
+  registerPushTool(server);
   registerWorkspaceRunTool(server);
   registerRunStatusTool(server);
   registerRunLogsTool(server);
@@ -73,16 +69,16 @@ async function listRegisteredTools(): Promise<Map<string, string[]>> {
 }
 
 describe("documentation coverage: every tool parameter appears in that tool's help text", () => {
-  test("download / transfer / upload / run-* / plugin-* parameters are all documented in help", async () => {
+  test("push / pull / copy / run-* / plugin-* parameters are all documented in help", async () => {
     const tools = await listRegisteredTools();
     const missing: string[] = [];
 
     for (const toolName of [
-      "download",
+      "pull",
       "sftp-list",
       "sftp-manage",
-      "transfer",
-      "upload",
+      "copy",
+      "push",
       "workspace-run",
       "run-status",
       "run-logs",
@@ -219,7 +215,7 @@ describe("documentation coverage: every tool parameter appears in that tool's he
     // connection-drop the user cannot diagnose. The earlier caveat here
     // ("8 is SLOWER") described serial connection setup, which was fixed in
     // 2.1.4; the measured, diminishing returns replace it.
-    const helpText = TOOL_HELP_FOR_TEST["download"];
+    const helpText = TOOL_HELP_FOR_TEST["pull"];
     assert.match(helpText, /MaxStartups/, "help must name the remote limit that actually applies to N connections");
     assert.match(helpText, /concurrent/i, "help must say the handshakes are concurrent -- that is why MaxStartups applies");
     assert.match(helpText, /Diminishing returns/i, "help must state the measured returns, not imply more is always better");
@@ -228,14 +224,14 @@ describe("documentation coverage: every tool parameter appears in that tool's he
   });
 
   test("help reflects current transfer defaults and parallel directory support", () => {
-    for (const tool of ["upload", "download", "transfer"]) {
+    for (const tool of ["push", "pull"]) {
       assert.match(TOOL_HELP_FOR_TEST[tool], /fast\s+\(boolean, optional\)\s+Default true/);
       assert.doesNotMatch(TOOL_HELP_FOR_TEST[tool], /recursion stays sequential|streaming\s+SFTP pipe/);
     }
-    assert.match(TOOL_HELP_FOR_TEST.transfer, /fileConcurrency/);
-    assert.match(TOOL_HELP_FOR_TEST.transfer, /Relay: prefetched source chunks, default\s+64/);
-    assert.match(TOOL_HELP_FOR_TEST.upload, /allowedLocalDirectories/);
-    assert.match(TOOL_HELP_FOR_TEST.download, /allowedLocalDirectories/);
+    assert.match(TOOL_HELP_FOR_TEST.push, /fileConcurrency/);
+    assert.match(TOOL_HELP_FOR_TEST.copy, /Relay: prefetched source chunks, default\s+64/);
+    assert.match(TOOL_HELP_FOR_TEST.push, /allowedLocalDirectories/);
+    assert.match(TOOL_HELP_FOR_TEST.pull, /allowedLocalDirectories/);
   });
 
   test("command and task guidance distinguishes remote shell sessions and durable Linux runs", () => {

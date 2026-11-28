@@ -7,8 +7,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
-import { registerDownloadTool } from "../tools/download.js";
-import { registerTransferTool } from "../tools/transfer.js";
+import { registerPushTool } from "../tools/push.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
 import { ToolError } from "../utils/tool-error.js";
 import { RealSshTestServer } from "./helpers/real-ssh-server.js";
 
@@ -67,8 +68,9 @@ describe("download paths: k50 replay, Windows remote paths, local policy", { con
         allowedRemoteDirectories: ["/C:/Data"],
       },
     }, ["k50", "open", "windowsAllowlist"]);
-    registerDownloadTool(mcpServer);
-    registerTransferTool(mcpServer);
+    registerPushTool(mcpServer);
+    registerPullTool(mcpServer);
+    registerCopyTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
     await mcpClient.connect(clientTransport);
@@ -85,7 +87,7 @@ describe("download paths: k50 replay, Windows remote paths, local policy", { con
   test("call 3: a download into a missing local directory creates it", async () => {
     const target = path.join(localRoot, "k50-switch", "power", "s_hit.json");
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { connectionName: "k50", remotePath: remote("s_hit.json"), localPath: target },
     });
     assert.notEqual(result.isError, true, text(result));
@@ -95,7 +97,7 @@ describe("download paths: k50 replay, Windows remote paths, local policy", { con
   test("call 1: a remotePath array downloads every file into the localPath directory", async () => {
     const dir = path.join(localRoot, "batch", "power");
     const result = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { connectionName: "k50", remotePath: Object.keys(files).map(remote), localPath: dir },
     });
     assert.notEqual(result.isError, true, text(result));
@@ -107,22 +109,11 @@ describe("download paths: k50 replay, Windows remote paths, local policy", { con
     }
   });
 
-  test("transfer mode=download takes the same remotePath array", async () => {
-    const dir = path.join(localRoot, "batch-transfer");
-    const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: { mode: "download", connectionName: "k50", remotePath: [remote("t_hit.json"), remote("t_home.json")], localPath: dir },
-    });
-    assert.notEqual(result.isError, true, text(result));
-    assert.equal(JSON.parse(text(result)).downloadedCount, 2);
-    assert.equal(fs.readFileSync(path.join(dir, "t_home.json"), "utf8"), files["t_home.json"]);
-  });
-
   test("batch download: duplicate basenames are rejected before any transfer; onError=continue reports each file", async () => {
     fs.mkdirSync(path.join(serverRoot, "other"), { recursive: true });
     fs.writeFileSync(server.toLocalPath("/other/s_hit.json"), "other");
     const collision = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { connectionName: "k50", remotePath: [remote("s_hit.json"), "/other/s_hit.json"], localPath: path.join(localRoot, "dup") },
     });
     assert.equal(collision.isError, true);
@@ -130,7 +121,7 @@ describe("download paths: k50 replay, Windows remote paths, local policy", { con
     assert.equal(fs.existsSync(path.join(localRoot, "dup", "s_hit.json")), false);
 
     const mixed = await mcpClient.callTool({
-      name: "download",
+      name: "pull",
       arguments: { connectionName: "k50", remotePath: [remote("missing.json"), remote("s_home.json")], localPath: path.join(localRoot, "mixed"), onError: "continue" },
     });
     const body = JSON.parse(text(mixed));
@@ -140,17 +131,24 @@ describe("download paths: k50 replay, Windows remote paths, local policy", { con
     assert.equal(fs.existsSync(path.join(localRoot, "mixed", "missing.json")), false, "a failed file leaves nothing behind");
   });
 
-  test("call 2: downloading a directory says so and leaves no local file", async () => {
+  test("call 2: pulling the directory copies its tree; a single-file download of it says so and leaves no file", async () => {
     const target = path.join(localRoot, "k50-switch", "power2");
     const result = await mcpClient.callTool({
-      name: "transfer",
-      arguments: { mode: "download", connectionName: "k50", remotePath: "/data/local/tmp", localPath: target },
+      name: "pull",
+      arguments: { connectionName: "k50", remotePath: "/data/local/tmp", localPath: target },
     });
-    assert.equal(result.isError, true);
-    assert.match(text(result), /INVALID_CONFIGURATION/);
-    assert.match(text(result), /is a directory/);
-    assert.match(text(result), /recursive=true/);
-    assert.equal(fs.existsSync(target), false);
+    assert.notEqual(result.isError, true, text(result));
+    for (const [name, content] of Object.entries(files)) {
+      assert.equal(fs.readFileSync(path.join(target, name), "utf8"), content);
+    }
+
+    const asFile = path.join(localRoot, "k50-switch", "tmp-as-file");
+    await assert.rejects(
+      () => service.download("/data/local/tmp", asFile, "k50"),
+      (error: unknown) => error instanceof ToolError && error.code === "INVALID_CONFIGURATION" &&
+        /is a directory/.test(error.message) && /pull/.test(error.message),
+    );
+    assert.equal(fs.existsSync(asFile), false);
   });
 
   test("a directory is also reported on the multi-connection path", async () => {

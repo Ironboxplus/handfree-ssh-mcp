@@ -11,7 +11,8 @@ import { registerAllTools } from "../tools/index.js";
  * default z.object() stripped both keys, so the tool answered "relay mode
  * requires: sourceServer, ..." without ever saying its arguments were not
  * recognized. Every tool must now reject unknown arguments by name, over the
- * same MCP path a client uses.
+ * same MCP path a client uses. The relay is now copy { from, to }; the
+ * nested source/destination shape is still named as unrecognized.
  */
 describe("tools reject unknown arguments instead of silently dropping them", () => {
   const server = new McpServer({ name: "strict-arguments", version: "0.0.0" });
@@ -31,12 +32,8 @@ describe("tools reject unknown arguments instead of silently dropping them", () 
   test("the reported nested relay call names source and destination as unrecognized", async () => {
     await assert.rejects(
       client.callTool({
-        name: "transfer",
-        arguments: {
-          mode: "relay",
-          source: { server: "cfscan", path: "/root/mexp/media.sql.gz" },
-          destination: { server: "txcloud", path: "/root/docker/media-from-cfscan.sql.gz" },
-        },
+        name: "copy",
+        arguments: { source: { server: "cfscan", path: "/root/mexp/media.sql.gz" }, destination: { server: "txcloud", path: "/root/docker/media-from-cfscan.sql.gz" } },
       }),
       (error: Error) => {
         assert.match(error.message, /unrecognized_keys/);
@@ -62,7 +59,7 @@ describe("tools reject unknown arguments instead of silently dropping them", () 
   });
 
   test("known arguments are still accepted", async () => {
-    const result = await client.callTool({ name: "help", arguments: { tool: "transfer" } });
+    const result = await client.callTool({ name: "help", arguments: { tool: "copy" } });
     assert.notEqual(result.isError, true);
   });
 });

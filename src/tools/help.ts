@@ -126,22 +126,31 @@ Examples:
   close-connection { connectionName: "scnet" }
   close-connection { connectionName: "dcu" }`,
 
-  "upload": `upload — Upload a local file, or a batch of local files, to a remote server over SFTP.
+  "push": `push — Copy local → remote over SFTP (like adb push).
+
+What is sent is decided by localPath, not by a flag:
+  • a file        → remotePath. If remotePath is an existing remote directory,
+                    or ends with / or \\, the file keeps its name inside it.
+  • a directory   → its whole tree lands in remotePath (local dir/x →
+                    remotePath/x), created as needed. Directories are detected;
+                    there is no recursive flag.
+  • an array      → batch: each file lands at remotePath/<basename>.
+  • archive=true  → one temporary tar extracted into remotePath, keeping
+                    the source name (dist → remotePath/dist).
 
 Parameters:
-  localPath       (string | string[], required)  File path on the MCP host,
-                  or an array of paths for batch upload. Any local path is
-                  allowed unless allowedLocalDirectories is configured.
-  remotePath      (string, required)   Absolute destination path on the remote
+  localPath       (string | string[], required)  File, directory or file array
+                  on the MCP host. Any local path is allowed unless
+                  allowedLocalDirectories is configured.
+  remotePath      (string, required)   Absolute destination on the remote
                   server: /home/me/x on Linux/macOS; C:\\Users\\me\\x,
-                  C:/Users/me/x or /C:/Users/me/x on Windows.
-                  Batch mode (array localPath): this must be a directory;
-                  each source lands at remotePath/<basename>.
+                  C:/Users/me/x or /C:/Users/me/x on Windows. ~ and relative
+                  paths are not expanded by SFTP servers.
   connectionName  (string, see below)  Target server name from list-servers.
-  skipIfIdentical (boolean, optional)  Default true. Skip only when the remote
-                  file has the same size and the same MD5 as the bytes that
-                  would be written (after the shell-script CRLF->LF fix). The
-                  MD5 is computed on the server (md5sum, md5 -r or rclone
+  skipIfIdentical (boolean, optional)  Default true. Skip a file only when the
+                  remote file has the same size and the same MD5 as the bytes
+                  that would be written (after the shell-script CRLF->LF fix).
+                  The MD5 is computed on the server (md5sum, md5 -r or rclone
                   md5sum, verified with empty input once per server); with no
                   such command the file is uploaded, never read back to compare.
                   Local CRLF + remote LF: skipped. Remote CRLF + local LF:
@@ -150,87 +159,102 @@ Parameters:
                   or suspected stale cached SSH connection.
   timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
-                  Recursive success returns structured JSON; debug is surfaced
-                  for single-file results, relay results, and recursive errors.
-  fast            (boolean, optional)  Default true. Use ssh2 fastPut for
-                  single-file upload throughput. Not multi-file concurrency.
-                  false is a serial compatibility mode and is much slower.
+                  Directory and batch success return structured JSON; debug is
+                  surfaced for single-file results and directory errors.
+  fast            (boolean, optional)  Default true. ssh2 fastPut pipelines each
+                  file's chunks. false is a serial compatibility mode and is
+                  much slower.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
-  onError         (string, optional)   Batch mode only. "abort" (default): stop
-                  scheduling new files once one fails, drain in-flight ones.
-                  "continue": attempt every file regardless of earlier failures.
-                  Both report a per-file uploaded/skipped/failed status.
-  fileConcurrency (number, optional)   Batch mode only. Files in flight at
-                  once. Default 32, maximum 64. They share at most 4 SFTP
-                  channels.
-  connections     (number, optional)   Single file only (not batch). Default 1
-                  (default behavior). Above 1, write the file over that many
-                  INDEPENDENT SSH/TCP connections, each carrying its own
-                  non-overlapping byte range into one remote temp file that
-                  then replaces remotePath -- atomically where the server
-                  supports posix-rename@openssh.com (OpenSSH does), otherwise
-                  by removing the old file first. A failure on any connection
-                  leaves remotePath untouched. Maximum 8. The handshakes run
+  fileConcurrency (number, optional)   Directory or array: files in flight at
+                  once. Default 32, maximum 64. They share at most
+                  min(fileConcurrency, 4) SFTP channels on one SSH connection,
+                  well under OpenSSH's common default MaxSessions=10.
+  connections     (number, optional)   Single file only. Default 1. Above 1,
+                  write the file over that many INDEPENDENT SSH/TCP
+                  connections, each carrying its own non-overlapping byte
+                  range into one remote temp file that then replaces the
+                  target -- atomically where the server supports
+                  posix-rename@openssh.com (OpenSSH does), otherwise by
+                  removing the old file first. A failure on any connection
+                  leaves the target untouched. Maximum 8. The handshakes run
                   concurrently, so sshd's MaxStartups is the limit that
                   matters, not MaxSessions. Helps on high-latency links;
                   pointless on a fast LAN. Measured uploading 128 MiB at
                   50 ms RTT (one connection 29.8 MiB/s): 2 -> 35.2,
-                  4 -> 43.5, 8 -> 44.9 MiB/s -- smaller than download's
-                  gains. Connections are pooled per server, as for download.
+                  4 -> 43.5, 8 -> 44.9 MiB/s. Connections are pooled per
+                  server (at most 8, idle ones closed after 60 s).
+  archive         (boolean, optional)  Default false. Pack localPath into a
+                  temporary tar, upload one file, extract it into the remotePath
+                  directory (the source keeps its name there) and remove both
+                  temporary archives. Suits many small files.
+  archiveCompression (string, optional) Only with archive=true. "none"
+                  (default), "gzip", "bzip2", "xz" or "zstd". Both ends need
+                  the matching tool.
+  onError         ("abort" | "continue", optional)  Array only. "abort"
+                  (default): stop scheduling new files once one fails, drain
+                  in-flight ones. "continue": attempt every file. Both report a
+                  per-file uploaded/skipped/failed status.
+
+Batch (array localPath):
+  • Basename collisions across sources, or the same path repeated, fail the
+    whole call with BATCH_TARGET_COLLISION before anything is written.
+  • Empty array → INVALID_CONFIGURATION. Over 1000 entries → BATCH_TOO_LARGE.
+  • Every file goes through the single-file rules: skip-if-identical,
+    CRLF→LF fix for .sh/.bash/.zsh, fast, and path policy.
+  • Returns JSON: { results: [...], total, uploadedCount, skippedCount,
+    failedCount, crlfFixedCount }.
+  • connections and archive take a single path, not an array.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
   • If multiple servers are enabled → REQUIRED.
 
-Batch mode (array localPath):
-  • remotePath must be a directory; each source lands at remotePath/<basename>.
-  • Basename collisions across sources, or the same path repeated in the
-    array, fail the whole call with BATCH_TARGET_COLLISION before anything
-    is written remotely — never silently deduplicated.
-  • Empty array → INVALID_CONFIGURATION. Over 1000 entries → BATCH_TOO_LARGE.
-  • Every file still goes through the normal single-file rules: skip-if-
-    identical, CRLF→LF fix for .sh/.bash/.zsh, fast, and path policy.
-  • Returns structured JSON: { results: [...], total, uploadedCount,
-    skippedCount, failedCount, crlfFixedCount }. A single string localPath
-    keeps the original plain-text response, unchanged.
-  • archive is not available for batch mode currently.
+Examples:
+  push { localPath: "data.csv", remotePath: "/tmp/data.csv" }
+  push { localPath: "build/app.tar", remotePath: "/opt/releases/" }
+  push { localPath: "dist", remotePath: "/opt/app/dist" }
+  push { localPath: ["a/config.yaml", "b/settings.json"], remotePath: "/etc/app" }
+  push { localPath: "big.bin", remotePath: "/data/big.bin", connections: 4 }
+  push { localPath: "node_modules", remotePath: "/srv/app", archive: true,
+         archiveCompression: "zstd" }`,
 
-Example:
-  upload { localPath: "data.csv", remotePath: "/tmp/data.csv" }
-  upload { localPath: "big.bin", remotePath: "/tmp/big.bin", fast: true,
-           sftpConcurrency: 32, chunkSize: 131072 }
-  upload { localPath: ["a/config.yaml", "b/settings.json"], remotePath: "/etc/app" }
-  upload { localPath: ["1.csv", "2.csv", "3.csv"], remotePath: "/data", onError: "continue" }`,
+  "pull": `pull — Copy remote → local over SFTP (like adb pull).
 
-  "download": `download — Download a file, or several files, from a remote server over SFTP.
+What is fetched is decided by remotePath, not by a flag:
+  • a file        → localPath. If localPath is an existing directory, or ends
+                    with / or \\, the file keeps its remote name inside it.
+                    Missing parent directories are created.
+  • a directory   → its whole tree lands in localPath (remote dir/x →
+                    localPath/x). Detected by one STAT; there is no recursive
+                    flag.
+  • an array      → batch: each file lands at localPath/<basename>.
+  • archive=true  → one temporary tar extracted into localPath, keeping
+                    the source name (results → localPath/results).
 
 Parameters:
-  remotePath      (string | string[], required)  Absolute file path on the
-                  remote server: /home/me/x on Linux/macOS; C:\\Users\\me\\x,
+  remotePath      (string | string[], required)  Absolute remote file or
+                  directory: /home/me/x on Linux/macOS; C:\\Users\\me\\x,
                   C:/Users/me/x or /C:/Users/me/x on Windows. ~ and relative
                   paths are not expanded by SFTP servers. An array (1-1000)
-                  is a batch download: each file lands at
-                  localPath/<basename>; duplicate basenames are rejected
-                  before any transfer (case-insensitively on Windows/macOS).
-  localPath       (string, required)   Destination on the MCP host: a file
-                  path, or a directory (an existing one, or a path ending
-                  with / or \\) that receives the file under its remote name.
-                  Missing parent directories are created. Any local path is
-                  allowed unless allowedLocalDirectories is configured.
-                  A remote directory is reported as such; download it with
-                  transfer mode="download" recursive=true.
+                  is a batch; duplicate basenames are rejected before any
+                  transfer (case-insensitively on Windows/macOS hosts).
+  localPath       (string, required)   Destination on the MCP host (see
+                  above). Any local path is allowed unless
+                  allowedLocalDirectories is configured.
   connectionName  (string, see below)  Target server name from list-servers.
   reuseConnection (boolean, optional)  Default true. Set false after timeout
                   or suspected stale cached SSH connection.
   timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
-  fast            (boolean, optional)  Default true. Use ssh2 fastGet for
-                  single-file download throughput. Not multi-file concurrency.
-                  false is a serial compatibility mode and is much slower.
+  fast            (boolean, optional)  Default true. ssh2 fastGet pipelines each
+                  file's chunks. false is a serial compatibility mode and is
+                  much slower.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
-  connections     (number, optional)   Default 1 (default behavior). Above 1,
+  fileConcurrency (number, optional)   Directory or array: files in flight at
+                  once, default 32, maximum 64, over at most 4 SFTP channels.
+  connections     (number, optional)   Single file only. Default 1. Above 1,
                   split the file into that many non-overlapping byte ranges and
                   pull each over its OWN independent SSH/TCP connection, then
                   reassemble, verify and atomically rename. Maximum 8.
@@ -246,181 +270,94 @@ Parameters:
                   per server (at most 8 per server, idle ones closed after
                   60 s), so a repeated transfer skips the handshakes;
                   reuseConnection=false uses fresh ones, closed afterwards.
-                  Not with a remotePath array.
-  fileConcurrency (number, optional)   remotePath array only: files in flight
-                  at once, default 32, maximum 64.
-  onError         ("abort" | "continue", optional)  remotePath array only.
-                  "abort" (default) stops scheduling after a failure; in-flight
-                  files finish. "continue" attempts every file. Every file's
-                  outcome is reported.
+  archive         (boolean, optional)  Default false. Pack remotePath into a
+                  temporary tar on the server, download one file, extract it
+                  into the localPath directory (the source keeps its name
+                  there) and remove both temporary archives.
+  archiveCompression (string, optional) Only with archive=true. "none"
+                  (default), "gzip", "bzip2", "xz" or "zstd".
+  onError         ("abort" | "continue", optional)  Array only. "abort"
+                  (default) stops scheduling after a failure; in-flight files
+                  finish. "continue" attempts every file. Every file's outcome
+                  is reported.
+
+Batch (array remotePath):
+  • localPath is one local directory, created if missing.
+  • Returns JSON: { results: [{ remotePath, localPath, status, reason? }],
+    total, downloadedCount, failedCount, notAttemptedCount }.
+  • connections and archive take a single path, not an array.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
   • If multiple servers are enabled → REQUIRED.
 
-Example:
-  download { remotePath: "/var/log/app.log", localPath: "app.log" }
-  download { remotePath: "C:\\Users\\me\\report.csv", localPath: "out/" }
-  download { remotePath: ["/data/a.json", "/data/b.json"], localPath: "results" }
-  download { remotePath: "/tmp/big.bin", localPath: "big.bin", fast: true,
-             sftpConcurrency: 32, chunkSize: 131072 }
-  download { remotePath: "/tmp/huge.bin", localPath: "huge.bin", connections: 4 }`,
+Examples:
+  pull { remotePath: "/var/log/app.log", localPath: "app.log" }
+  pull { remotePath: "C:\\Users\\me\\report.csv", localPath: "out/" }
+  pull { remotePath: "/data/results", localPath: "results" }
+  pull { remotePath: ["/data/a.json", "/data/b.json"], localPath: "results" }
+  pull { remotePath: "/tmp/huge.bin", localPath: "huge.bin", connections: 4 }`,
 
-  "transfer": `transfer — Move files between hosts (single/recursive/cross-server).
+  "copy": `copy — Copy remote → remote: from { server, path } to { server, path }.
 
-Modes:
-  upload    Push local → remote (single file or recursive directory).
-  download  Pull remote → local (single file or recursive directory).
-  relay     Copy a file from remote-A → remote-B. strategy="relay" (default,
-            unchanged) streams it via SFTP piping through this MCP host; no
-            temp file on the MCP host, no SCP, no authorized-key exchange
-            between the two servers. strategy="direct" instead runs the copy
-            ON server-A (rsync, else tar piped over ssh) so this MCP host
-            never reads or writes the file's bytes; requires server-A to
-            already reach server-B directly with its own pre-existing
-            non-interactive SSH trust (never transfers a private key, never
-            auto-accepts an unknown host key). strategy="auto" uses direct
-            when possible, else falls back to relay and reports why.
-            Same server on both ends (relay/auto): when its SFTP server
-            advertises copy-data (OpenSSH 9.0+), the server copies the file
-            itself into a temp file next to the target (size + md5 verified,
-            then renamed into place), no bytes pass through this MCP host and
-            connections is ignored; otherwise the normal relay runs.
+strategy selects how the bytes move:
+  relay   (default) Through this MCP host: bounded parallel SFTP read-ahead,
+          no temp file on the MCP host, no key exchange between the servers.
+          Same server on both ends (relay/auto): when its SFTP server
+          advertises copy-data (OpenSSH 9.0+), the server copies the file
+          itself into a temp file next to the target (size + md5 verified,
+          then renamed into place); no bytes pass through this MCP host and
+          connections is ignored. Otherwise the normal relay runs.
+  direct  The source server runs the copy (rsync, else tar piped over ssh),
+          so this MCP host never reads the file's bytes. Requires the source
+          to reach the destination with its own pre-existing non-interactive
+          SSH trust; never transfers a private key, never auto-accepts an
+          unknown host key. Fails with the precise reason otherwise (no
+          route, host key not pinned on the source, no key auth, no backend).
+          Cannot traverse NAT: use a jump host, an overlay network or relay.
+  auto    Probe the same conditions; direct when possible, else relay with
+          the reason reported.
 
-Parameters for upload / download:
-  mode            (string, required)   "upload" or "download"
-  localPath       (string | string[], required)  Path on the MCP host. Any
-                  local path is allowed unless allowedLocalDirectories is
-                  configured. Upload only: an array batch-uploads multiple
-                  independent files to the same remotePath directory (see
-                  "Batch upload" below). A single download into a directory
-                  (existing, or ending with / or \\) keeps the remote file
-                  name; missing parent directories are created.
-  remotePath      (string | string[], required)  Absolute path on the remote
-                  server: /home/me/x on Linux/macOS; C:\\Users\\me\\x,
-                  C:/Users/me/x or /C:/Users/me/x on Windows. Download only:
-                  an array batch-downloads files into the localPath
-                  directory (see "Batch download" below).
-  connectionName  (string, see below)  Target server name.
-  recursive       (boolean, optional)  True to transfer a whole directory tree.
-                  Not combinable with an array localPath.
-  skipIfIdentical (boolean, optional)  Default true. Skip the transfer when the
-                  destination already matches the source. Upload: remote MD5
-                  (computed on the server, no content crosses the network) must
-                  equal the MD5 of the bytes to be written, i.e. after the
-                  .sh/.bash/.zsh CRLF->LF fix; no remote md5sum/md5 -r/rclone
-                  md5sum means upload. Relay: size +
-                  md5sum on both servers when available, falling back to
-                  transferring. Download is never skipped. Set false to force.
-  archiveCompression (string, optional) Only with archive=true. One of "none"
-                  (default), "gzip", "bzip2", "xz", "zstd". The remote must
-                  have the matching tool available for the chosen codec.
+Parameters:
+  from            ({ server, path }, required)  Source server name from
+                  list-servers and absolute path (POSIX or Windows drive path).
+  to              ({ server, path }, required)  Destination server and path.
+                  server may equal from.server.
+  strategy        (string, optional)   "relay" (default) | "direct" | "auto".
+  archive         (boolean, optional)  Default false. Pack from.path (e.g. a
+                  directory) into a temporary tar on the source, relay it,
+                  extract into the to.path directory (the source keeps its
+                  name there), remove the archives.
+  archiveCompression (string, optional) Only with archive=true. "none"
+                  (default), "gzip", "bzip2", "xz" or "zstd".
+  skipIfIdentical (boolean, optional)  Default true. Skip when the destination
+                  already has the same size + md5 (when both servers can hash),
+                  else transfer. Set false to force.
+  connections     (number, optional)   Single file, strategy="relay" only.
+                  Default 1. Above 1, opens N connections on EACH server (N in
+                  total for a same-server copy), moves non-overlapping byte
+                  ranges, writes a temp file on the destination, verifies
+                  size + md5, then replaces the target. Measured on a
+                  50 ms/1 Gbps source leg (one connection 16.4 MiB/s):
+                  2 -> 23.7, 4 -> 33.6, 8 -> 31.7. Maximum 8. Concurrent
+                  handshakes, so sshd's MaxStartups is the limit that matters.
+                  Rejected for strategy="direct"/"auto" and archive=true.
+  sftpConcurrency (number, optional)   Relay: prefetched source chunks, default
+                  64; total prefetch window is capped at 64 MiB.
+  chunkSize       (number, optional)   Relay: bytes per chunk, default 32768.
   reuseConnection (boolean, optional)  Default true. Set false after timeout.
   timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
-  fast            (boolean, optional)  Default true. upload/download only:
-                  use ssh2 fastPut/fastGet for each file. Independent files
-                  are scheduled in parallel using fileConcurrency over a few
-                  shared SFTP sessions. false is a serial compatibility
-                  mode and is much slower.
-  sftpConcurrency (number, optional)   Upload/download with fast=true: concurrent
-                  SFTP chunks. Relay: prefetched source chunks, default 64.
-  chunkSize       (number, optional)   Bytes per chunk. Relay default 32768;
-                  total prefetch window is capped at 64 MiB.
-  connections     (number, optional)   Single file only; relay only with
-                  strategy="relay" (the default). Default 1 (unchanged).
-                  Above 1, split the file into that many non-overlapping byte
-                  ranges moved over that many INDEPENDENT SSH/TCP connections,
-                  reassembled, verified, renamed into place (see the
-                  download/upload help). Relay opens N connections on EACH
-                  server (N in total for a self-relay), writes a temp file on
-                  the destination, verifies size + md5, then replaces the
-                  target -- unlike the single-connection relay, which writes
-                  in place. Relay measured on a 50 ms/1 Gbps source leg (one
-                  connection 16.4 MiB/s): 2 -> 23.7, 4 -> 33.6, 8 -> 31.7.
-                  Maximum 8. Helps on high-latency links; pointless on a
-                  fast LAN. Separate, concurrent handshakes, so sshd's
-                  MaxStartups is the limit that matters, not MaxSessions.
-                  Connections are pooled per server (at most 8, idle ones
-                  closed after 60 s), so a repeat skips the handshakes.
-                  Download measured on 50 ms / 1 Gbps (one connection
-                  17.5 MiB/s): 2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s.
-                  Rejected for relay strategy="direct"/"auto", a batch
-                  (array) localPath, recursive=true and archive=true.
-  fileConcurrency (number, optional)   Recursive, or batch upload/download only: independent
-                  files in flight at once. Default 32, maximum 64. The
-                  files share at most min(fileConcurrency, 4) SFTP channels
-                  on the same SSH connection (requests are multiplexed on a
-                  channel), so the count stays well under OpenSSH's common
-                  default MaxSessions=10 however many files are in flight.
-  onError         (string, optional)   Batch upload or download only.
-                  "abort" (default): stop scheduling new files once one fails,
-                  drain in-flight ones. "continue": attempt every file
-                  regardless of earlier failures. Both report a per-file
-                  status.
-
-Batch upload (mode="upload" with an array localPath):
-  • remotePath must be a directory; each source lands at remotePath/<basename>.
-  • Basename collisions across sources, or the same path repeated in the
-    array, fail the whole call with BATCH_TARGET_COLLISION before anything
-    is written remotely — never silently deduplicated.
-  • Empty array → INVALID_CONFIGURATION. Over 1000 entries → BATCH_TOO_LARGE.
-  • Every file still goes through the normal single-file rules: skip-if-
-    identical, CRLF→LF fix for .sh/.bash/.zsh, fast, and path policy.
-  • Returns structured JSON: { results: [...], total, uploadedCount,
-    skippedCount, failedCount, crlfFixedCount }. A single string localPath
-    keeps the original plain-text response, unchanged.
-  • Not combinable with archive=true or recursive=true currently.
-
-Batch download (mode="download" with an array remotePath):
-  • localPath is one local directory (created if missing); each file lands at
-    localPath/<basename>.
-  • Basename collisions fail the whole call with BATCH_TARGET_COLLISION before
-    any transfer (compared case-insensitively on Windows and macOS hosts).
-  • Empty array → INVALID_CONFIGURATION. Over 1000 entries → BATCH_TOO_LARGE.
-  • Returns JSON: { results: [{ remotePath, localPath, status, reason? }],
-    total, downloadedCount, failedCount, notAttemptedCount }.
-  • Not combinable with archive, recursive or connections.
-
-Parameters for relay:
-  mode              (string, required)   "relay" selects remote-to-remote;
-                    strategy selects how bytes move.
-  sourceServer      (string, required)   Server name to read from.
-  sourceRemotePath  (string, required)   File path on source server.
-  destServer        (string, required)   Server name to write to.
-  destRemotePath    (string, required)   File path on dest server.
-  reuseConnection   (boolean, optional)  Default true. Set false after timeout.
-  timeout           (number, optional)   SSH setup and SFTP channel-open timeout.
-  vvv               (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
-  fast              (boolean, optional)  Ignored for relay, which uses bounded
-                    parallel SFTP read-ahead; fastGet/fastPut apply to
-                    host<->remote only.
-  strategy          (string, optional)   "relay" (default) | "direct" | "auto".
-                    "direct": run the copy on the source server (rsync, else
-                    tar|ssh; uses available backend) so this MCP host relays zero
-                    file-data bytes; fails explicitly with the precise reason
-                    if not possible (source cannot reach the destination
-                    directly, destination host key not pinned on the source,
-                    non-interactive existing-remote-key auth unavailable, or
-                    no backend installed on the source). Direct transfer
-                    cannot traverse NAT — use a jump host, an overlay
-                    network, or strategy="relay" instead. "auto": probe the
-                    same conditions and use direct when possible, else fall
-                    back to relay and report the real reason.
-
-connectionName rule (upload/download):
-  • If only one server is enabled → optional.
-  • If multiple servers are enabled → REQUIRED.
 
 Examples:
-  transfer { mode: "upload", localPath: "dist/", remotePath: "/opt/app/dist", recursive: true }
-  transfer { mode: "upload", localPath: ["a/config.yaml", "b/settings.json"], remotePath: "/etc/app" }
-  transfer { mode: "download", connectionName: "prod", localPath: "huge.bin",
-             remotePath: "/data/huge.bin", connections: 4 }
-  transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/var/log/app.log",
-             destServer: "backup", destRemotePath: "/backup/app.log" }
-  transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/data/dump.tar",
-             destServer: "backup", destRemotePath: "/backup/dump.tar", strategy: "auto" }`,
+  copy { from: { server: "prod", path: "/var/log/app.log" },
+         to: { server: "backup", path: "/backup/app.log" } }
+  copy { from: { server: "prod", path: "/data/dump.tar" },
+         to: { server: "backup", path: "/backup/dump.tar" }, strategy: "auto" }
+  copy { from: { server: "prod", path: "/srv/site" },
+         to: { server: "backup", path: "/backup" }, archive: true }
+  copy { from: { server: "gpu", path: "/data/ckpt.pt" },
+         to: { server: "gpu", path: "/data/ckpt-copy.pt" } }`,
 
   "workspace-run": `workspace-run — Start a durable task on a Linux remote.
 
@@ -844,11 +781,11 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
   show-whitelist    Show full command/SFTP policy (legacy name; includes blacklist).
   close-connection  Close a cached SSH connection for a server.
   command-status    Poll background status and incremental live output.
-  upload            Upload a single file, or a batch of files, to a remote server.
-  download          Download a single file from a remote server.
+  push              Copy a local file, directory or file array to a remote server (like adb push).
+  pull              Copy a remote file, directory or file array to the MCP host (like adb pull).
   sftp-list         Browse a paginated remote directory over SFTP.
   sftp-manage       Rename or permanently delete remote entries with path policy.
-  transfer          Move files/directories; mode=relay selects remote-to-remote, strategy selects relay/direct/auto.
+  copy              Copy between two remote servers (from/to { server, path }); strategy selects relay/direct/auto.
   workspace-run     Start a durable Linux task; no YAML run profile needed. Pass remoteRoot + venv/executable inline, or use a saved profile. Optional push/collect.
   run-status        Query a workspace-run's current status by runId.
   run-logs          Read a byte-offset window of a run's stdout/stderr.

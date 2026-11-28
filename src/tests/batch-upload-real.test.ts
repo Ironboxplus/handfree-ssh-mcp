@@ -15,8 +15,9 @@ import {
   validateBatchUploadTargets,
   type BatchUploadResult,
 } from "../services/transfer-service.js";
-import { registerUploadTool } from "../tools/upload.js";
-import { registerTransferTool } from "../tools/transfer.js";
+import { registerPushTool } from "../tools/push.js";
+import { registerPullTool } from "../tools/pull.js";
+import { registerCopyTool } from "../tools/copy.js";
 import { RealSshTestServer } from "./helpers/real-ssh-server.js";
 
 function sha256(buffer: Buffer): string {
@@ -59,8 +60,9 @@ describe("P1-09 batch upload (PLAN.MD §5.7)", { concurrency: false }, () => {
         keepaliveInterval: 0,
       },
     }, ["destination"]);
-    registerUploadTool(mcpServer);
-    registerTransferTool(mcpServer);
+    registerPushTool(mcpServer);
+    registerPullTool(mcpServer);
+    registerCopyTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
     await mcpClient.connect(clientTransport);
@@ -235,13 +237,8 @@ describe("P1-09 batch upload (PLAN.MD §5.7)", { concurrency: false }, () => {
 
     const localPaths = names.map((name) => path.join(localDir, name));
     const result = await mcpClient.callTool({
-      name: "upload",
-      arguments: {
-        localPath: localPaths,
-        remotePath: remoteDir,
-        connectionName: "destination",
-        timeout: 5000,
-      },
+      name: "push",
+      arguments: { localPath: localPaths, remotePath: remoteDir, connectionName: "destination", timeout: 5000 },
     });
     assert.equal(result.isError, undefined, responseText(result));
     const batch = parseBatchResult(result);
@@ -309,15 +306,8 @@ describe("P1-09 batch upload (PLAN.MD §5.7)", { concurrency: false }, () => {
 
       const openedBefore = destinationServer.stats.openedFiles;
       const result = await mcpClient.callTool({
-        name: "upload",
-        arguments: {
-          localPath: localPaths,
-          remotePath: remoteDir,
-          connectionName: "destination",
-          skipIfIdentical: false,
-          fileConcurrency: 1,
-          timeout: 5000,
-        },
+        name: "push",
+        arguments: { localPath: localPaths, remotePath: remoteDir, connectionName: "destination", skipIfIdentical: false, fileConcurrency: 1, timeout: 5000 },
       });
       assert.equal(result.isError, undefined, responseText(result));
       const batch = parseBatchResult(result);
@@ -378,16 +368,8 @@ describe("P1-09 batch upload (PLAN.MD §5.7)", { concurrency: false }, () => {
 
       const openedBefore = destinationServer.stats.openedFiles;
       const result = await mcpClient.callTool({
-        name: "upload",
-        arguments: {
-          localPath: localPaths,
-          remotePath: remoteDir,
-          connectionName: "destination",
-          skipIfIdentical: false,
-          fileConcurrency: 1,
-          onError: "continue",
-          timeout: 5000,
-        },
+        name: "push",
+        arguments: { localPath: localPaths, remotePath: remoteDir, connectionName: "destination", skipIfIdentical: false, fileConcurrency: 1, onError: "continue", timeout: 5000 },
       });
       assert.equal(result.isError, undefined, responseText(result));
       const batch = parseBatchResult(result);
@@ -432,13 +414,8 @@ describe("P1-09 batch upload (PLAN.MD §5.7)", { concurrency: false }, () => {
       fs.writeFileSync(localFile, "single file content\n", "utf8");
       fs.mkdirSync(destinationServer.toLocalPath("/single-string"), { recursive: true });
       const result = await mcpClient.callTool({
-        name: "upload",
-        arguments: {
-          localPath: localFile,
-          remotePath: "/single-string/single-string.txt",
-          connectionName: "destination",
-          timeout: 5000,
-        },
+        name: "push",
+        arguments: { localPath: localFile, remotePath: "/single-string/single-string.txt", connectionName: "destination", timeout: 5000 },
       });
       assert.equal(result.isError, undefined, responseText(result));
       assert.match(responseText(result), /^File uploaded successfully \(\d+ bytes via fast SFTP\)$/);
@@ -454,14 +431,8 @@ describe("P1-09 batch upload (PLAN.MD §5.7)", { concurrency: false }, () => {
       const fileA = path.join(localDir, "a.txt");
       fs.writeFileSync(fileA, "a\n", "utf8");
       const result = await mcpClient.callTool({
-        name: "transfer",
-        arguments: {
-          mode: "upload",
-          localPath: [fileA],
-          remotePath: "/archive-batch-rejected",
-          connectionName: "destination",
-          archive: true,
-        },
+        name: "push",
+        arguments: { localPath: [fileA], remotePath: "/archive-batch-rejected", connectionName: "destination", archive: true },
       });
       assert.equal(result.isError, true);
       assert.match(responseText(result), /INVALID_CONFIGURATION/);
@@ -480,13 +451,8 @@ describe("P1-09 batch upload (PLAN.MD §5.7)", { concurrency: false }, () => {
 
       const openedBefore = destinationServer.stats.openedFiles;
       const result = await mcpClient.callTool({
-        name: "transfer",
-        arguments: {
-          mode: "upload",
-          localPath: [fileA, fileB],
-          remotePath: "/collision-rejected",
-          connectionName: "destination",
-        },
+        name: "push",
+        arguments: { localPath: [fileA, fileB], remotePath: "/collision-rejected", connectionName: "destination" },
       });
       assert.equal(result.isError, true);
       assert.match(responseText(result), /BATCH_TARGET_COLLISION/);
@@ -495,19 +461,5 @@ describe("P1-09 batch upload (PLAN.MD §5.7)", { concurrency: false }, () => {
       assert.equal(destinationServer.stats.openedFiles, openedBefore);
     });
 
-    test("download mode with an array localPath is rejected (out of scope this round)", async () => {
-      const result = await mcpClient.callTool({
-        name: "transfer",
-        arguments: {
-          mode: "download",
-          localPath: [path.join(localRoot, "wont-be-used.txt")],
-          remotePath: "/does-not-matter",
-          connectionName: "destination",
-        },
-      });
-      assert.equal(result.isError, true);
-      assert.match(responseText(result), /INVALID_CONFIGURATION/);
-      assert.match(responseText(result), /mode="download"|download/i);
-    });
   });
 });
