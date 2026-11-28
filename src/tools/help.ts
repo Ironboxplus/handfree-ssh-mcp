@@ -226,8 +226,8 @@ What is fetched is decided by remotePath, not by a flag:
                     with / or \\, the file keeps its remote name inside it.
                     Missing parent directories are created.
   • a directory   → its whole tree lands in localPath (remote dir/x →
-                    localPath/x). Detected by one STAT; there is no recursive
-                    flag.
+                    localPath/x). Detected by the download itself (no extra
+                    round trip for a file); there is no recursive flag.
   • an array      → batch: each file lands at localPath/<basename>.
   • archive=true  → one temporary tar extracted into localPath, keeping
                     the source name (results → localPath/results).

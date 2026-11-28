@@ -41,7 +41,7 @@ export function registerPushTool(server: McpServer): void {
           : archive
             ? "archive"
             : fs.statSync(path.resolve(localPath), { throwIfNoEntry: false })?.isDirectory() ? "directory" : "file";
-        checkShapeArgs(shape, { connections, fileConcurrency, onError });
+        checkShapeArgs(shape, { connections, onError });
 
         const sftpOptions = {
           reuseConnection, timeout, vvv, fast: fast !== false, sftpConcurrency, chunkSize,

@@ -628,7 +628,6 @@ describe("MCP tool handlers", () => {
   it("should forward SFTP reuseConnection, timeout, vvv, and fast options on pull", async () => {
     const originalResolveServer = manager.resolveServer;
     const originalDownload = manager.transferService.download;
-    const originalIsDirectory = manager.transferService.remoteIsDirectoryPath;
     const { server, handlers } = captureRegisteredTools();
     let captured: any;
 
@@ -637,7 +636,6 @@ describe("MCP tool handlers", () => {
       captured = { remotePath, localPath, connectionName, options };
       return "downloaded";
     };
-    manager.transferService.remoteIsDirectoryPath = async () => false;
 
     try {
       registerPullTool(server as any);
@@ -673,7 +671,6 @@ describe("MCP tool handlers", () => {
     } finally {
       manager.resolveServer = originalResolveServer;
       manager.transferService.download = originalDownload;
-      manager.transferService.remoteIsDirectoryPath = originalIsDirectory;
     }
   });
 

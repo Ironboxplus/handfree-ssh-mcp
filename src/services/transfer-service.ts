@@ -155,6 +155,12 @@ export interface BatchDownloadResult {
   notAttemptedCount: number;
 }
 
+/**
+ * A single-file download whose remote path is a directory. pull catches it
+ * and copies the tree instead, so a file pull costs no extra round trip.
+ */
+export class RemoteDirectoryError extends ToolError {}
+
 export const MAX_BATCH_UPLOAD_SIZE = 1000;
 
 /**
@@ -927,7 +933,7 @@ export class TransferService {
   }
 
   private remoteDirectoryError(remotePath: string): ToolError {
-    return new ToolError(
+    return new RemoteDirectoryError(
       "INVALID_CONFIGURATION",
       `Remote path is a directory, not a file: ${remotePath}. pull detects a directory and copies all of it ` +
         `(connections applies to single files only), or pass the files as a remotePath array.`,
@@ -935,28 +941,50 @@ export class TransferService {
     );
   }
 
-  /**
-   * Whether a remote path is a directory, by one bounded STAT on a transfer
-   * session. False when it is a file, is missing or cannot be read: the
-   * transfer that follows reports that error with its own context.
-   */
-  public async remoteIsDirectoryPath(remotePath: string, name?: string, options?: SftpOptions): Promise<boolean> {
-    const resolvedName = name || this.pool.defaultName;
-    const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
-    const scope = this.openTransferScope(resolvedName, options, undefined);
+  /** One bounded STAT; "unknown" when it fails for another reason or times out. */
+  private async remotePathKind(sftp: SFTPWrapper, remotePath: string): Promise<"directory" | "file" | "missing" | "unknown"> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await scope.run(0, (_client, sftp) => this.remoteIsDirectory(sftp, validatedRemotePath));
+      return await Promise.race([
+        new Promise<"directory" | "file" | "missing" | "unknown">((resolve) => {
+          sftp.stat(remotePath, (err, stats) => {
+            // SFTP status 2 is NO_SUCH_FILE.
+            if (err) return resolve((err as { code?: unknown }).code === 2 ? "missing" : "unknown");
+            resolve(stats.isDirectory() ? "directory" : "file");
+          });
+        }),
+        new Promise<"unknown">((resolve) => { timer = setTimeout(() => resolve("unknown"), 10_000); }),
+      ]);
+    } catch {
+      return "unknown";
     } finally {
-      await scope.close();
+      clearTimeout(timer);
     }
   }
 
   /**
-   * Like adb push and scp: a file pushed to a remote directory (an existing
-   * one, or a path ending with /) keeps its local name there.
+   * Where a single-file push writes, like adb push: a remote directory (an
+   * existing one, or a path ending with /) receives the file under its local
+   * name, and a missing parent directory is created. One STAT on the session
+   * the upload then uses; mkdir round trips only when the target is new.
    */
-  private uploadTargetInDirectory(remoteDir: string, localPath: string, name: string): string {
-    return this.validateRemotePath(path.posix.join(remoteDir, path.basename(localPath)), name);
+  private async prepareUploadTarget(
+    sftp: SFTPWrapper,
+    remotePath: string,
+    localPath: string,
+    name: string,
+    timeout: number | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<string> {
+    const namesDirectory = /\/$/.test(remotePath);
+    const kind = namesDirectory ? "missing" : await this.remotePathKind(sftp, remotePath);
+    if (kind === "directory") {
+      return this.validateRemotePath(path.posix.join(remotePath, path.basename(localPath)), name);
+    }
+    if (kind === "missing") {
+      await this.sftpMkdirRecursive(sftp, namesDirectory ? remotePath : path.posix.dirname(remotePath), timeout, debug);
+    }
+    return namesDirectory ? this.validateRemotePath(path.posix.join(remotePath, path.basename(localPath)), name) : remotePath;
   }
 
   /** Create the local file's parent directories. */
@@ -1413,9 +1441,7 @@ export class TransferService {
     const scope = this.openTransferScope(resolvedName, options, debug);
     try {
       const message = await scope.run(0, async (client, sftp) => {
-        const target = /\/$/.test(validatedRemotePath) || await this.remoteIsDirectory(sftp, validatedRemotePath)
-          ? this.uploadTargetInDirectory(validatedRemotePath, validatedLocalPath, resolvedName)
-          : validatedRemotePath;
+        const target = await this.prepareUploadTarget(sftp, validatedRemotePath, validatedLocalPath, resolvedName, options?.timeout, debug);
         return this.uploadFileOn(client, sftp, resolvedName, target, source, options, debug);
       });
       return appendDebugOutput(message, debugCollector);
@@ -2098,9 +2124,7 @@ export class TransferService {
     const reservation = await this.pool.reserveTransferLanes(resolvedName, connections);
     try {
       await this.openLaneSessions(reservation, "multi-upload", lanes, sftpSessions, timeout, debug, fresh);
-      if (/\/$/.test(remotePath) || await this.remoteIsDirectory(sftpSessions[0], remotePath)) {
-        remotePath = this.uploadTargetInDirectory(remotePath, localPath, resolvedName);
-      }
+      remotePath = await this.prepareUploadTarget(sftpSessions[0], remotePath, localPath, resolvedName, timeout, debug);
 
       if (skipIfIdentical) {
         const decision = await this.decideUploadSkip(

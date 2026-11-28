@@ -58,10 +58,13 @@ export function checkTransferArgs(args: {
   }
 }
 
-/** Checks that depend on what the path is; run once the shape is known. */
+/**
+ * Checks that depend on what the path is; run once the shape is known.
+ * fileConcurrency is not checked: pull learns that a path is a directory only
+ * from the download itself, so for a single file it is simply unused.
+ */
 export function checkShapeArgs(shape: TransferShape, args: {
   connections?: number;
-  fileConcurrency?: number;
   onError?: string;
 }): void {
   if (shape === "directory" && args.connections !== undefined) {
@@ -69,8 +72,5 @@ export function checkShapeArgs(shape: TransferShape, args: {
   }
   if (shape !== "array" && args.onError !== undefined) {
     throw invalid("onError applies to an array of paths only");
-  }
-  if ((shape === "file" || shape === "archive") && args.fileConcurrency !== undefined) {
-    throw invalid("fileConcurrency applies to a directory or an array of paths");
   }
 }

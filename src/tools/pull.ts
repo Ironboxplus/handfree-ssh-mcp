@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
+import { RemoteDirectoryError } from "../services/transfer-service.js";
 import { Logger } from "../utils/logger.js";
 import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
 import { rejectUnknownArguments } from "./strict-arguments.js";
@@ -36,26 +37,29 @@ export function registerPullTool(server: McpServer): void {
           reuseConnection, timeout, vvv, fast: fast !== false, sftpConcurrency, chunkSize,
           ...(fileConcurrency === undefined ? {} : { fileConcurrency }),
         };
-        const shape: TransferShape = Array.isArray(remotePath)
-          ? "array"
-          : archive
-            ? "archive"
-            : await transferService.remoteIsDirectoryPath(remotePath, resolvedName, sftpOptions) ? "directory" : "file";
-        checkShapeArgs(shape, { connections, fileConcurrency, onError });
+        // A remote directory is learned from the file download itself (it
+        // reports RemoteDirectoryError before writing anything), so a file
+        // pull costs no extra STAT or connection.
+        const shape: TransferShape = Array.isArray(remotePath) ? "array" : archive ? "archive" : "file";
+        checkShapeArgs(shape, { onError });
 
         let text: string;
         if (Array.isArray(remotePath)) {
           text = JSON.stringify(await transferService.downloadBatch(remotePath, localPath, resolvedName, { ...sftpOptions, onError }));
         } else if (shape === "archive") {
           text = await transferService.downloadArchive(remotePath, localPath, resolvedName, archiveCompression ?? "none", sftpOptions);
-        } else if (shape === "directory") {
-          const files = await transferService.downloadDirectory(remotePath, localPath, resolvedName, sftpOptions);
-          text = JSON.stringify({ summary: `Directory pull complete. ${files.length} file(s) transferred.`, files });
         } else {
-          text = await transferService.download(remotePath, localPath, resolvedName, {
-            ...sftpOptions,
-            ...(connections === undefined ? {} : { connections }),
-          });
+          try {
+            text = await transferService.download(remotePath, localPath, resolvedName, {
+              ...sftpOptions,
+              ...(connections === undefined ? {} : { connections }),
+            });
+          } catch (error) {
+            if (!(error instanceof RemoteDirectoryError)) throw error;
+            checkShapeArgs("directory", { connections });
+            const files = await transferService.downloadDirectory(remotePath, localPath, resolvedName, sftpOptions);
+            text = JSON.stringify({ summary: `Directory pull complete. ${files.length} file(s) transferred.`, files });
+          }
         }
         return { content: [{ type: "text", text }] };
       } catch (error: unknown) {

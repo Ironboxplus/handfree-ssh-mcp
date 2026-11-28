@@ -49,7 +49,10 @@ export function appendDebugToError(error: Error, collector: OutputCollector | nu
   const message = `${error.message}\n\n${debugBlock}`;
 
   if (error instanceof ToolError) {
-    return new ToolError(error.code, message, error.retriable);
+    // Keep the subclass (e.g. RemoteDirectoryError): callers branch on it.
+    const copy = new ToolError(error.code, message, error.retriable);
+    Object.setPrototypeOf(copy, Object.getPrototypeOf(error));
+    return copy;
   }
 
   const wrapped = new Error(message);
